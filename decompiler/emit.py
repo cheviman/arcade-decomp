@@ -1104,6 +1104,8 @@ class FunctionWriter:
                 # (the value once, before its bytes go to their fields: named after the first of them and
                 # the access, bounce_direction_halfword)
                 first = re.split(r"->|\.", pieces[0][2])[-1]
+                # (an array's element by its array's name and number: time_difficulty[2], time_difficulty_2)
+                first = re.sub(r"\[(\w+)\]", r"_\1", first)
                 temp = self.fresh(f"{first}_{ {8: 'byte', 16: 'halfword', 32: 'long'}[statement.bits] }")
                 lines.append(f"{temp} = {text};")
                 text = temp
