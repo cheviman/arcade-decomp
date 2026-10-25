@@ -17,8 +17,8 @@ its variables), and stays a register.
 """
 from v60 import ir
 
-GLOBALS_BASE = 24
-GLOBALS_VALUE = 0x20E000
+GLOBALS_BASE = None
+GLOBALS_VALUE = None
 
 
 class ConstantError(Exception):
@@ -84,10 +84,12 @@ def run(function, block, state, register, rewrite):
     return value, frozenset(slots.items())
 
 
-def substitute(function, register=GLOBALS_BASE, value_at_entry=GLOBALS_VALUE):
+def substitute(function, register=None, value_at_entry=None):
     """Rewrites 'function' in place, or raises ConstantError if the register gets a value that is not
     known, two values meet, or the function calls out or leaves with a value other than the one it
-    started with."""
+    started with. The register and its value are the game's (GLOBALS_BASE, GLOBALS_VALUE) unless given."""
+    register = GLOBALS_BASE if register is None else register
+    value_at_entry = GLOBALS_VALUE if value_at_entry is None else value_at_entry
     blocks = function.blocks
     start = {function.entry: (value_at_entry, frozenset())}
     pending = [function.entry]
@@ -113,8 +115,10 @@ def substitute(function, register=GLOBALS_BASE, value_at_entry=GLOBALS_VALUE):
         run(function, blocks[label], state, register, rewrite=True)
 
 
-def uses(function, register=GLOBALS_BASE):
-    """Statements of 'function' that still read or write the register."""
+def uses(function, register=None):
+    """Statements of 'function' that still read or write the register (the game's GLOBALS_BASE unless
+    given)."""
+    register = GLOBALS_BASE if register is None else register
     found = []
     for block in function.blocks.values():
         for statement in block.statements + [block.end]:

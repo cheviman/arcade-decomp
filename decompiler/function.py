@@ -41,6 +41,10 @@ def flag_condition(name):
 
 
 CONDITION_NAMES = ("v", "nv", "l", "nl", "e", "ne", "nh", "h", "n", "p", "lt", "ge", "le", "gt")
+# the frame-wait loop (game_profile.py): where it takes the interrupts the board raised while it waited, at
+# the poll (the board's events come before it) or where the frame resumes; and its counter's name
+INTERRUPTS_BEFORE_POLL = False
+FRAME_COUNTER = "frames_to_wait"
 
 
 @dataclass
@@ -222,12 +226,15 @@ class Builder:
     def frame_hooks(self, statements, instruction):
         address = instruction.address
         if address == self.frame_wait_loop:
-            # the board runs its next event, and the interrupts it raised come before the poll (as s32ref
-            # takes them: their frames return to the poll, 000908)
             lifter = lift.Lifter(self.mem, prefix=f"w{address:06X}_")
-            counter = lifter.address_of(instruction.operands[0], 0, "frame_ready")
+            counter = lifter.address_of(instruction.operands[0], 0, FRAME_COUNTER)
             statements += lifter.statements
             statements.append(ir.Effect("frame_wait", (counter.address,)))
+            if INTERRUPTS_BEFORE_POLL:
+                # the board runs its next event, and the interrupts it raised come before the poll (as
+                # OutRunners' s32ref takes them: their frames return to the poll, 000908)
+                statements.append(ir.Effect("take_interrupts", (ir.const(address),)))
+        elif address == self.frame_resume and not INTERRUPTS_BEFORE_POLL:
             statements.append(ir.Effect("take_interrupts", (ir.const(address),)))
         elif address == self.frame_wait_done:
             statements.append(ir.Effect("frame_end", ()))

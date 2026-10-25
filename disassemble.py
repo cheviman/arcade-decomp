@@ -33,16 +33,16 @@ from pathlib import Path
 from typing import NamedTuple
 
 TOOLS = Path(__file__).resolve().parent
-ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
-import orunners_rom  # noqa: E402
+import game_profile  # noqa: E402  (the game's: its root, its ROM set, its settings)
+ROOT = game_profile.ROOT
 from v60 import disassembler as dis  # noqa: E402
 
 SYMBOL_KINDS = ("func", "code", "data")
 FORK = -1                       # a record kind (kinds=) that ends its array with a table of arrays
 STACK_POINTER = 31
 MAX_RECORDS = 4096
-CODE_CHIPS = orunners_rom.PROGRAM_AREAS[:2]
+CODE_CHIPS = game_profile.rom.PROGRAM_AREAS[:2]
 
 
 @dataclass(frozen=True)
@@ -154,7 +154,7 @@ def load_symbols(path):
             parts = parts[:3]
         if len(parts) > 3 and parts[1] != "data":
             raise SystemExit(f"{path.name}:{number}: only data symbols take a layout (code ones, calls=TABLE)")
-        address = orunners_rom.canonical_address(int(parts[0], 16))
+        address = game_profile.rom.canonical_address(int(parts[0], 16))
         if address is None:
             raise SystemExit(f"{path.name}:{number}: {parts[0]} is not in the program ROM")
         layout = parse_layout(parts[3:], f"{path.name}:{number}") if len(parts) > 3 else None
@@ -466,7 +466,7 @@ def load_trace(paths, fold_mirrors=True):
             if not line or line.startswith("#"):
                 continue
             address = int(line, 16)
-            canonical = orunners_rom.canonical_address(address)
+            canonical = game_profile.rom.canonical_address(address)
             if canonical is None:
                 outside += 1
             else:
@@ -485,7 +485,7 @@ class Analysis:
 
     def __init__(self, image, symbols, trace=frozenset(), fold_mirrors=True, entries=None):
         self.image = image
-        self.mem = orunners_rom.ProgramMemory(image)
+        self.mem = game_profile.rom.ProgramMemory(image)
         self.symbols = symbols
         self.fold = fold_mirrors
         self.entries = entries
@@ -520,7 +520,7 @@ class Analysis:
 
     def key(self, address):
         """The address code is known by: canonical, or as executed (24-bit) without folding."""
-        canonical = orunners_rom.canonical_address(address)
+        canonical = game_profile.rom.canonical_address(address)
         if canonical is None:
             return None
         return canonical if self.fold else address & 0xFFFFFF
@@ -528,8 +528,8 @@ class Analysis:
     @staticmethod
     def fits(address, length):
         """True if an instruction at 'address' lies inside one ROM area (does not run off its end)."""
-        start = orunners_rom.canonical_address(address)
-        end = orunners_rom.canonical_address(address + length - 1)
+        start = game_profile.rom.canonical_address(address)
+        end = game_profile.rom.canonical_address(address + length - 1)
         return start is not None and end == start + length - 1
 
     def add_target(self, address, kind, origin, label=True):
@@ -589,7 +589,7 @@ class Analysis:
             self.described.append((address, address + 2 * layout.lists))
         elif layout.pointers is not None:
             # (an address of 0 is no array)
-            arrays = [orunners_rom.canonical_address(self.mem.r32(address + 4 * number))
+            arrays = [game_profile.rom.canonical_address(self.mem.r32(address + 4 * number))
                       for number in range(layout.pointers) if self.mem.r32(address + 4 * number)]
             self.described.append((address, address + 4 * layout.pointers))
             if None in arrays:
@@ -623,13 +623,13 @@ class Analysis:
                         break
                     if length == FORK:
                         table = record + kind_offset + 2
-                        first = orunners_rom.canonical_address(self.mem.r32(table))
+                        first = game_profile.rom.canonical_address(self.mem.r32(table))
                         branches = (first - table) // 4 if first is not None and first > table else 0
                         if not 1 <= branches <= 8:
                             raise SystemExit(f"symbols.txt: {symbol.name} fork at {record:06X} has no table of "
                                              f"arrays after it")
                         for number in range(branches):
-                            branch = orunners_rom.canonical_address(self.mem.r32(table + 4 * number))
+                            branch = game_profile.rom.canonical_address(self.mem.r32(table + 4 * number))
                             if branch not in seen_arrays:
                                 seen_arrays.add(branch)
                                 arrays.append(branch)
@@ -645,7 +645,7 @@ class Analysis:
                     value = self.mem.r32(record + offset) if base is None else base + self.mem.r16(record + offset)
                     if value == 0:
                         continue   # no handler
-                    target = orunners_rom.canonical_address(value)
+                    target = game_profile.rom.canonical_address(value)
                     if target is None or not any(start <= target < end for start, end in CODE_CHIPS):
                         raise SystemExit(f"symbols.txt: {symbol.name} record at {record:06X} holds "
                                          f"{value:08X} at +{offset}, which is not in the code ROM")
@@ -658,7 +658,7 @@ class Analysis:
                     if offset + 4 > length:
                         continue   # a shorter kind of record has no such field
                     # (the V70 sees 24 address bits: a byte above them may hold something else)
-                    target = orunners_rom.canonical_address(self.mem.r32(record + offset) & 0xFFFFFF)
+                    target = game_profile.rom.canonical_address(self.mem.r32(record + offset) & 0xFFFFFF)
                     if target is not None and self.mem.r32(record + offset) & 0xFFFFFF:
                         self.data_fields[record + offset] = target
                 record += length
@@ -914,7 +914,7 @@ class Analysis:
             target = instruction.target_pointer
         if target is None:
             return ""
-        canonical = orunners_rom.canonical_address(target)
+        canonical = game_profile.rom.canonical_address(target)
         name = self.label_name(canonical) if canonical is not None else None
         return f"  ; {name}" if name else ""
 
@@ -924,7 +924,7 @@ def write_listing(analysis, path):
     with open(path, "w", encoding="ascii", newline="\n") as out:
         out.write("; OutRunners (orunners, World) - V70 program\n")
         out.write("; Generated by tools/disassemble.py from the user's own ROM. Do not redistribute.\n")
-        for start, end in orunners_rom.PROGRAM_AREAS:
+        for start, end in game_profile.rom.PROGRAM_AREAS:
             out.write(f"\n; ======== {start:06X}-{end - 1:06X} ========\n")
             address = start
             while address < end:
@@ -961,7 +961,7 @@ def write_report(analysis, path):
     lines = ["V70 program analysis", "====================", ""]
     total_code = 0
     total_size = 0
-    for start, end in orunners_rom.PROGRAM_AREAS:
+    for start, end in game_profile.rom.PROGRAM_AREAS:
         code = sum(1 for a in range(start, end) if a in analysis.owner)
         total_code += code
         total_size += end - start
@@ -1022,7 +1022,7 @@ def main():
         del arguments[position:position + 2]
     source = Path(arguments[0]) if arguments else ROOT / "rom"
 
-    image = orunners_rom.build_program(orunners_rom.load_set(source))
+    image = game_profile.rom.build_program(game_profile.rom.load_set(source))
     executed, outside = load_trace(trace_paths)
     analysis = Analysis(image, load_symbols(ROOT / "symbols.txt"), executed)
     analysis.trace_outside = outside

@@ -43,13 +43,13 @@ from v60 import ir
 
 from . import dataflow
 
-CONTEXT = (12, 14, 20, 23, 25, 27, 28, 32)
+CONTEXT = ()
 # what a context register holds when the program starts, where it is not 0 (the V70's SP after boot,
 # 000072: functions whose stack stays in memory, stack.MEMORY_SP, push from there)
-INITIAL = {32: 0x21F400}
+INITIAL = {}
 # context registers the game uses as scratch: the bits code that runs later may read without setting them
-SCRATCH_CONTEXT = {12: 0xFFFF0000, 14: 0xFFFFFFFF}
-CONSTANT = {24: 0x20E000}
+SCRATCH_CONTEXT = {}
+CONSTANT = {}
 # the functions nothing reaches (decompile.py)
 OPEN = set()
 

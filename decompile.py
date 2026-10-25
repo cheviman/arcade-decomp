@@ -37,11 +37,11 @@ from collections import Counter
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
-ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
+import game_profile  # noqa: E402  (the game's: its root, its ROM set, its settings)
+ROOT = game_profile.ROOT
 import disassemble  # noqa: E402
 import recompile  # noqa: E402
-import orunners_rom  # noqa: E402
 from decompiler import cleanup  # noqa: E402
 from decompiler import conditions  # noqa: E402
 from decompiler import constants  # noqa: E402
@@ -70,7 +70,7 @@ def load_program(source):
     """The program split into functions. A "func" line of symbols.txt in the middle of code another
     function reaches by jumping (each state of the player's update, entered through a jump table) makes
     that code a function of its own: the jumps into it become tail calls."""
-    image = orunners_rom.build_program(orunners_rom.load_set(source))
+    image = game_profile.rom.build_program(game_profile.rom.load_set(source))
     symbols = disassemble.load_symbols(SYMBOLS)
     program = recompile.Program(image, symbols, set(), set())
     reached = set().union(*program.bodies.values())
@@ -78,7 +78,7 @@ def load_program(source):
               if symbol.kind == "func" and address in reached and address not in program.entries}
     # code nothing reaches (functions the game never calls) is decompiled too, from its "func" lines
     # (the code runs in the ROM's mirrors too: an address is reached when any copy of it is)
-    reached_copies = {orunners_rom.canonical_address(address) for address in reached}
+    reached_copies = {game_profile.rom.canonical_address(address) for address in reached}
     unreached = {address for address, symbol in symbols.items()
                  if symbol.kind == "func" and address not in reached and address not in reached_copies}
     live = set(program.entries)
@@ -135,7 +135,7 @@ def fold_mirror_copies(program, built):
     live = getattr(program, "live_entries", set())
     copies = {}
     for entry in built:
-        canonical = orunners_rom.canonical_address(entry)
+        canonical = game_profile.rom.canonical_address(entry)
         if canonical is not None:
             copies.setdefault(canonical, []).append(entry)
     alias = {}
@@ -335,7 +335,7 @@ def file_header(name, description):
             f" *    Modified:    {time.strftime('%d-%m-%Y')}\n"
             " *    Author:      Sebastian Toyos\n"
             " *\n"
-            " *    OutRunners (arcade, Sega System Multi 32): the game's V70 program decompiled into C by\n"
+            f" *    {game_profile.GAME}: the game's {game_profile.CPU} program decompiled into C by\n"
             " *    tools/decompile.py, with the names of symbols.txt.\n"
             " */\n")
 FUNCTIONS_PER_FILE = 120
@@ -432,7 +432,7 @@ def source_locations(files, texts):
 
 def canonical_entry(entry):
     """Where a function is in the program ROM's own copy (code run through a mirror is folded to it)."""
-    canonical = orunners_rom.canonical_address(entry)
+    canonical = game_profile.rom.canonical_address(entry)
     return entry if canonical is None else canonical
 
 
@@ -841,7 +841,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     (out_dir / "game.h").write_text(
         file_header("game.h", "prototypes of the game's functions and the addresses of the code it keeps in "
                     "memory slots")
-        + "#ifndef ORUNNERS_GAME_H\n#define ORUNNERS_GAME_H\n\n#include \"game/support.h\"\n#include \"ram.h\"\n\n"
+        + f"#ifndef {game_profile.GUARD}_GAME_H\n#define {game_profile.GUARD}_GAME_H\n\n"
+        + "#include \"game/support.h\"\n#include \"ram.h\"\n\n"
         f"/* registers the whole program shares */\nextern uint32_t {context};\n\n"
         "/* where the code the program keeps in memory slots (objects' handlers, hooks) is, as the game's own\n"
         "   addresses: what it stores and compares, and what call_code() runs */\n"
@@ -856,7 +857,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                                                                           in emitter.constants.items()})]
     (out_dir / "ram.h").write_text(
         file_header("ram.h", "the game's variables, tables, board registers and structures")
-        + "#ifndef ORUNNERS_RAM_H\n#define ORUNNERS_RAM_H\n\n"
+        + f"#ifndef {game_profile.GUARD}_RAM_H\n#define {game_profile.GUARD}_RAM_H\n\n"
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM symbols.txt labels */\n"
         + "\n".join(labels) + "\n\n/* numbers the code uses, by name (symbols.txt constant lines) */\n"
         + "\n".join(numbers) + "\n\n/* the game's structures in work RAM */\n"

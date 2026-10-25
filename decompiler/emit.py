@@ -2481,9 +2481,9 @@ class Emitter:
             if address < memory.ROM_NAMES_FROM:
                 return None
             canonical = memory.own_copy(address)
-            if canonical != address:
-                # another copy of the ROM: its own value, which may be no address at all (the memory test
-                # counts 0xFF000 bytes, the copy of vector_table's 0x03F000 in the code ROM's fourth mirror)
+            if canonical != address and not memory.NAMED_COPIES:
+                # another copy of the ROM: its own value, which may be no address at all (OutRunners' memory
+                # test counts 0xFF000 bytes, the copy of vector_table's 0x03F000 in the code ROM's fourth mirror)
                 return None
             item = self.memory.tables.get(canonical)
             if item is not None:

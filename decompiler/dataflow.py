@@ -41,7 +41,7 @@ PARTS = ((0, 0x000000FF), (1, 0x0000FF00), (2, 0xFFFF0000))
 FULL = 0xFFFFFFFF
 # the field of an object that holds the handler the object loop calls (OutRunners: "jsr [4[R20]]", 011CD2),
 # then fields holding handlers the object later moves there (SegaSonic: 1C, and 9C)
-HANDLER_SLOTS = (0x4,)
+HANDLER_SLOTS = ()
 ZERO_MASKS = (0xFF, 0xFFFF, FULL)                 # what a test of R0 looks at: byte, halfword, word
 
 

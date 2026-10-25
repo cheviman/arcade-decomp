@@ -16,7 +16,7 @@ Usage: python tools/decompile_sound.py [--check] [--out DIR] [--timing FILE]
   --variables FILE  lists every local variable with the instructions that write it, which is what
               sound_symbols.txt's "local" lines name them by (decompile.py --variables)
 
-The sound program (epr-15550, read from the ROM set in rom/ by tools/orunners_rom.py) goes
+The sound program (epr-15550, read from the ROM set in rom/ by tools/game_profile.rom.py) goes
 through the decompiler the V60 program goes through (tools/decompiler/), with the Z80's profile
 (decompiler/cpu.py): tools/z80/analysis.py splits it into functions with sound_symbols.txt,
 tools/z80/function.py lifts them to IR with the sound board's timing model, and the passes work out
@@ -34,8 +34,9 @@ from collections import Counter
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
-ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
+import game_profile  # noqa: E402  (the game's: its root, its ROM set, its settings)
+ROOT = game_profile.ROOT
 import disassemble  # noqa: E402
 from decompile import call_results  # noqa: E402
 from decompile import grouped_prototypes  # noqa: E402
@@ -44,7 +45,6 @@ from decompile import twin  # noqa: E402
 from decompile import source_files  # noqa: E402
 from decompile import write_sources  # noqa: E402
 from decompile import write_variables  # noqa: E402
-import orunners_rom  # noqa: E402
 from decompiler import cleanup  # noqa: E402
 from decompiler.gotos import GotoError  # noqa: E402
 from decompiler import cprint  # noqa: E402
@@ -78,7 +78,7 @@ REGISTERS = {name: index for index, name in cpu.Z80.register_names.items()}    #
 def load_program():
     if not ROM_SET.exists():
         raise SystemExit(f"{ROM_SET}: no such ROM folder")
-    return analysis.load_program(orunners_rom.build_sound(orunners_rom.load_set(ROM_SET)), SYMBOLS)
+    return analysis.load_program(game_profile.rom.build_sound(game_profile.rom.load_set(ROM_SET)), SYMBOLS)
 
 
 def configure():
@@ -201,7 +201,7 @@ def file_header(name, description):
             f" *    Modified:    {time.strftime('%d-%m-%Y')}\n"
             " *    Author:      Sebastian Toyos\n"
             " *\n"
-            " *    OutRunners (arcade, Sega System Multi 32): the Z80 sound program decompiled into C by\n"
+            f" *    {game_profile.GAME}: the Z80 sound program decompiled into C by\n"
             " *    tools/decompile_sound.py, with the names of sound_symbols.txt.\n"
             " */\n")
 
@@ -389,7 +389,8 @@ def write_c(program, out_dir, variables_path=None):
     prototypes = grouped_prototypes(files, emitter.prototype)
     (out_dir / "sound.h").write_text(
         file_header("sound.h", "the sound program's ports, variables, tables, structures and functions")
-        + "#ifndef ORUNNERS_SOUND_H\n#define ORUNNERS_SOUND_H\n\n#include \"sound/support.h\"\n\n"
+        + f"#ifndef {game_profile.GUARD}_SOUND_H\n#define {game_profile.GUARD}_SOUND_H\n\n"
+        + "#include \"sound/support.h\"\n\n"
         + "/* the board's I/O ports the program uses */\n" + "\n".join(emitter.port_declarations()) + "\n\n"
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM sound_symbols.txt labels */\n"
         + "\n".join(f"#define {name}_ADDRESS 0x{address:04X}u" for address, name in sorted(emitter.data_labels.items()))

@@ -24,7 +24,7 @@ small stays an address ("RAM16(0x20E562u + r3)"), so it wraps the way the V60's 
 Writes that do something besides storing (the protection device at 0x20E5C4, see machine.c) keep going
 through the bus.
 
-The program ROM shows up several times in the address space (orunners_rom.PROGRAM_AREAS): code that runs in
+The program ROM shows up several times in the address space (game_profile.rom.PROGRAM_AREAS): code that runs in
 a mirror reads its tables through that mirror. A table is named, and read, at its own copy.
 
 The map above is the V60's. Another program sets its own in the module's names below (MAP and the rest;
@@ -32,13 +32,12 @@ tools/decompile_sound.py: the Z80's shared RAM, ROM, sample bank and RF5C68).
 """
 from collections import Counter
 
-import orunners_rom
 from v60 import ir
 
 from . import cprint
 from . import pointers
 
-WORK_RAM = (0x200000, 0x220000)
+WORK_RAM = (0, 0)
 ROM_AREAS = ((0x000000, 0x200000), (0xF00000, 0x1000000))    # the program ROM, the first area holding it whole
 ADDRESS_MASK = 0xFFFFFF
 ADDRESS_DIGITS = 6
@@ -46,7 +45,9 @@ RAM_MACRO, ROM_MACRO = "RAM", "ROM"          # the lvalue and rvalue macros (gam
 RAM_FUNCTION, ROM_FUNCTION = "ram", "rom"    # ... and what gives a pointer into either
 PAGED = True                                 # tables read with 16-bit arithmetic inside their 64 KB page
 PLAYER_FIELDS = ()                           # reached by the player's number (pointers.py), not as tables
-CANONICAL = orunners_rom.canonical_address      # the copy of the ROM tables are named by
+CANONICAL = lambda address: address      # the copy of the ROM tables are named by
+NAMED_COPIES = True    # a constant in another copy of the ROM is named by its own copy's place (game_profile.py:
+                       # False where such a constant may be no address)
 ROM_NAMES_FROM = 0x1000                      # constants below are numbers, never ROM addresses (the vectors)
 NOTES = {
     "variables": ["/* the game's variables in work RAM; SCREEN_1 and SCREEN_2 are the blocks of the two screens,",
@@ -59,11 +60,10 @@ TYPES = {8: "uint8_t", 16: "uint16_t", 32: "uint32_t"}
 SIGNED = {"u8": (8, False), "s8": (8, True), "u16": (16, False), "s16": (16, True),
           "u32": (32, False), "s32": (32, True)}
 BUS_ONLY = []    # writes a device on the bus watches in work RAM (SegaSonic: its protection)
-VARIABLES = 0x20E000    # where the game's variables start, as a constant base (R24: GAME_VARIABLES)
+VARIABLES = None    # where the game's variables start, as a constant base (R24: GAME_VARIABLES)
 # work RAM addresses with a name of their own: the blocks of the two screens (R25 of each task) and the race
 # records (each screen's, and the copy of them each screen keeps)
-NAMED_BASES = {0x208000: "SCREEN_1", 0x218000: "SCREEN_2", 0x20FB00: "RACE_1", 0x20FB80: "RACE_2",
-               0x20FC00: "RACE_COPY_1", 0x20FC80: "RACE_COPY_2"}
+NAMED_BASES = {}
 HARDWARE = [(0x300000, 0x320000, "VIDEO"), (0x400000, 0x420000, "SPRITE_RAM"), (0x500000, 0x500010, "SPRITE_CONTROL"),
             (0x600000, 0x610000, "PALETTE"), (0x610000, 0x620000, "MIXER"), (0x700000, 0x702000, "SOUND"),
             (0xC00000, 0xC00080, "IO"), (0xD00000, 0xD00010, "IRQ"), (0xD80000, 0xD80010, "RANDOM")]

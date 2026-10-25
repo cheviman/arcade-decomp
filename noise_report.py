@@ -25,8 +25,10 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-BASELINE = Path(__file__).resolve().parent / "noise_baseline.txt"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import game_profile  # noqa: E402  (the game's: its root)
+ROOT = game_profile.ROOT
+BASELINE = ROOT / "tools" / "noise_baseline.txt"
 UNNAMED_ADDRESSES = ROOT / "build" / "decompile" / "unnamed_addresses.txt"
 
 FUNCTION = re.compile(r"^(?:static )?\w[\w ]*?\b(\w+)\((.*)\)$")

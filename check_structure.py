@@ -19,8 +19,9 @@ import random
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import game_profile  # noqa: E402  (the game's: its root)
+ROOT = game_profile.ROOT
 
 from decompiler import gotos  # noqa: E402
 from decompiler import structure as tree_nodes  # noqa: E402

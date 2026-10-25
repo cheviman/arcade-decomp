@@ -10,10 +10,10 @@ Author:      Sebastian Toyos
 
 The decompiler's FunctionWriter does the work (decompiler/emit.py); this gives it the Z80's memory and
 effects. MEMORY_MAP is the Z80's for decompiler/memory.py and decompiler/pointers.py: the RAM it shares
-with the V70 (E000-FFFF) holds the variables and the structures sound_symbols.txt names, read and written
-as lvalues over those bytes (SOUND_RAM8, VOICE(p)->field); the program ROM (0000-9FFF) the tables; the
-banked page of the sound ROM (A000-BFFF) and the MultiPCM (C000-DFFF) are the board's, reached through its bus by
-name. A computed address no structure explains goes over the bus, z80_read8/16() and z80_write8/16()
+with the main CPU (E000-FFFF) holds the variables and the structures sound_symbols.txt names, read and
+written as lvalues over those bytes (SOUND_RAM8, VOICE(p)->field); the program ROM (0000-9FFF) the tables;
+the banked page of the sound ROM (A000-BFFF) and the sound chip (C000-DFFF) are the board's, reached through
+its bus by name (game_profile.SOUND_HARDWARE). A computed address no structure explains goes over the bus, z80_read8/16() and z80_write8/16()
 (runtime/include/sound/support.h). The timing model's Effects (z80_block, z80_cycles), DI and EI, OUT and
 the block moves print as calls of that header, the ports by the names sound_symbols.txt gives them.
 """
@@ -22,14 +22,19 @@ from v60 import ir
 
 SHARED_RAM = (0xE000, 0x10000)
 PROGRAM_ROM = (0x0000, 0xA000)
+BLOCK_FETCHES = True    # a block's z80_block() says its opcode fetches too, which count R up (the game's runtime
+                        # keeps R: game_profile.SOUND_BLOCK_FETCHES)
 
 
 def use_memory_map(names, arrays):
     """Makes the Z80's memory the one decompiler/memory.py and decompiler/pointers.py work on: 'names'
     (disassemble.Names) gives the structures, 'arrays' ({struct: (first, count)}) where they stand one
     after another."""
+    import game_profile
     from decompiler import memory
     from decompiler import pointers
+    global BLOCK_FETCHES
+    BLOCK_FETCHES = getattr(game_profile, "SOUND_BLOCK_FETCHES", True)
     memory.WORK_RAM = SHARED_RAM
     memory.ROM_AREAS = (PROGRAM_ROM,)
     memory.ADDRESS_MASK = 0xFFFF
@@ -41,16 +46,11 @@ def use_memory_map(names, arrays):
     memory.CANONICAL = lambda address: address
     memory.ROM_NAMES_FROM = 0x0100    # the restarts and the interrupt's code are below
     memory.VARIABLES = None
-    memory.HARDWARE = [(0xA000, 0xC000, "SAMPLE_BANK"), (0xC000, 0xE000, "MULTIPCM")]
+    memory.HARDWARE = list(game_profile.SOUND_HARDWARE)    # the board's: its banked window and its sound chip
     memory.BUS_ONLY = []
     memory.BYTE_INDEXES = True
     memory.NAMED_BASES = {}
-    memory.NOTES = {
-        "variables": ["/* the sound program's variables, in the RAM it shares with the V70 (E000-FFFF) */"],
-        "scoped": ["/* shared RAM as one family of functions uses it */"],
-        "tables": ["/* data in the program ROM the code reads */"],
-        "hardware": ["/* the banked page of the sound ROM and the MultiPCM (read and written through the bus) */"],
-    }
+    memory.NOTES = dict(game_profile.SOUND_NOTES)
     pointers.STRUCTS = dict(names.structs)
     pointers.PLAYERS = (0, 0, 0)
     pointers.VARIABLES = None
@@ -65,6 +65,11 @@ def use_memory_map(names, arrays):
     pointers.ARRAYS = dict(arrays)
     pointers.INSTANCES = {}
     pointers.VARIABLE_BLOCKS = {}
+    pointers.BASE_KINDS = {}
+    pointers.PAGE_LINK_KINDS = {}
+    pointers.NESTED = {}
+    pointers.BELOW = {}
+    pointers.OWN_REGISTERS = ()
     pointers.STRUCT_FUNCTION = "sound_ram_at"
     pointers.ROM_STRUCTS = set(names.rom_structs)    # records of the sound program's ROM: read only
     pointers.RUNS = set(names.rom_structs)           # ... one after another wherever a pointer starts
@@ -114,6 +119,8 @@ class SoundWriter(emit.FunctionWriter):
         name = statement.name
         args = statement.args
         if name == "z80_block":
+            if not BLOCK_FETCHES:
+                return [f"z80_block({args[0].value});"]
             return [f"z80_block({args[0].value}, {args[1].value});"]
         if name == "refresh_read":
             return [f"{self.register_set(args[1].value)} = refresh_read({args[0].value});"]

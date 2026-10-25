@@ -1,4 +1,4 @@
-﻿"""
+"""
 Name:        pointers.py
 Description: works out which registers point at which of the game's structures, so that a memory access
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
@@ -66,8 +66,8 @@ names below (tools/decompile_sound.py: the Z80's sound channels in its shared RA
 """
 from v60 import ir
 
-STRUCTS = {"object": 0x100, "car": 0x200, "screen": 0x8000, "object_area": 0x8000}
-VARIABLES = 0x20E000          # the base of the game's variables (R24, which the code adds offsets to: the race
+STRUCTS = {}
+VARIABLES = None          # the base of the game's variables (R24, which the code adds offsets to: the race
                               # records' copies from rom_00E0A0); R25 is the block of the screen each task runs
 PLAYERS = (0, 0, 0)           # first, size, count of a run of player blocks (SegaSonic's); none
 # (struct, offset) or ("global", address) -> (struct, bits): what a field or variable points at (Program)
@@ -76,20 +76,20 @@ TARGETS = {}
 # ("global", family, address) the same for a variable of the work RAM the family uses its own way
 SCOPED_TARGETS = {}
 GLOBAL_FAMILY = None          # the family whose own names of the work RAM the function being analysed uses
-CONTEXT_KINDS = {20: ("object", 0), 23: ("car", 0), 25: ("screen", 0)}
-OBJECT_REGISTERS = (20,)      # what the game keeps here it reads as objects, wherever it put them
-OWN_REGISTERS = (20,)         # what points at the object a function runs on when it starts (the object loop's)
-HANDLER_FIELD = ("object", 4)  # where an object keeps the code the object loop runs for it: set to a function of a
+CONTEXT_KINDS = {}
+OBJECT_REGISTERS = ()      # what the game keeps here it reads as objects, wherever it put them
+OWN_REGISTERS = ()         # what points at the object a function runs on when it starts (the object loop's)
+HANDLER_FIELD = None  # where an object keeps the code the object loop runs for it: set to a function of a
                                # family, the object is that family's
 # blocks of the work RAM the object registers walk as variables, not as objects: start -> size (the test
 # mode reads and writes the settings, 0x20E600-0x20E67F, through R20)
-VARIABLE_BLOCKS = {0x20E600: 0x80}
+VARIABLE_BLOCKS = {}
 REGIONS = {"rom"}             # kinds that are a memory, not a structure
 OFFSET = ("offset", 0)        # not a pointer: a value below 0x10000 (a halfword read, a mask...), an offset
 CONFLICT = ("conflict", 0)    # callers that know different things: nothing is known
 UNKNOWN = ("unknown", 0)      # a caller that does not know
 ROUNDS = 40
-WORK_RAM = (0x200000, 0x220000)
+WORK_RAM = (0, 0)
 ADDRESS_MASK = 0xFFFFFF
 POINTER_BITS = 32              # a value read at this width holds a whole address
 PAGE_LINKS = True              # structures linked by the low halves of their addresses, in the work RAM page
@@ -103,22 +103,19 @@ CONSTANTS = False              # registers keep the constants they are set to, s
                                # (the Z80's "ld de,12h ... add iy,de") keeps its kind
 PAGED = False                  # structures a page long, one per page: (p & FF00) | n is field n of p's (page_parts)
 # addresses that are a structure of the game: the blocks of the two screens (R25 of each task)
-BASE_KINDS = {0x208000: ("screen", 0), 0x218000: ("screen", 0)}
+BASE_KINDS = {}
 # what the page of a structure's address plus a 16-bit link points at, where it is not the same structure:
 # the objects of a screen are in the page of its block (0x200400-0x207FFF, 0x210400-0x217FFF)
-PAGE_LINK_KINDS = {"screen": ("object", 0)}
+PAGE_LINK_KINDS = {}
 # structures inside others: struct -> (offset, size, inner struct); a pointer into one is a pointer to it
-NESTED = {"screen": ((0x1000, 0x200, "car"),),
-          "object_area": ((0x100, 0x100, "object"), (0x200, 0x100, "object_list"), (0x300, 0x100, "object_list"))
-          + tuple((0x400 + 0x100 * n, 0x100, "object") for n in range(124))}
+NESTED = {}
 # structures right below others: struct -> (size, the structure below it): below each screen's block, its
 # objects' area (the lists of the objects, their slots, the spare object and the 124 objects)
-BELOW = {"screen": (0x8000, "object_area")}
+BELOW = {}
 # structures at fixed addresses, whose fields the code also reaches by their own address: start -> (struct,
 # how far into it): the blocks of the two screens (up to the game's variables at 0x20E000) and the race
 # records (each screen's, and the copy of them each screen keeps)
-INSTANCES = {0x208000: ("screen", 0x6000), 0x218000: ("screen", 0x6000), 0x20FB00: ("race", 0x80),
-             0x20FB80: ("race", 0x80), 0x20FC00: ("race", 0x80), 0x20FC80: ("race", 0x80)}
+INSTANCES = {}
 RUNS = set()                   # structures laid one after another wherever a pointer starts (no fixed base,
                                # unlike ARRAYS): a pointer moved past one points into the next
 ELEMENTS = {}                  # ROM structure -> element type: an array of one value per element (symbols.txt

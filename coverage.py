@@ -27,10 +27,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parent
-ROOT = TOOLS.parent
 sys.path.insert(0, str(TOOLS))
+import game_profile  # noqa: E402  (the game's: its root, its ROM set, its settings)
+ROOT = game_profile.ROOT
 import disassemble  # noqa: E402
-import orunners_rom  # noqa: E402
 from v60 import disassembler as dis  # noqa: E402
 
 CODE = "code"
@@ -50,7 +50,7 @@ FIXED_MODES = {"pc_disp", "pc_disp_indexed", "pc_disp_indirect", "pc_disp_indire
 # ... and the ones among them where a jump or call reads its target from that place
 INDIRECT_MODES = {"pc_disp_indirect", "pc_disp_indirect_indexed", "pc_double_disp",
                   "direct_deferred", "direct_deferred_indexed"}
-CODE_CHIPS = orunners_rom.PROGRAM_AREAS[:2]
+CODE_CHIPS = game_profile.rom.PROGRAM_AREAS[:2]
 
 
 def data_references(analysis):
@@ -67,7 +67,7 @@ def data_references(analysis):
             # a jump or call names code with its operand, unless it reads the target from memory
             if operand.mode not in FIXED_MODES or (jumps and operand.mode not in INDIRECT_MODES):
                 continue
-            place = orunners_rom.canonical_address(operand.value)
+            place = game_profile.rom.canonical_address(operand.value)
             if place is not None and place not in analysis.owner:
                 references[place].append(instruction.address)
     # data symbols count as references made by symbols.txt (no instruction address)
@@ -84,7 +84,7 @@ def classify(analysis, references):
     for first, stop in analysis.described:
         described.update(range(first, stop))
     classes = {}
-    for start, end in orunners_rom.PROGRAM_AREAS:
+    for start, end in game_profile.rom.PROGRAM_AREAS:
         current = UNKNOWN
         for address in range(start, end):
             if address in analysis.owner:
@@ -166,14 +166,14 @@ def pointers_to(analysis, targets):
     """32-bit words outside code (any alignment) whose value is one of 'targets', through any mirror"""
     image = analysis.image
     found = defaultdict(list)
-    for start, end in orunners_rom.PROGRAM_AREAS:
+    for start, end in game_profile.rom.PROGRAM_AREAS:
         for address in range(start, end - 3):
             if address in analysis.owner:
                 continue
             value = int.from_bytes(image[address:address + 4], "little")
             if value >= 0x1000000:
                 continue
-            target = orunners_rom.canonical_address(value)
+            target = game_profile.rom.canonical_address(value)
             if target in targets:
                 found[target].append(address)
     return found
@@ -185,7 +185,7 @@ def write_coverage(analysis, references, classes, path):
     header = f"{'area':<14}" + "".join(f"{name:>16}" for name in CLASSES) + f"{'total':>10}"
     lines.append(header)
     totals = Counter()
-    for start, end in orunners_rom.PROGRAM_AREAS:
+    for start, end in game_profile.rom.PROGRAM_AREAS:
         counts = Counter(classes[address] for address in range(start, end))
         if sum(counts.values()) != end - start:
             raise SystemExit(f"coverage: {start:06X}-{end - 1:06X} classes do not add up to the area size")
@@ -194,7 +194,7 @@ def write_coverage(analysis, references, classes, path):
                      + f"{end - start:10}")
     lines.append(f"{'total':<14}" + "".join(f"{totals[name]:16}" for name in CLASSES)
                  + f"{sum(totals.values()):10}")
-    image_size = sum(end - start for start, end in orunners_rom.PROGRAM_AREAS)
+    image_size = sum(end - start for start, end in game_profile.rom.PROGRAM_AREAS)
     if sum(totals.values()) != image_size:
         raise SystemExit("coverage: classes do not add up to the program image size")
 
@@ -238,7 +238,7 @@ def main():
         del arguments[position:position + 2]
     source = Path(arguments[0]) if arguments else ROOT / "rom"
 
-    image = orunners_rom.build_program(orunners_rom.load_set(source))
+    image = game_profile.rom.build_program(game_profile.rom.load_set(source))
     executed, _ = disassemble.load_trace(trace_paths)
     analysis = disassemble.Analysis(image, disassemble.load_symbols(ROOT / "symbols.txt"), executed)
     analysis.run()
