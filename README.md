@@ -1,9 +1,15 @@
-# decomp-core
+# arcade-decomp
 
-The decompiler and analysis tools shared by [segasonic-decomp](https://github.com/cheviman/segasonic-decomp)
+Tools to decompile arcade games into readable C that does exactly what the original does, checked frame by
+frame against MAME: the CPUs' frontends, the decompiler, the static analysis, the checks and the asset
+formats, shared by the games decompiled with them, [segasonic-decomp](https://github.com/cheviman/segasonic-decomp)
 (SegaSonic The Hedgehog, Sega System 32) and [outrunners-decomp](https://github.com/cheviman/outrunners-decomp)
-(OutRunners, Sega System Multi 32): arcade programs decompiled into C that does exactly what the original
-does, checked frame by frame against MAME.
+(OutRunners, Sega System Multi 32). Arcade boards only: a game is its CPUs' code, its board's chips and its
+ROM, which this is made for (a PC or console game, with an operating system and its libraries, is not).
+
+The root holds what any arcade game uses; a family of boards gets a folder of its own: `system32/` will
+hold Sega's System 32 and Multi 32 (the board in C and the reference that runs the original on MAME's cores),
+and the CPUs and boards of the next families come the same way (Konami's 68000 and 053248 boards).
 
 Each game keeps this repository in its `tools/core/` (a `git subtree`), and its own `tools/game_profile.py`
 tells the core about it. Nothing here is a game's: no ROM, no names, no data.
@@ -50,7 +56,7 @@ the path; the game's other tools add `tools/core` to their path to import the co
 core:
 
 ```bash
-git subtree pull --prefix=tools/core https://github.com/cheviman/decomp-core main --squash
+git subtree pull --prefix=tools/core https://github.com/cheviman/arcade-decomp main --squash
 ```
 
 ## Legal
