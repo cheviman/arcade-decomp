@@ -278,6 +278,14 @@ class Printer(cprint.Printer):
                     return cprint.Value(f"{near[0]}_ADDRESS + 0x{near[1]:X}u", cprint.ADD, True, "u32")
                 # an address in the ROM nothing names yet
                 self.writer.emitter.raw_addresses.setdefault(node.value, set()).add(self.writer.function.name)
+            elif node.value in self.writer.emitter.referenced and id(node) not in self.writer.sum_operands():
+                # an address below 0x10000 an instruction names (absolute or PC-relative): a few bytes into a
+                # piece of data (a text's characters past its place), or one nothing names yet (in a sum, as
+                # above 0x10000, a table of branches the code jumps into is no value of its own)
+                near = self.writer.emitter.label_before(node.value)
+                if near is not None:
+                    return cprint.Value(f"{near[0]}_ADDRESS + 0x{near[1]:X}u", cprint.ADD, True, "u32")
+                self.writer.emitter.raw_addresses.setdefault(node.value, set()).add(self.writer.function.name)
         return super().emit(node)
 
 
@@ -2332,6 +2340,7 @@ class Emitter:
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
                                     # something else puts its own in its place (decompile.py, replaced_functions)
         self.raw_addresses = {}     # ROM address printed as a number -> the functions that use it
+        self.referenced = set()     # addresses below 0x10000 the program's instructions name (decompile.py)
         self.constants = {}         # (function name, value) -> its name (symbols.txt constant lines)
         self.constants_used = set()  # the (function name, value) of those the C printed
         self.writes = {}            # entry -> what a function may write (dataflow summaries)
@@ -2488,8 +2497,8 @@ class Emitter:
                     return f"{found[0].name}_ADDRESS + 0x{address - found[0].address:X}u", cprint.ADD
             return (f"{item.name}_ADDRESS", cprint.PRIMARY) if item is not None else None
         if memory.program_rom(address):
-            if address < memory.ROM_NAMES_FROM:
-                return None
+            if address < memory.ROM_NAMES_FROM and address not in self.referenced:
+                return None    # (a number below it is no address, unless an instruction names it as one)
             canonical = memory.own_copy(address)
             if canonical != address and not memory.NAMED_COPIES:
                 # another copy of the ROM: its own value, which may be no address at all (OutRunners' memory

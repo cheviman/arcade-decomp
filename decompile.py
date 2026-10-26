@@ -90,6 +90,25 @@ def load_program(source):
     return program
 
 
+# the operands that name an address: absolute, or relative to the instruction (not a register's displacement)
+ADDRESS_MODES = {"direct", "direct_indexed", "direct_deferred", "direct_deferred_indexed", "pc_disp",
+                 "pc_disp_indexed", "pc_disp_indirect", "pc_disp_indirect_indexed", "pc_double_disp"}
+
+
+def referenced_addresses(program):
+    """The addresses below 0x10000 the program's instructions name (absolute or PC-relative operands): a
+    number of the C with one of these values is an address, not a count, and emit.py notes it among the ROM
+    addresses printed as numbers when nothing names it (above 0x10000 any ROM address is). Below 0x100 and
+    at whole multiples of 0x100 a number is as likely a count or a structure's offset as an address (the
+    boot's 6, a screen block's 1000): those are left out, as above 0x10000 the whole multiples of 0x10000 are.
+    An absolute operand of MOVEA reads nothing there: the code works out a sum with it (SegaSonic's
+    "movea.h 140(R1), R2", 0x140 + 2 * R1), so only the PC-relative ones count for it."""
+    return {operand.value for instruction in program.analysis.instructions.values()
+            for operand in instruction.operands
+            if operand.mode in ADDRESS_MODES and 0x100 <= operand.value < 0x10000 and operand.value & 0xFF
+            and (operand.mode.startswith("pc_") or not instruction.mnemonic.startswith("movea"))}
+
+
 def merge_entries(program):
     """A function that, after some code of its own, jumps into the middle of code another function has
     too (the player's update runs into the state code the player's animation has) is that code and a
@@ -730,6 +749,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     emitter.register_names = dict(known.registers)
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
     emitter.second_entries = dict(program.second_entries)
+    emitter.referenced = referenced_addresses(program)
     table = code_table(program, flow)
     emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in table
                               if address >= 0x1000 and address in names}

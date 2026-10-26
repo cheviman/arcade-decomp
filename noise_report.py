@@ -34,6 +34,8 @@ UNNAMED_ADDRESSES = ROOT / "build" / "decompile" / "unnamed_addresses.txt"
 FUNCTION = re.compile(r"^(?:static )?\w[\w ]*?\b(\w+)\((.*)\)$")
 # a result written back through its pointer from the function's variable for it, whole or the part the
 # function writes: *p_x = x; *p_x = (*p_x & 0xFFFF0000u) | x; *p_x = (*p_x & 0xFFFF0000u) | (x & 0xFFFFu);
+# the Z80's registers, which the sound program's C (src/sound/) names its values after until a line names them
+Z80_REGISTER = r"(?:a|b|c|d|e|h|l|af|bc|de|hl|ix|iy|ixh|ixl|iyh|iyl)(?:_\d+)?"
 COPY_BACK = re.compile(r"^\t+\*p_(\w+) = (?:\w+|\(\*p_\1 & 0x[0-9A-F]+u\) \| (?:\w+|\(\w+ & 0x[0-9A-F]+u\)));$")
 # kind -> (what it is, pattern counted in the code lines; None: counted below)
 KINDS = {
@@ -45,8 +47,9 @@ KINDS = {
                   re.compile(r"(?<!->)(?<!\.)\brom_[0-9A-F]{6}\b")),
     "unk_fields": ("fields of a structure named after their offset (->unk_XX)",
                    re.compile(r"(?:->|\.)unk_[0-9A-F]{2,4}\b")),
-    "register_names": ("parameters and locals named after a register (r1, p_r4, r0_2)", None),
+    "register_names": ("parameters and locals named after a register (r1, p_r4, r0_2; the Z80's a, hl)", None),
     "temp_names": ("values the decompiler works out once, named by a number (t1)", None),
+    "stack_names": ("stack slots named after their offset (stack_4)", None),
 
 
     "context_registers": ("uses of the registers the C keeps as globals, still named after them (src/game.h)", None),
@@ -78,6 +81,7 @@ def count(paths):
         lines = path.read_text(encoding="ascii", errors="replace").splitlines()
         counts["lines"] += len(lines)
         in_function = False
+        z80 = "sound" in path.parts    # (the sound program's C: its registers have names of their own)
         for index, line in enumerate(lines):
             if line.startswith(("/*", "   ", " *")):
                 continue    # (comments)
@@ -92,6 +96,9 @@ def count(paths):
                 if found.group(1) == "BOARD_ORIGINAL":
                     counts["board_replaced"] += 1
                 counts["register_names"] += len(re.findall(r"(?<!\w)(?:p_)?r\d+(?:_\d+)?(?=[,)]|$)", found.group(2)))
+                if z80:
+                    counts["register_names"] += len(re.findall(rf"(?<!\w)(?:p_)?{Z80_REGISTER}(?=[,)]|$)",
+                                                               found.group(2)))
                 continue
             if not in_function:
                 continue
@@ -100,7 +107,10 @@ def count(paths):
                     counts[kind] += len(pattern.findall(line))
             if re.match(r"^\t(?:uint\d+_t|int\d+_t) ", line):
                 counts["register_names"] += len(re.findall(r"\br\d+(?:_\d+)? = ", line))
+                if z80:
+                    counts["register_names"] += len(re.findall(rf"\b{Z80_REGISTER} = ", line))
                 counts["temp_names"] += len(re.findall(r"\bt\d+ = ", line))
+                counts["stack_names"] += len(re.findall(r"\bstack_[0-9A-F]+ = ", line))
             if line.startswith("\tbool "):
                 counts["control_variables"] += 1
             if COPY_BACK.match(line) and not COPY_BACK.match(lines[index - 1]):
