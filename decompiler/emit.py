@@ -2183,12 +2183,13 @@ class FunctionWriter:
                 lines += [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({self.expr(node.value)});", pad + "}"]
                 return lines
             target = self.expr(node.value)
-            lines = [pad + f"switch ({target})", pad + "{"]
+            lines = []
             if not re.fullmatch(r"\w+", target):
-                # (the address once, for the cases and the default)
+                # (the address once, for the switch and the default)
                 value = target
                 target = self.fresh("jump_target")
-                lines.insert(0, pad + f"{target} = {value};")
+                lines.append(pad + f"{target} = {value};")
+            lines += [pad + f"switch ({target})", pad + "{"]
             for values, body in node.cases:
                 lines += [pad + f"case 0x{value:06X}u:" for value in values]
                 lines += self.nodes(body, depth + 1)
