@@ -1353,6 +1353,8 @@ class FunctionWriter:
         name = pointer if element else f"{pointer}{member}{layouts.names[struct][field_offset]}"
         if element_number is not None:
             name = f"{name}[{self.record_number(element_number)}]"
+        elif not element and layouts.array_count(struct, field_offset) is not None:
+            name = f"{name}[0]"    # (the first element of a field that is an array, through its record)
         overlay = layouts.overlay(struct, offset, bits) if field_offset == offset else None
         if field_offset == offset and field_bits == bits:
             generic = name, layouts.signed[struct][offset], True

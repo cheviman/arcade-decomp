@@ -514,6 +514,10 @@ def kind_of(node, state, zeros):
         found = kind_of(args[0], state, zeros)
         if found is not None and found[0] in ("to", "rel"):
             return found
+    if name in ("zext", "fits"):
+        found = kind_of(args[0], state, zeros)
+        if records_kind(found):
+            return found    # (a pointer to a record in the ROM's first 64 KB, known to fit 16 bits)
     if PAGED and name in ("and", "or", "shl"):
         found = page_parts(node, state, zeros)
         if found is not None:
@@ -705,6 +709,8 @@ def access(address, state, zeros=None):
     if isinstance(address, ir.Op) and address.name in ("add", "sub") and isinstance(address.args[1], ir.Const):
         base = address.args[0]
         displacement = address.args[1].value if address.name == "add" else -address.args[1].value
+    while isinstance(base, ir.Op) and base.name in ("zext", "fits") and records_kind(kind_of(base.args[0], state, {})):
+        base = base.args[0]    # (a pointer to a record in the ROM's first 64 KB, known to fit 16 bits: the pointer)
     if isinstance(base, ir.Reg):
         kind = state.get(base.index)
     elif isinstance(base, ir.Op) and (base.name == "or" or base.name == "add" and isinstance(base.args[0], ir.Const)):
@@ -822,6 +828,8 @@ def indexed_access(address, state, in_fields=True, zeros=None):
             pointer, kind = term, found
             break
     if pointer is None:
+        if any(found is not None and (found[0] in STRUCTS or found[0] == "global") for found in kinds):
+            return None    # (a field of a structure a register points at: the constant is its offset, no table)
         table = record_table(constant & ADDRESS_MASK)
         if table is None:
             return None

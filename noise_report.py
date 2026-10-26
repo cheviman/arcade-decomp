@@ -10,7 +10,7 @@ Author:      Sebastian Toyos
 Every kind of leftover the C can still have, counted in one pass over the generated C, so a round of work
 shows what it took away and nothing comes back unseen: gotos, functions and locals named after an address
 or a register, values the decompiler works out once named by a number, the registers the C keeps as globals,
-fields and memory named after their place, memory reached through computed addresses, results written back
+fields, memory and tables of the ROM named after their place, memory reached through computed addresses, results written back
 again before an early return (a function writes them once, at its end, where its ways out can meet), jumps
 out of a table, ROM addresses printed as numbers, functions without a comment, data read through its ROM
 address instead of a table or structure with a name, tables the C names over the ROM (src/ram.h), functions
@@ -19,7 +19,7 @@ the board puts its own in place of. The counts are compared with tools/noise_bas
 Usage: python tools/noise_report.py [--save] [--src DIR] [--files]
   --save   write the counts as the new baseline (after a round that took something away)
   --src    count another copy of the C (tools/decompile.py --out DIR) against the same baseline
-  --files  also the data read through its ROM address, file by file
+  --files  also the data read through its ROM address and the tables named after theirs, file by file
 """
 import re
 import sys
@@ -41,6 +41,8 @@ KINDS = {
     "control_variables": ("functions with bool control variables", None),
     "sub_functions": ("functions named after their address (sub_XXXXXX, the sound program's sound_XXXX)", None),
     "unk_names": ("memory named after its address (unk_XXXXXX)", re.compile(r"(?<!->)(?<!\.)\bunk_[0-9A-F]{4,6}\b")),
+    "rom_names": ("tables of the program ROM named after their address (rom_XXXXXX)",
+                  re.compile(r"(?<!->)(?<!\.)\brom_[0-9A-F]{6}\b")),
     "unk_fields": ("fields of a structure named after their offset (->unk_XX)",
                    re.compile(r"(?:->|\.)unk_[0-9A-F]{2,4}\b")),
     "register_names": ("parameters and locals named after a register (r1, p_r4, r0_2)", None),
@@ -160,10 +162,11 @@ def main():
             rose.append(kind)
     if "--files" in arguments:
         print()
+        print(f"{'rom_reads':>9s} {'rom_names':>9s}")
         for path in sources:
-            found = count([path])["rom_reads"]
-            if found:
-                print(f"{found:5d}  {path.relative_to(source).as_posix()}")
+            found = count([path])
+            if found["rom_reads"] or found["rom_names"]:
+                print(f"{found['rom_reads']:9d} {found['rom_names']:9d}  {path.relative_to(source).as_posix()}")
     if "--save" in arguments and source == ROOT / "src":
         BASELINE.write_text("# KIND COUNT: tools/noise_report.py --save writes it\n" +
                             "".join(f"{kind} {value}\n" for kind, value in counts.items()), encoding="ascii")
