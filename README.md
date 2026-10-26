@@ -32,7 +32,15 @@ Nothing here is a game's: no ROM, no names, no data.
   `tools/noise_baseline.txt`.
 - `coverage.py`: every byte of the program ROM classified as code, data or fill.
 - `data_formats.py`, `asset_formats.py`: the program's data as text, and the graphics and samples as PNG and
-  WAV files, and back, byte for byte (the game's `formats/` add its own data formats).
+  WAV files, and back, byte for byte. `formats/common.py` holds the data formats' helpers; `formats` is a
+  namespace package (no `__init__.py`), so the game's `tools/formats/` adds its own formats to it.
+- `check_scenarios.py`: every control script of the game's `tests/controls/` run on the reference and on the
+  game (or the translation scaffold), compared frame by frame (state, and with `--video` and `--sound` the
+  pictures and the sound), and the static analysis checked against all the code the reference ran.
+- `verify_rom.py`: the player's ROM set checked file by file (CRC32 and SHA-1).
+- `render_state.py`: a board state the reference saved, its text layer and tilemap pages drawn as PNG.
+- `memory_census.py`: which of the board's memories each line of the C that reaches memory through an
+  address reaches, over the scenarios (a build of the game with its census on).
 
 ## A game's profile
 
@@ -41,7 +49,8 @@ and gives the core
 
 - `ROOT`, the game's repository; `rom`, its ROM set's module (`load_set`, `build_program`, `build_sound`,
   `PROGRAM_AREAS`, `canonical_address`, `ProgramMemory`);
-- `GAME`, `ROM_SET_TITLE`, `CPU`, `GUARD`: what the generated files say of the game;
+- `GAME`, `ROM_SET_TITLE`, `CPU`, `GUARD`: what the generated files say of the game; `BINARY`, the prefix of
+  its executables (`sonic_game_headless`, `orunners_headless`);
 - the decompiler's settings, which it writes into the core's modules: the structures the game keeps
   (`pointers.STRUCTS`), what the registers the whole program shares hold (`signatures.CONTEXT`,
   `pointers.CONTEXT_KINDS`), the base of its variables, its object handler's slots, the fixed structures and
@@ -52,7 +61,8 @@ Each module keeps neutral defaults, and says which of its settings a profile giv
 ## Using it in a game
 
 The game's scripts in `tools/` (`decompile.py`, `decompile_sound.py`, `recompile.py`, `disassemble.py`,
-`check_structure.py`, `noise_report.py`, `coverage.py`) run the core's with the core and the game's tools on
+`check_structure.py`, `noise_report.py`, `coverage.py`, `check_scenarios.py`, `verify_rom.py`,
+`render_state.py`, `memory_census.py`) run the core's with the core and the game's tools on
 the path; the game's other tools add `tools/core` to their path to import the core's modules. A game takes
 the core with
 
