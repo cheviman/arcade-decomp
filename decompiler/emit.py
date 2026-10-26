@@ -1913,7 +1913,7 @@ class FunctionWriter:
                 return [shorter]
             source, length1, dest, length2, size, fill, downward = (self.exact(arg) for arg in args)
             # (R26, the fill, only where the move fills)
-            fill_value = "0u" if isinstance(args[5], ir.Const) and not args[5].value else self.use(("r", 26))
+            fill_value = "0u" if isinstance(args[5], ir.Const) and not args[5].value else self.fill_register()
             return [f"move_string({source}, {length1}, {dest}, {length2}, {size}, {fill}, {downward}, "
                     f"{fill_value}, &{self.register_set(27)}, &{self.register_set(28)});"]
         if name in ("move_bits_down", "move_bits_up"):
@@ -1955,8 +1955,13 @@ class FunctionWriter:
             return f"move_{unit}{backward}({self.address_argument(dest)}, {self.address_argument(source)}, " \
                    f"{self.exact(length1)});"
         if fill.value and not downward.value and length1 == ir.Const(0, length1.bits):
-            return f"set_{unit}({self.address_argument(dest)}, {self.exact(length2)}, {self.use(('r', 26))});"
+            return f"set_{unit}({self.address_argument(dest)}, {self.exact(length2)}, {self.fill_register()});"
         return None
+
+    def fill_register(self):
+        """The variable a string move's fill (R26) is read from."""
+        name = self.vars.implicit_name(self.current, 26) if 26 not in self.emitter.context else None
+        return name if name is not None else self.use(("r", 26))
 
     def address_argument(self, node):
         """C for what a helper takes as an address: a constant one by its name, or as a place in the work

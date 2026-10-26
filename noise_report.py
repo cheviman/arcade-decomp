@@ -91,7 +91,7 @@ def count(paths):
                     counts["sub_functions"] += 1
                 if found.group(1) == "BOARD_ORIGINAL":
                     counts["board_replaced"] += 1
-                counts["register_names"] += len(re.findall(r"(?<!\w)(?:p_)?r\d+(?:_\d+)?(?=[,)])", found.group(2)))
+                counts["register_names"] += len(re.findall(r"(?<!\w)(?:p_)?r\d+(?:_\d+)?(?=[,)]|$)", found.group(2)))
                 continue
             if not in_function:
                 continue

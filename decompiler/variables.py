@@ -145,6 +145,9 @@ class Variables:
                 and isinstance(statement.args[1], ir.Const):
             low = statement.args[1].value
             return [index for index in (low, low + 1) if self.scratch(index)]
+        if isinstance(statement, ir.Effect) and statement.name == "move_string" \
+                and not (isinstance(statement.args[5], ir.Const) and not statement.args[5].value):
+            return [26] if self.scratch(26) else []    # (the fill, R26, where the move fills)
         if isinstance(statement, (ir.Return, ir.TailCall, ir.InterruptReturn)):
             reads = set(self.end_reads(statement))
             if isinstance(statement, ir.TailCall):
