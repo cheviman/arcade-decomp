@@ -11,8 +11,9 @@ The root holds what any arcade game uses; a family of boards gets a folder of it
 hold Sega's System 32 and Multi 32 (the board in C and the reference that runs the original on MAME's cores),
 and the CPUs and boards of the next families come the same way (Konami's 68000 and 053248 boards).
 
-Each game keeps this repository in its `tools/core/` (a `git subtree`), and its own `tools/game_profile.py`
-tells the core about it. Nothing here is a game's: no ROM, no names, no data.
+Each game keeps this repository in its `tools/core/` (a git submodule: the game's repository holds which
+commit of the core it uses, not the core), and its own `tools/game_profile.py` tells the core about it.
+Nothing here is a game's: no ROM, no names, no data.
 
 ## What is here
 
@@ -52,12 +53,22 @@ Each module keeps neutral defaults, and says which of its settings a profile giv
 
 The game's scripts in `tools/` (`decompile.py`, `decompile_sound.py`, `recompile.py`, `disassemble.py`,
 `check_structure.py`, `noise_report.py`, `coverage.py`) run the core's with the core and the game's tools on
-the path; the game's other tools add `tools/core` to their path to import the core's modules. To take a newer
-core:
+the path; the game's other tools add `tools/core` to their path to import the core's modules. A game takes
+the core with
 
 ```bash
-git subtree pull --prefix=tools/core https://github.com/cheviman/arcade-decomp main --squash
+git submodule add https://github.com/cheviman/arcade-decomp tools/core
 ```
+
+and a newer core (checked on every game that uses it: its scenarios frame by frame, its structure check)
+with
+
+```bash
+git submodule update --remote tools/core
+```
+
+and a commit of `tools/core`. A clone of a game takes its core with `git clone --recursive`, or
+`git submodule update --init` in a clone made without it.
 
 ## Legal
 
