@@ -18,7 +18,7 @@ pieces of C. Function names come from symbols.txt; unnamed functions are sub_ADD
 someone works out what they do.
 
 Instructions take no time. The board's events and the interrupts they raise run only in the game's
-frame loop (frame_wait_loop in symbols.txt), as tools/reference/s32ref runs them with frame timing.
+frame loop (frame_wait_loop in symbols.txt), as system32/reference/s32ref runs them with frame timing.
 """
 import sys
 from collections import Counter

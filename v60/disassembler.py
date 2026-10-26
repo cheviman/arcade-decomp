@@ -9,7 +9,7 @@ Modified:    11-10-2026
 Author:      Sebastian Toyos
 
 Ported from MAME src/devices/cpu/v60/v60d.cpp. The text of every instruction matches MAME's
-output exactly: tools/reference/compare_with_mame.py builds the original and diffs both.
+output exactly: system32/reference/compare_with_mame.py builds the original and diffs both.
 On top of the text, every instruction carries its decoded operands and control flow,
 which is what the analyzer and the C generator work with.
 """

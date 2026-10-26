@@ -9,7 +9,7 @@ Author:      Sebastian Toyos
 Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (default ROM: rom/)
 Writes build/listing/orunners.s and build/listing/report.txt.
 
---trace adds the addresses a real run executed (tools/reference/s32ref --trace) as entry points
+--trace adds the addresses a real run executed (system32/reference/s32ref --trace) as entry points
 and checks them against the static analysis: an executed address that falls inside a statically
 decoded instruction means one of the two readings is wrong, and it is reported.
 

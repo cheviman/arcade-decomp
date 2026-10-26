@@ -10,7 +10,7 @@ Usage: python tools/decompile_sound.py [--check] [--out DIR] [--timing FILE]
   --check     build every function's IR and report what does not lift and what the analysis finds,
               without writing anything
   --out       where to write the C (src/sound/ by default)
-  --timing    where to write the blocks of the timing model for tools/reference/s32ref (--sound-timing;
+  --timing    where to write the blocks of the timing model for system32/reference/s32ref (--sound-timing;
               build/sound/timing.txt by default)
   --symbols FILE  the names to use instead of sound_symbols.txt
   --variables FILE  lists every local variable with the instructions that write it, which is what

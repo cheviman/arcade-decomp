@@ -7,9 +7,9 @@ formats, shared by the games decompiled with them, [segasonic-decomp](https://gi
 (OutRunners, Sega System Multi 32). Arcade boards only: a game is its CPUs' code, its board's chips and its
 ROM, which this is made for (a PC or console game, with an operating system and its libraries, is not).
 
-The root holds what any arcade game uses; a family of boards gets a folder of its own: `system32/` will
-hold Sega's System 32 and Multi 32 (the board in C and the reference that runs the original on MAME's cores),
-and the CPUs and boards of the next families come the same way (Konami's 68000 and 053248 boards).
+The root holds what any arcade game uses; a family of boards gets a folder of its own: `system32/` holds
+Sega's System 32 and Multi 32 (the reference that runs the original on MAME's cores; the board in C will
+follow), and the CPUs and boards of the next families come the same way (Konami's 68000 and 053248 boards).
 
 Each game keeps this repository in its `tools/core/` (a git submodule: the game's repository holds which
 commit of the core it uses, not the core), and its own `tools/game_profile.py` tells the core about it.
@@ -41,6 +41,15 @@ Nothing here is a game's: no ROM, no names, no data.
 - `render_state.py`: a board state the reference saved, its text layer and tilemap pages drawn as PNG.
 - `memory_census.py`: which of the board's memories each line of the C that reaches memory through an
   address reaches, over the scenarios (a build of the game with its census on).
+- `system32/reference/`: the reference of a System 32 or Multi 32 game, which the scenarios compare the game
+  with: `s32ref` runs the original program on MAME's V60 core against the game's board model, with MAME's
+  System 32 video and its sound board (MAME's Z80, the sound chips, ymfm's YM3438), and writes each frame's
+  hashes (state, picture, sound) and the addresses it executed; `oracle` and `oracle_z80`, MAME's
+  disassemblers, against which `compare_with_mame.py` and `compare_z80_with_mame.py` check `v60/` and
+  `z80/` at every byte; `pcmcheck`, the game's MultiPCM against MAME's. `reference.cmake` builds them: the
+  game's CMake includes it, after its board runtime (`s32runtime`) and with its data library
+  (`S32_GAME_DATA`). MAME's and ymfm's sources are in `mame/` and `ymfm/`. Today they are Multi 32's
+  (OutRunners': two screens, the MultiPCM).
 
 ## A game's profile
 
@@ -82,5 +91,6 @@ and a commit of `tools/core`. A clone of a game takes its core with `git clone -
 
 ## Legal
 
-BSD 3-Clause License (see `LICENSE`). The reference tools the games build on MAME's cores are in the games'
-repositories, under MAME's licenses.
+BSD 3-Clause License (see `LICENSE`). `system32/reference/mame/` and `system32/reference/ymfm/` are MAME's
+and ymfm's code, BSD 3-Clause too, under their copyright holders' terms (`mame/LICENSE`, `ymfm/LICENSE`):
+they go into the reference tools only, never into a game.

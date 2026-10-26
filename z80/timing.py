@@ -12,7 +12,7 @@ cycles(instruction) is (taken, not taken) for the instructions whose time depend
 (JR cc, DJNZ, CALL cc, RET cc), and the same number twice for the others. LDIR and LDDR give the time of
 their last round; each round before it takes 21 (runtime/src/sound_cpu.c adds them). These are the
 Zilog timings MAME's core keeps (an opcode fetch 4, a memory or argument access 3, a port access 4,
-plus its internal cycles); tools/reference/sound measures the core and compares.
+plus its internal cycles); system32/reference/sound measures the core and compares.
 """
 from . import disassembler as dis
 

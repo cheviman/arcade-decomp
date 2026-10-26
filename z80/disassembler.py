@@ -9,7 +9,7 @@ Modified:    13-10-2026
 Author:      Sebastian Toyos
 
 Ported from MAME src/devices/cpu/z80/z80dasm.cpp. The text of every instruction matches MAME's
-output exactly: tools/reference/compare_z80_with_mame.py builds the original and diffs both, over
+output exactly: system32/reference/compare_z80_with_mame.py builds the original and diffs both, over
 the sound program and over every opcode of every prefix. On top of the text, every instruction
 carries its decoded operands and control flow, which is what the tools that analyze the sound
 program work with.
