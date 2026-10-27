@@ -4,7 +4,7 @@ Description: counts what is left of the CPU and of the decompiler in the C (src/
              with the counts last saved
 Version:     0.1.0
 Created:     17-10-2026
-Modified:    25-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 Every kind of leftover the C can still have, counted in one pass over the generated C, so a round of work
@@ -72,6 +72,7 @@ INFORMATION = {
     "lines": "lines of C",
     "casts": "casts",
     "partial_writes": "partial writes of a variable ((x & ~0xFFFFu) | ...)",
+    "board_registers": "reads and writes of a register of a device of the board by its name (io_read8...)",
 }
 
 
@@ -123,6 +124,7 @@ def count(paths):
                     counts["copy_backs"] += end - index
             counts["casts"] += len(re.findall(r"\((?:u?int\d+_t)\)", line))
             counts["partial_writes"] += len(re.findall(r"& ~0xF+u\) \|", line))
+            counts["board_registers"] += len(re.findall(r"\bio_(?:read|write)\d+\(", line))
     return counts
 
 

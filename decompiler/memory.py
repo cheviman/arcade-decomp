@@ -5,7 +5,7 @@ Description: the game's variables, tables and hardware registers by name: work R
              named addresses
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    25-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 Work RAM (0x200000-0x20FFFF) stays the board's byte array, so the state compares byte for byte with the
@@ -43,6 +43,11 @@ ADDRESS_MASK = 0xFFFFFF
 ADDRESS_DIGITS = 6
 RAM_MACRO, ROM_MACRO = "RAM", "ROM"          # the lvalue and rvalue macros (game/support.h) ...
 RAM_FUNCTION, ROM_FUNCTION = "ram", "rom"    # ... and what gives a pointer into either
+BOARD_MACRO, BOARD_FUNCTION = "BOARD", "board"    # ... and into the board's plain memories (PLAIN_HARDWARE)
+# the areas of HARDWARE the code uses as plain memory (the video RAM, the sprite RAM, the RAM the sound
+# program shares): what symbols.txt names there is a variable of the board, an lvalue through board();
+# a name anywhere else is a register of a device, which the bus hands every read and write (io_read8...)
+PLAIN_HARDWARE = ()
 PAGED = True                                 # tables read with 16-bit arithmetic inside their 64 KB page
 PLAYER_FIELDS = ()                           # reached by the player's number (pointers.py), not as tables
 CANONICAL = lambda address: address      # the copy of the ROM tables are named by
@@ -90,6 +95,11 @@ def hardware_area(address):
         if start <= address < end:
             return name
     return None
+
+
+def plain_hardware(address):
+    """True for an address in a memory of the board the code uses as plain memory (PLAIN_HARDWARE)."""
+    return hardware_area(address) in PLAIN_HARDWARE
 
 
 def bus_only(address, bits):
@@ -291,6 +301,9 @@ class Memory:
                          lambda address: data_names.get(address, f"rom_{address:0{ADDRESS_DIGITS}X}"))
         self.add_unnamed(self.hardware, widths["hardware"],
                          lambda address: f"{hardware_area(address)}_{address:0{ADDRESS_DIGITS}X}")
+        # the board's plain memories: variables of the board, not registers
+        self.board = {address: self.hardware.pop(address) for address in list(self.hardware)
+                      if plain_hardware(address)}
         for address in indexed:
             for items in (self.variables, self.tables):
                 if address in items:
@@ -355,6 +368,12 @@ class Memory:
         value = constant_address(address)
         if value is not None:
             value = own_copy(value)
+            if plain_hardware(value):
+                text = self.scalar(self.board, value, bits)
+                if text is None:
+                    return None
+                item = self.board.get(value)
+                return text, item is not None and item.signed and item.bits == bits, True
             for items, ram in ((self.variables, True), (self.tables, False)):
                 if (work_ram(value) if ram else program_rom(value)):
                     text = self.scalar(items, value, bits)
@@ -409,7 +428,16 @@ class Memory:
         return f"{macro}({start} + {index_text(rest)})", False, ram
 
     def register(self, value):
-        """Name of a hardware register at 'value', or None."""
+        """Name of a hardware register at 'value' (NAME_ADDRESS for a variable of the board's plain
+        memories), or None."""
+        item = self.hardware.get(value)
+        if item is not None:
+            return item.name
+        item = self.board.get(value)
+        return f"{item.name}_ADDRESS" if item is not None else None
+
+    def device(self, value):
+        """Name of the register of a device at 'value' (none of the plain memories'), or None."""
         item = self.hardware.get(value)
         return item.name if item is not None else None
 
@@ -440,6 +468,10 @@ class Memory:
         lines += [""] + NOTES["hardware"]
         for address, item in sorted(self.hardware.items()):
             lines.append(f"#define {item.name} 0x{address:0{ADDRESS_DIGITS}X}u")
+        if self.board:
+            lines += [""] + NOTES.get("board", ["/* the board's plain memories, by name */"])
+            for address, item in sorted(self.board.items()):
+                lines += self.declare(item, BOARD_MACRO, BOARD_FUNCTION)
         return lines
 
     @staticmethod

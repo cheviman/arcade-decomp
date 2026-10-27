@@ -3,7 +3,7 @@ Name:        decompile.py
 Description: decompiles the game's V70 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    23-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--out DIR] [--symbols FILE]
@@ -209,6 +209,19 @@ def declared_results(program, open_entries):
     return found
 
 
+def declared_unread(program):
+    """The registers functions read before setting them only on paths the game never takes, from the
+    "unread" lines of symbols.txt: {entry: {RN}}."""
+    entries = {program.names[entry]: entry for entry in program.names}
+    found = {}
+    for function_name, register in disassemble.load_names(SYMBOLS).unread:
+        entry = entries.get(function_name)
+        if entry is None:
+            raise SystemExit(f"symbols.txt: an unread register of {function_name}, which is no function")
+        found.setdefault(entry, set()).add(register)
+    return found
+
+
 def analyse(program, built):
     """Stack slots, preserved registers, R25 and the data flow summaries, in place."""
     for function in built.values():
@@ -326,6 +339,10 @@ def analyse_after_stack(program, built):
     flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
     signatures.OPEN = open_entries(program, built, flow)
     flow.declared = declared_results(program, signatures.OPEN)
+    signatures.UNREAD = declared_unread(program)
+    # (from the start: what a caller would hand them there is not live at its calls)
+    for entry, registers in signatures.UNREAD.items():
+        flow.zeroed[entry] = {("r", register) for register in registers}
     flow.solve()
     while True:
         removed = sum(len(preserved.analyse(function, flow.call_writes, context=signatures.CONTEXT))
@@ -694,6 +711,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     built_in = set(pointers.STRUCTS)
     pointers.STRUCTS.update(known.structs)
     pointers.ROM_STRUCTS = set(known.rom_structs)
+    pointers.BOARD_STRUCTS = set(known.board_structs)
     # the program ROM's arrays of plain values a pointer walks, and its tables of records by name
     pointers.ELEMENTS = dict(known.arrays)
     pointers.RECORD_TABLES = dict(known.record_tables)
@@ -732,9 +750,17 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         family = next((family for family in global_names if name == family or name.startswith(family + "_")), None)
         if family is not None:
             global_families[entry] = family    # as emit.global_family_of
+    # a family's own name for a variable that says nothing of what it points at: the family reads it as a
+    # number, whatever the variable's own line says it points at (test_mode_blink_address holds a cell on the
+    # cursor pages and a text record of the ROM on the prompt pages)
+    scoped_targets = dict(known.scoped_targets)
+    for (struct, family), found_names in known.scoped.items():
+        if struct == "global":
+            for address, (_, kind) in found_names.items():
+                scoped_targets.setdefault(("global", family, address), (None, int(kind[1:])))
     typing = pointers.Program(built, flow, found,
                               {entry: call_results(function, found, flow) for entry, function in built.items()},
-                              signatures.CONTEXT, known.targets, hints, site_hints, known.scoped_targets, families,
+                              signatures.CONTEXT, known.targets, hints, site_hints, scoped_targets, families,
                               global_families)
     fields, accesses = typing.run()
     through = [(hit[1], hit[2]) for found_fields in fields.values() for hit in found_fields.values()

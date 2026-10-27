@@ -3,16 +3,15 @@ Name:        signatures.py
 Description: the C signature of every function: its parameters and the results it hands back
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    23-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 The game passes values in registers, as hand-written assembly does. In C:
   - Context registers the whole program shares (CONTEXT) are global variables. In OutRunners: R25, the
     block of the screen being run (0x208000 or 0x218000), which the interrupt handlers read too; R23, a
-    place in it (1000[R25]); R20, the object the object loop (011CC0) runs; R27 and R28, which the loop
-    does not set between handlers, so a handler may find what the one before left there. (R22, the loop's
-    place in the list, and R26, the fill of the string moves, are not: no function reads them before
-    setting them.) symbols.txt names them ("register" lines). R12 is one too, although the game uses it as scratch: an object handler,
+    place in it (1000[R25]); R20, the object the object loop (011CC0) runs. (R22, the loop's place in the
+    list, R26, the fill of the string moves, and R27 and R28 are not: no function reads them before
+    setting them, but on a path the game never takes.) symbols.txt names them ("register" lines). R12 is one too, although the game uses it as scratch: an object handler,
     009590, sets only the low halfword of R12 ("mov.h R21, R12") and reads through it, so the high one is
     the work RAM page some code before it left there (the screen's, 0x0020 or 0x0021); only that halfword
     outlives the function that sets it (SCRATCH_CONTEXT), unless the callers read more, and its assignments
@@ -22,7 +21,9 @@ The game passes values in registers, as hand-written assembly does. In C:
     the runtime swaps them with the task.
   - Any other register a function reads before writing is a parameter when some caller sets it before
     the call. When none does, the value would be whatever an earlier piece of code left there, which only
-    happens on paths the game never takes: the function starts the register at 0 instead.
+    happens on paths the game never takes: the function starts the register at 0 instead. symbols.txt
+    says so of a register its callers do set, where the path that reads it is one the game never takes
+    ("unread" lines, with the reason): it is no parameter, and starts at 0 too.
   - The registers and flags some caller reads after the call, out of those the function may write, are
     its results: each one a pointer parameter the function writes through (and reads, when it may leave
     it unchanged).
@@ -52,6 +53,9 @@ SCRATCH_CONTEXT = {}
 CONSTANT = {}
 # the functions nothing reaches (decompile.py)
 OPEN = set()
+# entry -> register numbers the function reads before setting them only on a path the game never takes
+# (symbols.txt's unread lines, decompile.py): no input of it, they start at 0 as an unset input does
+UNREAD = {}
 
 
 def register_of(variable):
@@ -128,6 +132,7 @@ def provided_inputs(flow, written):
                         provided[target] |= available
         for entry in flow.functions:
             new = inputs[entry] if entry in OPEN else inputs[entry] & provided[entry]
+            new = {value for value in new if value[0] != "r" or value[1] not in UNREAD.get(entry, ())}
             if new != params[entry]:
                 params[entry] = new
                 changed = True

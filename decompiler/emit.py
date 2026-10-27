@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    23-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -237,6 +237,10 @@ class Names:
     def board_register(self, address):
         """Name of the board register at a constant address, or None."""
         return self.writer.emitter.memory.register(address)
+
+    def device_register(self, address):
+        """Name of the register of a device at a constant address (io_read8...), or None."""
+        return self.writer.emitter.memory.device(address)
 
 
 class Printer(cprint.Printer):
@@ -1406,7 +1410,14 @@ class FunctionWriter:
                 and index.args[1].value & 0xFFFFFFFF >= 0x80000000:
             before = 0x100000000 - (index.args[1].value & 0xFFFFFFFF)
             return f"(int32_t)({self.printer.any(index.args[0]).text} - {before}u)"
-        return self.printer.any(index).text
+        value = self.printer.any(index)
+        small = pointers.offset_sized(index) and not any(isinstance(node, ir.Op) and node.name in ("sub", "neg")
+                                                         for node in ir.walk(index))
+        if value.ctype == "u32" and not value.signed and not small:
+            # (a 32-bit number the code may have wrapped below 0: the processor's addresses wrap at 32 bits, a
+            # C index past 0x7FFFFFFF does not, so it goes in as the signed number it stands for)
+            return f"(int32_t){cprint.Printer.wrap(value, cprint.UNARY)}"
+        return value.text
 
     def note_missing(self, struct, offset, bits, base, base_offset, generic):
         """Notes an access to the object types' own variables (from where the families' views start) that
@@ -1590,6 +1601,9 @@ class FunctionWriter:
                         return composed
                 return [assigned]
             text = self.stored(value, statement.bits)
+            device = self.emitter.memory.device(address) if address is not None else None
+            if device is not None:
+                return [f"io_write{statement.bits}({device}, {text});"]    # (a register of a device, by name)
             where = self.emitter.memory.register(address) if address is not None else None
             return [f"mem_write{statement.bits}({where or self.expr(statement.address)}, {text});"]
         if isinstance(statement, ir.Effect):

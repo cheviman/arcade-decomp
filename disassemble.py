@@ -3,7 +3,7 @@ Name:        disassemble.py
 Description: recursive-descent disassembly of the V70 program into a listing and a coverage report
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    22-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (default ROM: rom/)
@@ -131,7 +131,7 @@ def parse_layout(attributes, where):
 
 
 NAME_KINDS = ("var", "io", "table", "struct", "field", "register", "scoped", "param", "result", "local", "port",
-              "file", "anchor", "comment", "elements", "constant", "task")    # names for the decompiled C (load_names; file lines:
+              "file", "anchor", "comment", "elements", "constant", "task", "unread")    # names for the decompiled C (load_names; file lines:
                                               # decompile.source_files)
 
 
@@ -207,6 +207,11 @@ class Names(NamedTuple):
 
     tasks: set          # functions a task starts at: the runtime runs them by address (task lines)
     counts: dict        # work RAM address -> how many elements the variable there has (var NAME[COUNT])
+    unread: set         # (function name, register number): a register the function reads before it sets it
+                        # only on a path the game never takes (unread lines): it starts at 0 there
+    board_structs: set  # the structures (and arrays of values) in a memory of the board the code reads and
+                        # writes as plain memory ('struct NAME SIZE board', 'elements NAME TYPE board'): the
+                        # video RAM, the sprite RAM, the RAM the sound program shares
 
 
 def load_names(path, registers=None):
@@ -219,8 +224,12 @@ def load_names(path, registers=None):
                                          "rom", or elements), read by index: name[i].field
         struct   NAME   SIZE             a structure in work RAM (SIZE in hexadecimal)
         struct   NAME   SIZE rom         a record of the program ROM (read through rom(), never written)
-        elements NAME   TYPE [STRUCT]    values of the program ROM a pointer walks (TYPE each): what is
-                                         read through one is NAME(p)[i] (STRUCT: what each value points at)
+        struct   NAME   SIZE board       a structure in a memory of the board the code uses as plain memory
+                                         (the video RAM, the sprite RAM, the sound program's RAM: board())
+        elements NAME   TYPE [REGION] [STRUCT]  values a pointer walks (TYPE each), in the program ROM, or with
+                                         REGION in the work RAM ("ram") or a memory of the board ("board"):
+                                         what is read or written through one is NAME(p)[i] (STRUCT: what
+                                         each value points at)
         field    STRUCT OFFSET NAME TYPE [STRUCT]  one of its fields (OFFSET in hexadecimal); TYPE[N] (N in
                                          hexadecimal) an array of N in the record, TYPE[] (a record of the
                                          program ROM) one that goes on past the record's end, read
@@ -258,10 +267,13 @@ def load_names(path, registers=None):
                                          divisor, a count, a code the program compares with
         task     FUNCTION                a task starts there, from an interrupt frame the game writes (the
                                          runtime runs it by its address)
+        unread   FUNCTION RN             the function reads RN before it sets it only on a path the game
+                                         never takes (the comment says why): RN is no input of it, and
+                                         starts at 0 there, as an input no caller sets does
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {})
+                  set(), {}, set(), set())
     registers = registers or {}
 
     def register_number(text):
@@ -304,6 +316,11 @@ def load_names(path, registers=None):
                 raise SystemExit(f"{where}: expected 'task FUNCTION'")
             names.tasks.add(parts[1])
             continue
+        if parts[0] == "unread":
+            if len(parts) != 3 or not parts[1].isidentifier() or register_number(parts[2]) is None:
+                raise SystemExit(f"{where}: expected 'unread FUNCTION RN'")
+            names.unread.add((parts[1], register_number(parts[2])))
+            continue
         if parts[0] == "comment":
             words = line.split(None, 2)
             if len(words) != 3 or not words[1].isidentifier():
@@ -313,23 +330,29 @@ def load_names(path, registers=None):
             names.comments[words[1]] = words[2]
             continue
         if parts[0] == "struct":
-            if len(parts) not in (3, 4) or (len(parts) == 4 and parts[3] != "rom"):
-                raise SystemExit(f"{where}: expected 'struct NAME SIZE [rom]'")
+            if len(parts) not in (3, 4) or (len(parts) == 4 and parts[3] not in ("rom", "board")):
+                raise SystemExit(f"{where}: expected 'struct NAME SIZE [rom|board]'")
             names.structs[parts[1]] = int(parts[2], 16)
             if len(parts) == 4:
-                names.rom_structs.add(parts[1])
+                (names.rom_structs if parts[3] == "rom" else names.board_structs).add(parts[1])
             continue
         if parts[0] == "elements":
-            if len(parts) not in (3, 4) or not parts[1].isidentifier() or parts[2] not in VALUE_TYPES:
-                raise SystemExit(f"{where}: expected 'elements NAME TYPE [STRUCT]' with TYPE in {VALUE_TYPES}")
+            region = parts[3] if len(parts) > 3 and parts[3] in ("rom", "ram", "board") else None
+            pointed = parts[4 if region else 3:]
+            if len(parts) < 3 or len(pointed) > 1 or not parts[1].isidentifier() or parts[2] not in VALUE_TYPES:
+                raise SystemExit(f"{where}: expected 'elements NAME TYPE [rom|ram|board] [STRUCT]' with TYPE in "
+                                 f"{VALUE_TYPES}")
             if parts[1] in names.structs:
                 raise SystemExit(f"{where}: '{parts[1]}' is a structure already")
             names.structs[parts[1]] = int(parts[2][1:]) // 8
-            names.rom_structs.add(parts[1])
+            if region in (None, "rom"):
+                names.rom_structs.add(parts[1])
+            elif region == "board":
+                names.board_structs.add(parts[1])
             names.arrays[parts[1]] = parts[2]
             names.fields[(parts[1], 0)] = ("element", parts[2])
-            if len(parts) == 4:
-                names.targets[(parts[1], 0)] = (parts[3], int(parts[2][1:]))
+            if pointed:
+                names.targets[(parts[1], 0)] = (pointed[0], int(parts[2][1:]))
             continue
         if parts[0] == "scoped":
             if len(parts) not in (6, 7) or parts[5] not in VALUE_TYPES:

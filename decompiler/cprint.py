@@ -3,7 +3,7 @@ Name:        cprint.py
 Description: prints IR expressions as plain C, with casts and parentheses only where the value needs them
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    16-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 An IR value has a width; C has its integer types and promotions. Every printed value says whether it
@@ -200,6 +200,10 @@ class Printer:
                 if signed:
                     return Value(text, PRIMARY, False, "int", node.bits)
                 return Value(text, PRIMARY, True, ctype)
+            device = getattr(self.names, "device_register", None)
+            device = device(node.address.value & 0xFFFFFF) if device and isinstance(node.address, ir.Const) else None
+            if device is not None:
+                return Value(f"io_read{node.bits}({device})", PRIMARY, True, ctype)    # (a register of a device)
             register = self.names.board_register(node.address.value & 0xFFFFFF) \
                 if isinstance(node.address, ir.Const) else None
             address = register or self.any(node.address).text

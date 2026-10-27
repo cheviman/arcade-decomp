@@ -4,7 +4,7 @@ Description: works out which registers point at which of the game's structures, 
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    25-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 The structures (STRUCTS) are OutRunners': the game objects (0x100 bytes, 124 of them below each screen's
@@ -99,6 +99,9 @@ ARRAYS = {}                    # struct -> (first, count): structures one after 
 STRUCT_FUNCTION = "ram"        # what gives a pointer to a structure from its address (game/support.h)
 ROM_STRUCTS = set()            # structures that are records of the program ROM: read through ROM_FUNCTION
 ROM_FUNCTION = "rom"           # ... and what gives a pointer to one of those (const)
+BOARD_STRUCTS = set()          # structures (and arrays of values) in a memory of the board the code uses as
+                               # plain memory (the video RAM, the sprite RAM, the sound program's RAM)
+BOARD_FUNCTION = "board"       # ... and what gives a pointer to one of those
 CONSTANTS = False              # registers keep the constants they are set to, so that a pointer moved by one
                                # (the Z80's "ld de,12h ... add iy,de") keeps its kind
 PAGED = False                  # structures a page long, one per page: (p & FF00) | n is field n of p's (page_parts)
@@ -118,8 +121,9 @@ BELOW = {}
 INSTANCES = {}
 RUNS = set()                   # structures laid one after another wherever a pointer starts (no fixed base,
                                # unlike ARRAYS): a pointer moved past one points into the next
-ELEMENTS = {}                  # ROM structure -> element type: an array of one value per element (symbols.txt
-                               # "array"), read as NAME(p)[i] rather than through a field
+ELEMENTS = {}                  # structure -> element type: an array of one value per element (symbols.txt
+                               # "elements"), read as NAME(p)[i] rather than through a field; in the program
+                               # ROM, the work RAM or a memory of the board
 RECORD_TABLES = {}             # program ROM address -> (name, ROM structure): a table of records, name[i].field
 FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that is an array of 'count' elements
                                # of 'bits' (None: it goes on past the record's end), read STRUCT(p)->field[i]
@@ -370,9 +374,15 @@ def scaled_count(node, size, zeros=None):
 
 
 def records_kind(kind):
-    """True for the kind of a pointer to (or into) a record of the program ROM, which may move by whole
-    records: by an index, or past the end of one into the next."""
-    return kind is not None and kind[0] in ROM_STRUCTS and kind[0] in STRUCTS
+    """True for the kind of a pointer to (or into) a record of the program ROM, or to a value of an array
+    (ELEMENTS, wherever it is), which may move by whole records: by an index, or past the end of one into
+    the next."""
+    return kind is not None and kind[0] in STRUCTS and (kind[0] in ROM_STRUCTS or kind[0] in ELEMENTS)
+
+
+def rom_records_kind(kind):
+    """records_kind for the program ROM's: a pointer that moves off them points into the ROM, no more."""
+    return records_kind(kind) and kind[0] in ROM_STRUCTS
 
 
 def in_variable_block(kind):
@@ -405,7 +415,7 @@ def merge(a, b):
             pointer, structure = (kind, other) if kind[0] == "global" else (other, kind)
             if structure[0] in STRUCTS and structure[1] == 0 and in_work_ram(pointer[1]):
                 found[index] = structure
-        elif other is not None and all(records_kind(either) or either == ("rom", 0) for either in (kind, other)):
+        elif other is not None and all(rom_records_kind(either) or either == ("rom", 0) for either in (kind, other)):
             found[index] = ("rom", 0)    # into the program ROM either way: two kinds of record, or one and other data
     return found
 
@@ -539,10 +549,10 @@ def kind_of(node, state, zeros):
         # (a byte offset to a record, read where it leads nowhere symbols.txt says: an offset like any other)
         kinds = [OFFSET if kind is not None and kind[0] in ("to", "rel") else kind for kind in kinds]
         if not any(isinstance(arg, ir.Const) for arg in args):
-            kinds = [("rom", 0) if records_kind(kind) else kind for kind in kinds]
+            kinds = [("rom", 0) if rom_records_kind(kind) else kind for kind in kinds]
         elif name == "add":
             # (a table of records, by its address, plus something other than a number of records)
-            kinds = [("rom", 0) if isinstance(arg, ir.Const) and records_kind(kind) else kind
+            kinds = [("rom", 0) if isinstance(arg, ir.Const) and rom_records_kind(kind) else kind
                      for kind, arg in zip(kinds, args)]
         if kinds.count(("rom", 0)) == 1 and all(kind in (("rom", 0), OFFSET) or (kind is None and offset_sized(arg, state))
                                                  for kind, arg in zip(kinds, args)):
@@ -700,8 +710,9 @@ def access(address, state, zeros=None):
             return found[0], found[1], found[2], 0, None
     if isinstance(address, ir.Reg):
         kind = state.get(address.index)
-        return (kind[0], kind[1], address, kind[1], family_of(kind)) if kind is not None and kind[0] in STRUCTS \
-            else None
+        if kind is None or kind[0] not in STRUCTS:
+            return None
+        return in_field_array(kind[0], kind[1], address, kind[1], family_of(kind))
     if isinstance(address, ir.Const):
         found = instance_of(address.value & ADDRESS_MASK)
         return (found[1], found[2], ir.Const(found[0], 32), 0, None) if found is not None else None
@@ -723,7 +734,7 @@ def access(address, state, zeros=None):
         return None
     offset = signed(kind[1] + displacement)
     if 0 <= offset < STRUCTS[kind[0]]:
-        return kind[0], offset, base, kind[1], family_of(kind)
+        return in_field_array(kind[0], offset, base, kind[1], family_of(kind))
     found = below(kind[0], offset)
     if found is not None:
         # the base points that far past the start of the structure below (screen - 0x8000u: its objects' area)
@@ -731,11 +742,23 @@ def access(address, state, zeros=None):
     return None
 
 
-def array_access(kind, pointer, constant, rest, zeros=None):
+def in_field_array(struct, offset, base, base_offset, family):
+    """access()'s answer for a field at 'offset' of 'struct': past the start of a field that is an array
+    (FIELD_ARRAYS), that array's element (a pointer moved into it reads name[1], not a field at its place)."""
+    for (array_struct, start), (bits, count) in FIELD_ARRAYS.items():
+        width = bits // 8
+        if array_struct == struct and start < offset and (offset - start) % width == 0 \
+                and (count is None or offset - start < count * width):
+            return struct, start, base, base_offset, family, None, ir.Const((offset - start) // width, 32)
+    return struct, offset, base, base_offset, family
+
+
+def array_access(kind, pointer, constant, rest, zeros=None, records=True):
     """(struct, field offset, pointer, how far into its record the pointer points, family, record number or None,
     element number) for an access to an element of a field that is an array (FIELD_ARRAYS): the pointer's
     record (or the one so many records on) plus the field's offset plus the element's; None otherwise. The
-    terms 'rest' are a record's number times its size and an element's number times the element's."""
+    terms 'rest' are a record's number times its size and an element's number times the element's; without
+    'records' (a structure the work RAM or the board has one of there), an element's number only."""
     size = STRUCTS[kind[0]]
     for (struct, start), (bits, count) in FIELD_ARRAYS.items():
         if struct != kind[0]:
@@ -744,7 +767,7 @@ def array_access(kind, pointer, constant, rest, zeros=None):
         records, element_terms = [], []
         for term in rest:
             # (an array past the record's end takes no record number: what follows is the array)
-            by_record = scaled_count(term, size, zeros) if count is not None else None
+            by_record = scaled_count(term, size, zeros) if count is not None and records else None
             by_element = scaled_count(term, width, zeros)
             if by_record is not None and not records:
                 records.append(by_record)
@@ -755,6 +778,8 @@ def array_access(kind, pointer, constant, rest, zeros=None):
         else:
             offset = kind[1] + constant
             record, inside = divmod(offset, size) if count is not None else (0, offset)
+            if record and not records:
+                continue
             within = inside - start
             if within < 0 or within % width or (count is not None and within >= count * width):
                 continue
@@ -828,6 +853,16 @@ def indexed_access(address, state, in_fields=True, zeros=None):
             pointer, kind = term, found
             break
     if pointer is None:
+        if in_fields and len(terms) <= 3:
+            # an element of a field that is an array, in a structure of the work RAM or the board, by a
+            # number the code works out (SCREEN(screen)->lap_times[player]) or a constant one
+            for term, found in zip(terms, kinds):
+                if found is not None and found[0] in STRUCTS and not records_kind(found) \
+                        and any(struct == found[0] for struct, _ in FIELD_ARRAYS):
+                    rest = [other for other in terms if other is not term]
+                    hit = array_access(found, term, constant, rest, zeros, records=False)
+                    if hit is not None:
+                        return hit
         if any(found is not None and (found[0] in STRUCTS or found[0] == "global") for found in kinds):
             return None    # (a field of a structure a register points at: the constant is its offset, no table)
         table = record_table(constant & ADDRESS_MASK)
@@ -1422,9 +1457,14 @@ class Layouts:
         floor_block *)rom", "(const uint16_t *)rom" for an array of plain values, "(struct object *)ram"."""
         if struct in ELEMENTS:
             bits, signed = self.TYPES[ELEMENTS[struct]]
-            return f"(const {'' if signed else 'u'}int{bits}_t *){ROM_FUNCTION}"
+            value = f"{'' if signed else 'u'}int{bits}_t"
+            if struct in ROM_STRUCTS:
+                return f"(const {value} *){ROM_FUNCTION}"
+            return f"({value} *){BOARD_FUNCTION if struct in BOARD_STRUCTS else STRUCT_FUNCTION}"
         if struct in ROM_STRUCTS:
             return f"(const struct {struct} *){ROM_FUNCTION}"
+        if struct in BOARD_STRUCTS:
+            return f"(struct {struct} *){BOARD_FUNCTION}"
         return f"(struct {struct} *){STRUCT_FUNCTION}"
 
     def member_type(self, struct, offset, bits):
@@ -1472,7 +1512,8 @@ class Layouts:
         for struct, size in STRUCTS.items():
             if struct in ELEMENTS:
                 continue
-            what = "the program ROM's records" if struct in ROM_STRUCTS else "the game's blocks"
+            what = "the program ROM's records" if struct in ROM_STRUCTS else \
+                "the board's memory" if struct in BOARD_STRUCTS else "the game's blocks"
             lines.append(f"_Static_assert(sizeof(struct {struct}) == 0x{size:X}, "
                          f"\"struct {struct} has the size of {what}\");")
         lines.append("")
