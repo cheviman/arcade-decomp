@@ -212,6 +212,8 @@ class Names(NamedTuple):
     board_structs: set  # the structures (and arrays of values) in a memory of the board the code reads and
                         # writes as plain memory ('struct NAME SIZE board', 'elements NAME TYPE board'): the
                         # video RAM, the sprite RAM, the RAM the sound program shares
+    scoped_arrays: dict  # (struct, family, offset) -> how many elements a family's field holds when it is an
+                         # array ('scoped STRUCT FAMILY OFFSET NAME TYPE[N]'), read ->view.name[i]
 
 
 def load_names(path, registers=None):
@@ -241,7 +243,7 @@ def load_names(path, registers=None):
     points into the program ROM. STRUCT.FAMILY (object.eggman_scene) says which family's structure it is:
     what is read through it reads as that family's code reads its own (its scoped fields).
         register RN     NAME             a register the whole program shares (a global variable in C)
-        scoped   STRUCT FAMILY OFFSET NAME TYPE [STRUCT]  a field as the functions whose names start with
+        scoped   STRUCT FAMILY OFFSET NAME TYPE [STRUCT]  (TYPE[N]: an array of N) a field as the functions whose names start with
                                          FAMILY use it, in the structure their code runs on (a structure or
                                          "rom": what it holds points at one); with "global" for STRUCT and
                                          an address for OFFSET, work RAM as they use it
@@ -273,7 +275,7 @@ def load_names(path, registers=None):
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {}, set(), set())
+                  set(), {}, set(), set(), {})
     registers = registers or {}
 
     def register_number(text):
@@ -355,6 +357,10 @@ def load_names(path, registers=None):
                 names.targets[(parts[1], 0)] = (pointed[0], int(parts[2][1:]))
             continue
         if parts[0] == "scoped":
+            array = re.fullmatch(r"(\w+)\[([0-9A-Fa-f]+)\]", parts[5]) if len(parts) in (6, 7) else None
+            if array is not None and array.group(1) in VALUE_TYPES:
+                parts[5] = array.group(1)
+                names.scoped_arrays[(parts[1], parts[2], int(parts[3], 16))] = int(array.group(2), 16)
             if len(parts) not in (6, 7) or parts[5] not in VALUE_TYPES:
                 raise SystemExit(f"{where}: expected 'scoped STRUCT FAMILY OFFSET NAME TYPE [STRUCT]' with TYPE in "
                                  f"{VALUE_TYPES}")
@@ -463,16 +469,16 @@ def load_names(path, registers=None):
             raise SystemExit(f"{path.name}: the table {name} holds '{record}', which is no record of the program ROM "
                              "(struct NAME SIZE rom, or elements)")
     for (pointed, _) in list(names.targets.values()) + list(names.scoped_targets.values()):
-        if not structure(pointed) and pointed != "rom":
-            raise SystemExit(f"{path.name}: points at '{pointed}', which is no struct (nor 'rom')")
+        if not structure(pointed) and pointed not in ("rom", "io"):
+            raise SystemExit(f"{path.name}: points at '{pointed}', which is no struct (nor 'rom' or 'io')")
     for (function, _), pointed in names.param_structs.items():
-        if not structure(pointed) and pointed != "rom":
+        if not structure(pointed) and pointed not in ("rom", "io"):
             raise SystemExit(f"{path.name}: a parameter of {function} points at '{pointed}', which is no struct "
-                             "(nor 'rom')")
+                             "(nor 'rom' or 'io')")
     for (function, _, _), pointed in names.local_structs.items():
-        if not structure(pointed) and pointed != "rom":
+        if not structure(pointed) and pointed not in ("rom", "io"):
             raise SystemExit(f"{path.name}: a local of {function} points at '{pointed}', which is no struct "
-                             "(nor 'rom')")
+                             "(nor 'rom' or 'io')")
     return names
 
 

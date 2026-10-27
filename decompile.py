@@ -716,6 +716,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     pointers.ELEMENTS = dict(known.arrays)
     pointers.RECORD_TABLES = dict(known.record_tables)
     pointers.FIELD_ARRAYS = {key: (int(known.fields[key][1][1:]), count) for key, count in known.field_arrays.items()}
+    pointers.SCOPED_ARRAYS = {(struct, family, offset): (int(known.scoped[(struct, family)][offset][1][1:]), count)
+                              for (struct, family, offset), count in known.scoped_arrays.items()}
     # the names a "STRUCT@BASE" may give its base by: the program's data, tables and tables of records
     pointers.BASES = {symbol.name: address for address, symbol in program.symbols.items() if symbol.kind == "data"}
     pointers.BASES.update({name: address for address, (name, _) in list(known.tables.items())
@@ -772,6 +774,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     emitter = emit.Emitter(built, found, names, signatures.CONTEXT, needs_return_address(built), named, always,
                            program.mem.r32, trace)
     emitter.layouts = pointers.Layouts(accesses, known)
+    emitter.reroll_statements = True    # an unrolled copy or clear as the loop it does (emit.rerolled_statements)
     emitter.register_names = dict(known.registers)
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
     emitter.second_entries = dict(program.second_entries)

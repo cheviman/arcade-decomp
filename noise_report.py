@@ -72,7 +72,7 @@ INFORMATION = {
     "lines": "lines of C",
     "casts": "casts",
     "partial_writes": "partial writes of a variable ((x & ~0xFFFFu) | ...)",
-    "board_registers": "reads and writes of a register of a device of the board by its name (io_read8...)",
+    "board_registers": "reads and writes of a device of the board, through the bus (io_read8...)",
 }
 
 

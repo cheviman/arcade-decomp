@@ -31,6 +31,9 @@ from 0x1000 on in the ROM, plus any offset, or a word read from a field or varia
 into the ROM ("rom" after its type). What is read through one reads the ROM itself (ROM16(p)) rather than
 the board's bus; rom() stops the program if such an address ever falls outside the ROM.
 
+A pointer into one of the board's devices (DEVICE_AREAS: from an address there, and that moved by an offset)
+has the kind "io": what is read or written through it goes through the bus, io_read16(p), io_write16(p, value).
+
 A pointer may also say which record of the program ROM it points at (ROM_STRUCTS: "struct NAME SIZE rom"; an
 array of plain values, ELEMENTS, is a record of one value), and so may a table of them at a fixed address
 (RECORD_TABLES). Then a read through it plus a record's number times its size, or past the record it is in,
@@ -84,7 +87,10 @@ HANDLER_FIELD = None  # where an object keeps the code the object loop runs for 
 # blocks of the work RAM the object registers walk as variables, not as objects: start -> size (the test
 # mode reads and writes the settings, 0x20E600-0x20E67F, through R20)
 VARIABLE_BLOCKS = {}
-REGIONS = {"rom"}             # kinds that are a memory, not a structure
+REGIONS = {"rom", "io"}       # kinds that are a memory, not a structure: the program ROM, a device of the board
+# where the board's devices answer (the palettes, the mixers, the I/O chips, the link board...): a pointer
+# there reaches a device, which the bus hands every read and write (game profile)
+DEVICE_AREAS = ()
 OFFSET = ("offset", 0)        # not a pointer: a value below 0x10000 (a halfword read, a mask...), an offset
 CONFLICT = ("conflict", 0)    # callers that know different things: nothing is known
 UNKNOWN = ("unknown", 0)      # a caller that does not know
@@ -125,6 +131,7 @@ ELEMENTS = {}                  # structure -> element type: an array of one valu
                                # "elements"), read as NAME(p)[i] rather than through a field; in the program
                                # ROM, the work RAM or a memory of the board
 RECORD_TABLES = {}             # program ROM address -> (name, ROM structure): a table of records, name[i].field
+SCOPED_ARRAYS = {}             # (struct, family, offset) -> (bits, count): a family's field that is an array
 FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that is an array of 'count' elements
                                # of 'bits' (None: it goes on past the record's end), read STRUCT(p)->field[i]
 
@@ -446,7 +453,7 @@ def gather(a, b):
 def outward(kind):
     """What a function tells its callees and callers about a register: a pointer into the ROM, or an offset,
     stays inside the function (a constant that happens to be a ROM address is not news to anyone)."""
-    return UNKNOWN if kind[0] in REGIONS or kind == OFFSET or kind[0] == "const" else kind
+    return UNKNOWN if kind[0] == "rom" or kind == OFFSET or kind[0] == "const" else kind
 
 
 def held_constant(node, state):
@@ -497,7 +504,7 @@ def kind_of(node, state, zeros):
     if isinstance(node, ir.Reg):
         return state.get(node.index)
     if isinstance(node, ir.Temp):
-        return state.get(("temp", node.name))    # (PAGED only: the Z80's EX DE,HL goes through one)
+        return state.get(("temp", node.name))    # (an address an instruction works out and uses twice; the Z80's EX DE,HL)
     if isinstance(node, ir.Const):
         value = node.value & ADDRESS_MASK
         found = BASE_KINDS.get(value) or player_constant(value)
@@ -509,6 +516,8 @@ def kind_of(node, state, zeros):
             found = ("global", value)
         if found is None and rom_address(value):
             found = record_table(value) or ("rom", 0)
+        if found is None and any(start <= value < end for start, end in DEVICE_AREAS):
+            found = ("io", 0)
         return found
     if isinstance(node, ir.Load):
         if node.bits == POINTER_BITS:
@@ -520,7 +529,8 @@ def kind_of(node, state, zeros):
     if not isinstance(node, ir.Op):
         return None
     name, args = node.name, node.args
-    if name in ("zext", "fits") and isinstance(args[0], ir.Load):
+    if name in ("zext", "fits") and isinstance(args[0], (ir.Load, ir.Reg, ir.Op)):
+        # (a byte offset to a record, read or held in a register and known to fit: still that offset)
         found = kind_of(args[0], state, zeros)
         if found is not None and found[0] in ("to", "rel"):
             return found
@@ -554,9 +564,11 @@ def kind_of(node, state, zeros):
             # (a table of records, by its address, plus something other than a number of records)
             kinds = [("rom", 0) if isinstance(arg, ir.Const) and rom_records_kind(kind) else kind
                      for kind, arg in zip(kinds, args)]
-        if kinds.count(("rom", 0)) == 1 and all(kind in (("rom", 0), OFFSET) or (kind is None and offset_sized(arg, state))
-                                                 for kind, arg in zip(kinds, args)):
-            return "rom", 0
+        for region in ("rom", "io"):
+            # (a device's place moved by an offset: still that device, the bus's)
+            if kinds.count((region, 0)) == 1 and all(kind in ((region, 0), OFFSET) or (kind is None and offset_sized(arg, state))
+                                                      for kind, arg in zip(kinds, args)):
+                return region, 0
     if name in ("add", "sub") and isinstance(args[1], ir.Const):
         delta = args[1].value if name == "add" else -args[1].value
         inner = kind_of(args[0], state, zeros)
@@ -590,6 +602,17 @@ def kind_of(node, state, zeros):
                 and low_zeros(args[1], zeros) >= PLAYERS[1].bit_length() - 1:
             return found
         return None
+    if name == "or" and DEVICE_AREAS:
+        # a device's base put together with a place in it (a palette's 0x600000 | the screen's bit | the
+        # colour's place): that device
+        def constants(part):
+            if isinstance(part, ir.Const):
+                return [part.value & ADDRESS_MASK]
+            if isinstance(part, ir.Op) and part.name == "or":
+                return [value for arg in part.args for value in constants(arg)]
+            return []
+        if any(any(start <= value < end for start, end in DEVICE_AREAS) for value in constants(node)):
+            return "io", 0
     if name == "or" and PAGE_LINKS:
         kept, low = args
         page = isinstance(kept, ir.Const) and (kept.value & 0xFFFF) == 0 and in_work_ram(kept.value)
@@ -708,8 +731,9 @@ def access(address, state, zeros=None):
         found = page_parts(address, state, {})
         if found is not None:
             return found[0], found[1], found[2], 0, None
-    if isinstance(address, ir.Reg):
-        kind = state.get(address.index)
+    if isinstance(address, (ir.Reg, ir.Temp)):
+        # (a temporary: an address an instruction works out and uses twice, "add.h #20, [8C[R20]]")
+        kind = state.get(address.index) if isinstance(address, ir.Reg) else state.get(("temp", address.name))
         if kind is None or kind[0] not in STRUCTS:
             return None
         return in_field_array(kind[0], kind[1], address, kind[1], family_of(kind))
@@ -724,6 +748,8 @@ def access(address, state, zeros=None):
         base = base.args[0]    # (a pointer to a record in the ROM's first 64 KB, known to fit 16 bits: the pointer)
     if isinstance(base, ir.Reg):
         kind = state.get(base.index)
+    elif isinstance(base, ir.Temp):
+        kind = state.get(("temp", base.name))
     elif isinstance(base, ir.Op) and (base.name == "or" or base.name == "add" and isinstance(base.args[0], ir.Const)):
         kind = kind_of(base, state, {})
     elif isinstance(base, ir.Load):
@@ -742,32 +768,42 @@ def access(address, state, zeros=None):
     return None
 
 
+def arrays_of(struct, family):
+    """(start, bits, count) of the fields of 'struct' that are arrays (FIELD_ARRAYS), and of the family's own
+    (SCOPED_ARRAYS)."""
+    for (array_struct, start), (bits, count) in FIELD_ARRAYS.items():
+        if array_struct == struct:
+            yield start, bits, count
+    if family is not None:
+        for (array_struct, array_family, start), (bits, count) in SCOPED_ARRAYS.items():
+            if array_struct == struct and array_family == family:
+                yield start, bits, count
+
+
 def in_field_array(struct, offset, base, base_offset, family):
     """access()'s answer for a field at 'offset' of 'struct': past the start of a field that is an array
-    (FIELD_ARRAYS), that array's element (a pointer moved into it reads name[1], not a field at its place)."""
-    for (array_struct, start), (bits, count) in FIELD_ARRAYS.items():
+    (FIELD_ARRAYS, the family's SCOPED_ARRAYS), that array's element (a pointer moved into it reads name[1],
+    not a field at its place)."""
+    for start, bits, count in arrays_of(struct, family):
         width = bits // 8
-        if array_struct == struct and start < offset and (offset - start) % width == 0 \
-                and (count is None or offset - start < count * width):
+        if start < offset and (offset - start) % width == 0 and (count is None or offset - start < count * width):
             return struct, start, base, base_offset, family, None, ir.Const((offset - start) // width, 32)
     return struct, offset, base, base_offset, family
 
 
-def array_access(kind, pointer, constant, rest, zeros=None, records=True):
+def array_access(kind, pointer, constant, rest, zeros=None, whole_records=True):
     """(struct, field offset, pointer, how far into its record the pointer points, family, record number or None,
     element number) for an access to an element of a field that is an array (FIELD_ARRAYS): the pointer's
     record (or the one so many records on) plus the field's offset plus the element's; None otherwise. The
     terms 'rest' are a record's number times its size and an element's number times the element's; without
-    'records' (a structure the work RAM or the board has one of there), an element's number only."""
+    'whole_records' (a structure the work RAM or the board has one of there), an element's number only."""
     size = STRUCTS[kind[0]]
-    for (struct, start), (bits, count) in FIELD_ARRAYS.items():
-        if struct != kind[0]:
-            continue
+    for start, bits, count in arrays_of(kind[0], family_of(kind)):
         width = bits // 8
         records, element_terms = [], []
         for term in rest:
             # (an array past the record's end takes no record number: what follows is the array)
-            by_record = scaled_count(term, size, zeros) if count is not None and records else None
+            by_record = scaled_count(term, size, zeros) if count is not None and whole_records else None
             by_element = scaled_count(term, width, zeros)
             if by_record is not None and not records:
                 records.append(by_record)
@@ -778,7 +814,7 @@ def array_access(kind, pointer, constant, rest, zeros=None, records=True):
         else:
             offset = kind[1] + constant
             record, inside = divmod(offset, size) if count is not None else (0, offset)
-            if record and not records:
+            if record and not whole_records:
                 continue
             within = inside - start
             if within < 0 or within % width or (count is not None and within >= count * width):
@@ -858,9 +894,9 @@ def indexed_access(address, state, in_fields=True, zeros=None):
             # number the code works out (SCREEN(screen)->lap_times[player]) or a constant one
             for term, found in zip(terms, kinds):
                 if found is not None and found[0] in STRUCTS and not records_kind(found) \
-                        and any(struct == found[0] for struct, _ in FIELD_ARRAYS):
+                        and any(True for _ in arrays_of(found[0], family_of(found))):
                     rest = [other for other in terms if other is not term]
-                    hit = array_access(found, term, constant, rest, zeros, records=False)
+                    hit = array_access(found, term, constant, rest, zeros, whole_records=False)
                     if hit is not None:
                         return hit
         if any(found is not None and (found[0] in STRUCTS or found[0] == "global") for found in kinds):
@@ -1113,7 +1149,7 @@ class Program:
                 state[index] = kind
 
     def step(self, statement, state, zeros, record):
-        if PAGED and isinstance(statement, ir.SetTemp):
+        if isinstance(statement, ir.SetTemp):
             kind = kind_of(statement.value, state, zeros)
             if kind is None:
                 state.pop(("temp", statement.temp.name), None)
@@ -1181,8 +1217,11 @@ class Program:
         zeros = zeros if zeros is not None else {}
         if isinstance(statement, ir.Store):
             hit = access(statement.address, state, zeros)
-            if hit is not None and hit[0] in REGIONS:
+            if hit is not None and hit[0] == "rom":
                 hit = None    # nothing writes the ROM: whatever this is, it stays as it was
+            if hit is not None and hit[0] in REGIONS:
+                found[id(statement)] = hit    # (a device's: no structure's field)
+                hit = None
             if hit is not None:
                 if hit[0] == "global":
                     hit = hit + (statement.bits,)
@@ -1346,11 +1385,18 @@ class Layouts:
         """(view name, field name, field offset, field bits, signed) of the family's field holding 'offset',
         or None."""
         fields = self.scoped.get(struct, {}).get(family, {})
-        for start in range(offset, offset - 4, -1):
-            found = fields.get(start)
-            if found is not None and start + found[1] // 8 > offset:
-                return self.views[struct][family], found[0], start, found[1], found[2]
+        for start, found in fields.items():
+            width = found[1] // 8
+            if start <= offset < start + width * SCOPED_ARRAYS.get((struct, family, start), (0, 1))[1]:
+                # (an array's element: where that element starts)
+                return self.views[struct][family], found[0], start + (offset - start) // width * width, found[1], found[2]
         return None
+
+    @staticmethod
+    def scoped_array_count(struct, family, offset):
+        """How many elements the family's field at 'offset' holds when it is an array, else None."""
+        found = SCOPED_ARRAYS.get((struct, family, offset))
+        return None if found is None else found[1]
 
     def overlay(self, struct, offset, bits):
         """(name, signed) of the overlay of 'bits' at 'offset', or None."""
@@ -1384,20 +1430,25 @@ class Layouts:
                 return start, bits
         return None
 
-    def members(self, struct, fields=None):
+    def members(self, struct, fields=None, rooms=None):
         """The fields ({offset: bits}, the structure's by default) as C members: (offset, bits, [parts]) for
         each outermost field, the parts being the fields inside it, as members of their own (a part may
-        have parts). A field that starts inside another and runs past its end has no place in C."""
+        have parts). A field that starts inside another and runs past its end has no place in C. 'rooms'
+        ({offset: bytes}): the room of the fields that are arrays."""
         fields = self.fields.get(struct, {}) if fields is None else fields
+        rooms = rooms or {}
+
+        def room(member):
+            return rooms.get(member[0], member[1] // 8)
         outer = []
         holding = []    # the fields the next one may lie inside, the outermost first
         for offset in sorted(fields, key=lambda start: (start, -fields[start])):
             bits = fields[offset]
             member = (offset, bits, [])
-            while holding and offset >= holding[-1][0] + holding[-1][1] // 8:
+            while holding and offset >= holding[-1][0] + room(holding[-1]):
                 holding.pop()
             if holding:
-                if offset + bits // 8 > holding[-1][0] + holding[-1][1] // 8:
+                if offset + room(member) > holding[-1][0] + room(holding[-1]):
                     raise ValueError(f"{struct}: the field at {offset:X} runs past the end of the one at "
                                      f"{holding[-1][0]:X}")
                 holding[-1][2].append(member)
@@ -1406,7 +1457,7 @@ class Layouts:
             holding.append(member)
         return outer
 
-    def member_lines(self, struct, members, start, end, pad, names=None, signed=None, overlays=None):
+    def member_lines(self, struct, members, start, end, pad, names=None, signed=None, overlays=None, arrays=None):
         """C members for the fields 'members' (see members()), from offset 'start' to 'end'; 'names',
         'signed' ({offset: ...}) and 'overlays' ({(offset, bits): (name, signed)}) are the structure's by
         default."""
@@ -1427,7 +1478,7 @@ class Layouts:
                     lines.append(f"{pad}uint8_t pad_{position:02X}[0x{offset - position:X}];")
                 own = [(found_bits, found) for (found_offset, found_bits), found in sorted(overlays.items())
                        if found_offset == offset and found_bits < bits]
-                count = self.array_count(struct, offset) if generic else None
+                count = self.array_count(struct, offset) if generic else (arrays or {}).get(offset)
                 if count is not None:
                     # an array: of so many, or (count 0) the values after the record
                     lines.append(f"{pad}{kind(offset, bits)} {names[offset]}[{f'0x{count:X}' if count else ''}];")
@@ -1495,14 +1546,17 @@ class Layouts:
                 for family in self.families(struct):
                     fields = self.scoped[struct][family]
                     widths = {offset: bits for offset, (_, bits, _) in fields.items()}
-                    view = self.members(struct, widths)
-                    if max(o + b // 8 for o, b in widths.items()) > size:
+                    arrays = {offset: self.scoped_array_count(struct, family, offset) for offset in fields
+                              if self.scoped_array_count(struct, family, offset) is not None}
+                    rooms = {offset: widths[offset] // 8 * count for offset, count in arrays.items()}
+                    view = self.members(struct, widths, rooms)
+                    if max(o + rooms.get(o, b // 8) for o, b in widths.items()) > size:
                         raise ValueError(f"{struct} {family}: fields run past the end")
                     lines += ["\t\tstruct", "\t\t{"]
                     lines += self.member_lines(struct, view, region, region, "\t\t\t",
                                                {offset: found[0] for offset, found in fields.items()},
                                                {offset: found[2] for offset, found in fields.items()},
-                                               self.scoped_overlays.get(struct, {}).get(family, {}))
+                                               self.scoped_overlays.get(struct, {}).get(family, {}), arrays)
                     lines.append(f"\t\t}} {self.views[struct][family]};")
                 lines.append("\t};")
             lines.append("};")

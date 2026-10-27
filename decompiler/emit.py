@@ -329,6 +329,83 @@ def rerolled(lines):
     return found
 
 
+ASSIGNED = re.compile(r"([A-Za-z_]\w*) (?:[-+*/%&|^]|<<|>>)?= ")
+TEMP_NAME = re.compile(r"Temp\(name='([^']+)'")
+
+
+def renumbered(head, body, local_name):
+    """A local variable the C numbered (move_destination_63) because others had its name, which the function
+    no longer has (a run rerolled into a loop keeps one group's): its name, in place (the declarations in
+    'head', the lines of 'body')."""
+    words = re.compile(r"(?<![\w.>])[A-Za-z_]\w*")
+    used = set(words.findall("\n".join(head + body)))
+    declared = [name for line in head if line.startswith("\t") and not line.startswith("\t/*")
+                for name in re.findall(r"([A-Za-z_]\w*) = ", line)]
+    for name in sorted(declared, key=lambda found: (len(found), found)):
+        found = re.fullmatch(r"(\w+)_(\d+)", name)
+        if found is None or found.group(1) in used or local_name(found.group(1)) is None:
+            continue
+        base = found.group(1)
+        pattern = re.compile(rf"(?<![\w.>]){re.escape(name)}\b")
+        for lines in (head, body):
+            lines[:] = [pattern.sub(base, line) for line in lines]
+        used.add(base)
+        used.discard(name)
+
+
+def group_key(statements):
+    """What a group of statements does, its temporaries named by their order in it (an instruction's are
+    named after its address: t0109B4_2_operand), so that one instruction's group is equal to the next's."""
+    names = {}
+
+    def canonical(found):
+        names.setdefault(found.group(1), f"T{len(names)}")
+        return f"Temp(name='{names[found.group(1)]}'"
+    return [TEMP_NAME.sub(canonical, repr(statement)) for statement in statements]
+
+
+def same_group_text(texts, position, size, count):
+    """True when the C of 'count' groups of 'size' statements from 'position' ('texts': each statement's lines)
+    is one group's, but for the names of the variables each group sets before it reads them."""
+    def group_lines(start):
+        return [line for index in range(start, start + size) for line in texts[index]]
+
+    def assigned(lines):
+        names = []
+        for line in lines:
+            found = ASSIGNED.match(line)
+            if found is not None and found.group(1) not in names:
+                names.append(found.group(1))
+        return names
+
+    def fresh(lines, name):
+        """True when the group sets 'name' (a plain assignment) before anything in it reads it."""
+        word = re.compile(rf"\b{re.escape(name)}\b")
+        for line in lines:
+            if word.search(line):
+                return line.startswith(f"{name} = ") and not word.search(line[len(name) + 3:])
+        return False
+
+    first = group_lines(position)
+    if not first:
+        return False
+    first_names = assigned(first)
+    for number in range(1, count):
+        other = group_lines(position + number * size)
+        other_names = assigned(other)
+        if len(other) != len(first) or len(other_names) != len(first_names):
+            return False
+        mapping = {name: first_name for name, first_name in zip(other_names, first_names) if name != first_name}
+        if any(not fresh(other, name) or not fresh(first, first_name) for name, first_name in mapping.items()):
+            return False
+        if mapping:
+            renaming = re.compile(r"\b(" + "|".join(map(re.escape, mapping)) + r")\b")
+            other = [renaming.sub(lambda found: mapping[found.group(1)], line) for line in other]
+        if other != first:
+            return False
+    return True
+
+
 def shared_results(texts):
     """For the C of every function ('texts': its text by anything), the result pointers of each function
     that some call of it gives the same variable as another one ("wait_for_frame(&ignored, &ignored, ...)",
@@ -902,7 +979,10 @@ class FunctionWriter:
                 read = next((node for node in ir.walk(address) if node == field[2]), field[2])
                 register = self.printer.any(read).text
                 return (f"{item.name}[{register}]" if size == 1 else f"{item.name}[{register} / {size}u]"), item.signed, False
-            field = (pointers.REGIONS and next(iter(pointers.REGIONS)), 0, address, 0, None)
+            field = ("rom", 0, address, 0, None)
+        if field is not None and field[0] == "io":
+            # through a pointer into a device of the board: the bus, at the address the code works out
+            return f"io_read{bits}({self.printer.any(field[2]).text})", False, False
         if field is not None and field[0] in pointers.REGIONS:
             # through a pointer into the ROM: a table with a name, or the data read straight
             named = self.emitter.memory.access(address, bits, self.exact)
@@ -1002,6 +1082,14 @@ class FunctionWriter:
             struct, offset, base, base_offset, kind_family = field[:5]
             layouts = self.emitter.layouts
             family = self.field_family(field)
+            element = field[6] if len(field) > 6 else None
+            if element is not None:
+                # an element of a field that is an array: from where that element is, by a constant number only
+                width = self.array_width(struct, family, offset)
+                if width is None or not isinstance(element, ir.Const):
+                    return None
+                offset += (element.value & 0xFFFFFFFF) * width
+                field = field[:6]
             position = offset
             while position < offset + size:
                 scoped = layouts.scoped_field(struct, family, position) if family else None
@@ -1043,6 +1131,14 @@ class FunctionWriter:
             struct, offset, base, base_offset, kind_family = field[:5]
             layouts = self.emitter.layouts
             family = self.field_family(field)
+            element = field[6] if len(field) > 6 else None
+            if element is not None:
+                # an element of a field that is an array: from where that element is, by a constant number only
+                width = self.array_width(struct, family, offset)
+                if width is None or not isinstance(element, ir.Const):
+                    return None
+                offset += (element.value & 0xFFFFFFFF) * width
+                field = field[:6]
             position = offset
             while position < offset + size:
                 scoped = layouts.scoped_field(struct, family, position) if family else None
@@ -1357,7 +1453,7 @@ class FunctionWriter:
             if scoped is None:
                 raise EmitError(f"{self.function.name}: no field of {struct} at {offset:X}")
             view, scoped_name, scoped_offset, scoped_bits, scoped_signed = scoped
-            text = f"{pointer}->{view}.{scoped_name}"
+            text = f"{pointer}->{view}.{scoped_name}" + self.scoped_element(struct, family, scoped_offset, element_number)
             if scoped_offset == offset and scoped_bits == bits:
                 return text, scoped_signed
             return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
@@ -1378,7 +1474,7 @@ class FunctionWriter:
             scoped = layouts.scoped_field(struct, family, offset)
             if scoped is not None:
                 view, scoped_name, scoped_offset, scoped_bits, scoped_signed = scoped
-                text = f"{pointer}{member}{view}.{scoped_name}"
+                text = f"{pointer}{member}{view}.{scoped_name}" +                     self.scoped_element(struct, family, scoped_offset, element_number)
                 if scoped_offset == offset and scoped_bits == bits:
                     if field_offset == offset and field_bits == bits and layouts.names[struct][offset] == scoped_name \
                             and layouts.signed[struct][offset] == scoped_signed:
@@ -1396,6 +1492,62 @@ class FunctionWriter:
                 return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
         self.note_missing(struct, offset, bits, base, base_offset, generic)
         return generic[:2]
+
+    def rerolled_statements(self, statements, texts):
+        """The C of a block's statements ('texts': each one's lines), with every run of one group of
+        statements the code has REPEAT_MINIMUM times or more in a row (the same IR: a copy or a clear
+        unrolled) as a counted loop. The groups' C may differ only in the names of the variables each one sets
+        before it reads them (an instruction's own values, which the C names group by group); the loop's
+        body is the last group's, so that what the run leaves for the code after it is in the names that
+        code reads."""
+        plain = (ir.SetReg, ir.SetTemp, ir.SetFlag, ir.Store)
+        lines = []
+        position = 0
+        while position < len(statements):
+            best = None
+            for size in range(1, 17):
+                group = statements[position:position + size]
+                if len(group) < size or not all(isinstance(statement, plain) for statement in group):
+                    break
+                key = group_key(group)
+                count = 1
+                while position + (count + 1) * size <= len(statements) \
+                        and group_key(statements[position + count * size:position + (count + 1) * size]) == key:
+                    count += 1
+                if count >= REPEAT_MINIMUM and (best is None or count * size > best[0] * best[1]) \
+                        and same_group_text(texts, position, size, count):
+                    best = (count, size)
+            if best is None:
+                lines += texts[position]
+                position += 1
+                continue
+            count, size = best
+            last = position + (count - 1) * size
+            counter = "repeat"
+            while counter in self.vars.declarations() or counter in self.temps:
+                counter += "_"
+            lines += [f"for (uint32_t {counter} = 0; {counter} < {count}u; {counter}++)", "{"]
+            lines += ["\t" + line for index in range(last, last + size) for line in texts[index]]
+            lines.append("}")
+            position += count * size
+        return lines
+
+    def scoped_element(self, struct, family, offset, element_number):
+        """'[i]' for an element of a family's field that is an array (at 'offset': the element's own place,
+        or the array's start with the element's number), '' for any other field."""
+        for (array_struct, array_family, start), (bits, count) in pointers.SCOPED_ARRAYS.items():
+            width = bits // 8
+            if array_struct == struct and array_family == family and start <= offset < start + width * count:
+                if element_number is not None and offset == start:
+                    return f"[{self.record_number(element_number)}]"
+                return f"[{(offset - start) // width}]"
+        return ""
+
+    def array_width(self, struct, family, start):
+        """The bytes of an element of the field that is an array at 'start' (the structure's or the family's),
+        or None."""
+        found = pointers.FIELD_ARRAYS.get((struct, start)) or pointers.SCOPED_ARRAYS.get((struct, family, start))
+        return found[0] // 8 if found is not None else None
 
     def record_number(self, index):
         """C for the number of a record from a pointer (pointers.indexed_access): 0, 1, -1 for the one the
@@ -1586,6 +1738,11 @@ class FunctionWriter:
             return [f"{name} = {self.stored(statement.value, statement.bits)};"]
         if isinstance(statement, ir.Store):
             value = statement.value
+            field = self.fields.get(id(statement))
+            if field is not None and field[0] == "io":
+                # (through a pointer into a device of the board: the bus, at the address the code works out)
+                return [f"io_write{statement.bits}({self.printer.any(field[2]).text}, "
+                        f"{self.stored(value, statement.bits)});"]
             target = self.memory(statement.address, statement.bits, id(statement))
             address = memory.constant_address(statement.address)
             if target is not None and target[2] and (address is None or not memory.bus_only(address, statement.bits)):
@@ -2155,9 +2312,14 @@ class FunctionWriter:
             lines = []
             if self.emitter.trace and isinstance(node.label, int):
                 lines.append(f"game_trace_block(0x{node.label:06X}u);")
+            texts = []
             for statement in node.statements:
                 # an assignment of a variable to itself (two registers that hold one variable) does nothing
-                lines += [line for line in self.statement(statement) if not SELF_ASSIGNMENT.fullmatch(line)]
+                texts.append([line for line in self.statement(statement) if not SELF_ASSIGNMENT.fullmatch(line)])
+            if self.emitter.reroll_statements:
+                lines += self.rerolled_statements(node.statements, texts)
+            else:
+                lines += [line for text in texts for line in text]
             if self.emitter.reroll:
                 lines = rerolled(lines)
             return [pad + line for line in lines]
@@ -2275,6 +2437,8 @@ class FunctionWriter:
         # declared because some OBJECT(...)->z is read
         declarations = self.declarations(set(re.findall(r"(?<![\w.>])[A-Za-z_]\w*", "\n".join(body))))
         text += ["\t" + line for line in declarations]
+        body = list(body)
+        renumbered(text, body, self.emitter.local_name)
         if self.emitter.trace:
             text.append(f"\tgame_trace(0x{self.entry:06X}u);")
         if declarations:
@@ -2367,6 +2531,9 @@ class Emitter:
         self.trace = trace    # every function reports itself to game_trace() when it starts
         self.saved_locals = False    # a stack slot that saves a local variable is saved_NAME (slot_hint)
         self.reroll = False    # runs of one group of statements written as a loop (rerolled)
+        # the same, for runs of one group of instructions (the same IR, each group's own temporaries named
+        # its own way: rerolled_statements)
+        self.reroll_statements = False
 
     def context_name(self, index):
         """The C name of a register the whole program shares."""
@@ -2592,7 +2759,8 @@ class Emitter:
         if not hasattr(self, "_globals"):
             found = set(self.names.values()) | set(self.register_names.values()) | set(cprint.UNSIGNED.values())
             found |= set(cprint.SIGNED.values()) | GLOBAL_WORDS
-            for items in (self.memory.variables, self.memory.tables, self.memory.hardware, self.memory.overlays):
+            for items in (self.memory.variables, self.memory.tables, self.memory.hardware, self.memory.overlays,
+                          getattr(self.memory, "board", {})):
                 for item in items.values():
                     found |= {item.name, item.name + "_ADDRESS"}
             for items in list(self.memory.scoped.values()) + list(self.memory.scoped_overlays.values()):

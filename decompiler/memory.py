@@ -269,6 +269,7 @@ class Memory:
 
         widths = {"variables": {}, "tables": {}, "hardware": {}}
         indexed = set()
+        board_indexed = set()
         # the tables of records (pointers.py reads them by name and field): no plain table of their own
         records = [(address, address + names.structs[struct])
                    for address, (_, struct) in getattr(names, "record_tables", {}).items()]
@@ -290,6 +291,9 @@ class Memory:
                 continue    # (a column of a table of records gets no table without a name of its own)
             where = "variables" if work_ram(value) else "tables" if program_rom(value) else \
                 "hardware" if hardware_area(value) else None
+            if where == "hardware" and parts is not None and plain_hardware(value):
+                board_indexed.add(value)    # (a variable of the board's plain memories, by a number)
+                continue
             if where is None or (where == "hardware" and parts is not None):
                 continue
             widths[where].setdefault(value, Counter())[bits] += 1
@@ -304,6 +308,8 @@ class Memory:
         # the board's plain memories: variables of the board, not registers
         self.board = {address: self.hardware.pop(address) for address in list(self.hardware)
                       if plain_hardware(address)}
+        for address in board_indexed & set(self.board):
+            self.board[address].indexed = True
         for address in indexed:
             for items in (self.variables, self.tables):
                 if address in items:
@@ -397,9 +403,12 @@ class Memory:
         if not table_index(rest, bits):
             return None
         ram = work_ram(base)
-        if not ram and (not program_rom(base) or base + index_limit(rest) * (bits // 8) >= ROM_AREAS[0][1]):
+        board = plain_hardware(base) and base in self.board
+        if not ram and not board and (not program_rom(base) or base + index_limit(rest) * (bits // 8) >= ROM_AREAS[0][1]):
             return None
-        items = self.variables if ram else self.tables
+        items = self.variables if ram else self.board if board else self.tables
+        lvalue = ram or board
+        ram_macro = BOARD_MACRO if board else RAM_MACRO
         loaded = rest
         while isinstance(loaded, ir.Op) and loaded.name in ("zext", "fits"):
             loaded = loaded.args[0]
@@ -414,18 +423,18 @@ class Memory:
             # an index from an element of an array past its first (the scrolls of the second tile layer)
             array, number, byte = found
             if byte == 0 and index is not None and array.bits == bits:
-                return f"{array.name}[{number} + {index_text(index)}]", array.signed, ram
-            macro = (RAM_MACRO if ram else ROM_MACRO) + str(bits)
-            return f"{macro}({array.name}_ADDRESS + 0x{base - array.address:X}u + {index_text(rest)})", False, ram
+                return f"{array.name}[{number} + {index_text(index)}]", array.signed, lvalue
+            macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
+            return f"{macro}({array.name}_ADDRESS + 0x{base - array.address:X}u + {index_text(rest)})", False, lvalue
         item = items[base]
         if base == VARIABLES:
-            macro = (RAM_MACRO if ram else ROM_MACRO) + str(bits)
-            return f"{macro}(GAME_VARIABLES + {index_text(rest)})", False, ram
+            macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
+            return f"{macro}(GAME_VARIABLES + {index_text(rest)})", False, lvalue
         if index is not None and item.bits == bits:
-            return f"{item.name}[{index_text(index)}]", item.signed, ram
-        macro = (RAM_MACRO if ram else ROM_MACRO) + str(bits)
+            return f"{item.name}[{index_text(index)}]", item.signed, lvalue
+        macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
         start = "GAME_VARIABLES" if base == VARIABLES else f"{item.name}_ADDRESS"
-        return f"{macro}({start} + {index_text(rest)})", False, ram
+        return f"{macro}({start} + {index_text(rest)})", False, lvalue
 
     def register(self, value):
         """Name of a hardware register at 'value' (NAME_ADDRESS for a variable of the board's plain
