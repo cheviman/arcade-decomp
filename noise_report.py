@@ -56,15 +56,18 @@ KINDS = {
     "var_fields": ("object fields without a name (var_XX)", re.compile(r"\bvar_[0-9A-F]{2}\b")),
     "mem_access": ("memory reached through a computed address (mem_read/mem_write)",
                    re.compile(r"\bmem_(?:read|write)\d+\(")),
-    "wide_access": ("several fields read or written at once (AS/AT)", re.compile(r"\bA[ST]\d+\(")),
+    "wide_access": ("several fields read or written at once (AS/AT), a table read at another width (TABLE16)",
+                    re.compile(r"\b(?:A[ST]|TABLE)\d+\(")),
     "copy_backs": ("results written back again before an early return (*p_x = x; return;)", None),
     "invalid_jump": ("jumps through a table with an index it does not have", re.compile(r"\binvalid_jump\(")),
     "unknown_code": ("calls to code the analysis does not know", re.compile(r"\bunknown_code\(")),
     "raw_rom_addresses": ("ROM addresses printed as numbers (build/decompile/unnamed_addresses.txt)", None),
     "uncommented": ("functions without a comment above them", None),
-    "rom_reads": ("data read through its ROM address (ROM8/16/32, rom(), SOUND_ROM8/16, sound_rom_at)",
-                  re.compile(r"\b(?:ROM(?:8|16|32)S?|SOUND_ROM(?:8|16)|rom|sound_rom_at)\(")),
-    "rom_table_reads": ("reads of a table the C names over the ROM (src/ram.h: rom(...))", None),
+    "rom_reads": ("data read through an address (DATA8/16/32, data_at(), ROM8/16/32, rom(), SOUND_ROM8/16, "
+                  "sound_rom_at)",
+                  re.compile(r"\b(?:DATA(?:8|16|32)S?|data_at|ROM(?:8|16|32)S?|SOUND_ROM(?:8|16)|rom|sound_rom_at)\(")),
+    "rom_table_reads": ("reads of a table the C names over an address (src/ram.h: rom(...); src/sound/sound.h: "
+                        "sound_rom_at(...))", None),
     "board_replaced": ("functions the board puts its own in place of (BOARD_ORIGINAL, runtime/replaced.txt)", None),
 }
 INFORMATION = {
@@ -73,6 +76,8 @@ INFORMATION = {
     "casts": "casts",
     "partial_writes": "partial writes of a variable ((x & ~0xFFFFu) | ...)",
     "board_registers": "reads and writes of a device of the board, through the bus (io_read8...)",
+    "clean_functions": "functions with nothing of the above in them (the partial writes too), per thousand",
+    "clean_lines": "lines of code in the functions with nothing of the above, per thousand",
 }
 
 
@@ -103,6 +108,9 @@ def count(paths):
                 continue
             if not in_function:
                 continue
+            if line == "}":
+                in_function = False    # (what follows a function's end, a table of data, is no code of it)
+                continue
             for kind, (_, pattern) in KINDS.items():
                 if pattern is not None:
                     counts[kind] += len(pattern.findall(line))
@@ -128,6 +136,52 @@ def count(paths):
     return counts
 
 
+PARTIAL_WRITE = re.compile(r"& ~0xF+u\) \|")
+
+
+def clean_measure(paths, extra):
+    """(functions with no leftover, functions, lines of code with none, lines of code in functions): a
+    leftover is any kind of KINDS on the line, a register the C keeps as a global, a table over an address
+    ('extra'), a partial write, a bool control variable, a result written back before an early return; a
+    parameter named after a register leaves its function unclean."""
+    patterns = [pattern for _, pattern in KINDS.values() if pattern is not None] + list(extra) + [PARTIAL_WRITE]
+    clean_functions = functions = clean_lines = lines = 0
+    for path in paths:
+        text = path.read_text(encoding="ascii", errors="replace").splitlines()
+        z80 = "sound" in path.parts
+        inside, dirty = False, False
+        for index, line in enumerate(text):
+            if line.startswith(("/*", "   ", " *")):
+                continue
+            found = FUNCTION.match(line)
+            if found and index + 1 < len(text) and text[index + 1] == "{":
+                inside = True
+                dirty = bool(re.findall(r"(?<!\w)(?:p_)?r\d+(?:_\d+)?(?=[,)]|$)", found.group(2))) or \
+                    (z80 and bool(re.findall(rf"(?<!\w)(?:p_)?{Z80_REGISTER}(?=[,)]|$)", found.group(2))))
+                continue
+            if not inside:
+                continue
+            if line == "}":
+                functions += 1
+                clean_functions += not dirty
+                inside = False
+                continue
+            if line.strip() in ("", "{", "}"):
+                continue
+            lines += 1
+            leftover = any(pattern.search(line) for pattern in patterns) or line.startswith("\tbool ")
+            if not leftover and COPY_BACK.match(line):
+                end = index
+                while end < len(text) and COPY_BACK.match(text[end]):
+                    end += 1
+                leftover = end < len(text) and text[end].strip().startswith("return")
+            if leftover:
+                dirty = True
+            else:
+                clean_lines += 1
+    return clean_functions, functions, clean_lines, lines
+
+
 def main():
     arguments = sys.argv[1:]
     source = ROOT / "src"
@@ -135,14 +189,16 @@ def main():
         source = Path(arguments[arguments.index("--src") + 1]).resolve()
     sources = sorted(path for path in source.rglob("*.c"))
     counts = count(sources)
-    # the tables src/ram.h defines over the ROM ("#define NAME ((const uint16_t *)rom(NAME_ADDRESS))"): every
-    # use of one reads the ROM, which the game has to read from its assets instead
-    header = source / "ram.h"
-    tables = re.findall(r"^#define (\w+) \(\(const \w+ \*\)rom\(", header.read_text(encoding="ascii"), re.M) \
-        if header.exists() else []
-    if tables:
-        use = re.compile(r"\b(?:" + "|".join(tables) + r")\b")
-        counts["rom_table_reads"] = sum(len(use.findall(path.read_text(encoding="ascii", errors="replace")))
+    # the tables src/ram.h and src/sound/sound.h define over an address ("#define NAME ((const uint16_t
+    # *)rom(NAME_ADDRESS))"): every use of one reads by the address, which the game has to read by name
+    tables = []
+    for header, function in ((source / "ram.h", "rom"), (source / "sound" / "sound.h", "sound_rom_at")):
+        if header.exists():
+            tables += re.findall(r"^#define (\w+) \(\(const (?:struct )?\w+ \*\)\(?" + function + r"\(",
+                                 header.read_text(encoding="ascii"), re.M)
+    table_use = re.compile(r"\b(?:" + "|".join(tables) + r")\b") if tables else None
+    if table_use:
+        counts["rom_table_reads"] = sum(len(table_use.findall(path.read_text(encoding="ascii", errors="replace")))
                                         for path in sources)
     # the registers the whole program shares, globals of the C ("extern uint32_t r20, ..." in src/game.h and
     # src/sound/sound.h): the ones still named after the register
@@ -151,13 +207,16 @@ def main():
         if header.exists():
             for declaration in re.findall(r"^extern \w+ ([^;]*);", header.read_text(encoding="ascii"), re.M):
                 registers |= {name.strip() for name in declaration.split(",") if re.fullmatch(r"r\d+", name.strip())}
-    if registers:
-        use = re.compile(r"\b(?:" + "|".join(sorted(registers)) + r")\b")
-        counts["context_registers"] = sum(len(use.findall(path.read_text(encoding="ascii", errors="replace")))
+    register_use = re.compile(r"\b(?:" + "|".join(sorted(registers)) + r")\b") if registers else None
+    if register_use:
+        counts["context_registers"] = sum(len(register_use.findall(path.read_text(encoding="ascii", errors="replace")))
                                           for path in sources)
     if UNNAMED_ADDRESSES.exists():
         counts["raw_rom_addresses"] = sum(1 for line in UNNAMED_ADDRESSES.read_text().splitlines()
                                           if line and not line.startswith("#"))
+    measure = clean_measure(sources, [pattern for pattern in (table_use, register_use) if pattern is not None])
+    counts["clean_functions"], counts["clean_lines"] = measure[0] * 1000 // max(measure[1], 1), \
+        measure[2] * 1000 // max(measure[3], 1)
     saved = {}
     if BASELINE.exists():
         for line in BASELINE.read_text().splitlines():
@@ -172,6 +231,8 @@ def main():
         print(f"{kind:20s} {counts[kind]:7d} {'' if before is None else before:>7} {change:>6s}  {what}")
         if kind in KINDS and before is not None and counts[kind] > before:
             rose.append(kind)
+    print(f"\nclean: {measure[0]} of {measure[1]} functions ({measure[0] * 100 / max(measure[1], 1):.1f}%), "
+          f"{measure[2]} of {measure[3]} lines of code ({measure[2] * 100 / max(measure[3], 1):.1f}%)")
     if "--files" in arguments:
         print()
         print(f"{'rom_reads':>9s} {'rom_names':>9s}")

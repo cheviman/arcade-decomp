@@ -268,7 +268,7 @@ def _wrap(text, prefix="# ", width=110):
     return lines + [line.rstrip()]
 
 
-def export(region, base, places, formats_path, folder, kept=(), movable=None, default_group=None):
+def export(region, base, places, formats_path, folder, kept=(), movable=None, default_group=None, choose=None):
     """Every piece of 'region' (which starts at address 'base') into 'folder', and layout.json, the pieces in
     order. 'places' are [(address, name)] where pieces start (pieces() for the program ROM); 'kept' are (start,
     end) ranges the asset does not hold (code): pieces of their own that build() takes from the ROM; 'movable',
@@ -276,7 +276,8 @@ def export(region, base, places, formats_path, folder, kept=(), movable=None, de
     gives each piece its format and its file: a text file by subject holds its pieces as sections; a piece
     in a binary format is a file of its own in the folder of its subject; a run of one byte (padding) is
     written in layout.json. 'default_group' (an address -> a file's name) groups the pieces no file of the
-    formats file takes. Returns how many files."""
+    formats file takes; 'choose' (a piece's name -> a format of FORMATS or None), the format of a piece the
+    formats file gives none. Returns how many files."""
     chosen, groups, descriptions = load_formats(formats_path)
     cuts = dict(places)
     if base not in cuts:
@@ -311,7 +312,7 @@ def export(region, base, places, formats_path, folder, kept=(), movable=None, de
         if address in kept_starts:
             layout.append(dict(entry, format="kept"))
             continue
-        kind = chosen.get(name)
+        kind = chosen.get(name) or (choose(name) if choose else None)
         if kind not in FORMATS:
             kind = plain_format(data)
         suffix, to_text, from_text = FORMATS[kind][:3]

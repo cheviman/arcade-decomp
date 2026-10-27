@@ -54,6 +54,10 @@ CANONICAL = lambda address: address      # the copy of the ROM tables are named 
 NAMED_COPIES = True    # a constant in another copy of the ROM is named by its own copy's place (game_profile.py:
                        # False where such a constant may be no address)
 ROM_NAMES_FROM = 0x1000                      # constants below are numbers, never ROM addresses (the vectors)
+# the program's tables as data the game loads from its assets: each one a pointer of its own (NAME_data)
+# that the runtime sets from the game's table registry (table.c: game_tables), read by name (NAME[i]),
+# never through ROM_FUNCTION and the table's address
+LOADED_TABLES = False
 NOTES = {
     "variables": ["/* the game's variables in work RAM; SCREEN_1 and SCREEN_2 are the blocks of the two screens,",
                   "   which the code reaches through screen (R25 of the task that runs each) */"],
@@ -424,6 +428,8 @@ class Memory:
             array, number, byte = found
             if byte == 0 and index is not None and array.bits == bits:
                 return f"{array.name}[{number} + {index_text(index)}]", array.signed, lvalue
+            if LOADED_TABLES and not lvalue:
+                return f"TABLE{bits}({array.name}, 0x{base - array.address:X}u + {index_text(rest)})", False, False
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
             return f"{macro}({array.name}_ADDRESS + 0x{base - array.address:X}u + {index_text(rest)})", False, lvalue
         item = items[base]
@@ -432,6 +438,9 @@ class Memory:
             return f"{macro}(GAME_VARIABLES + {index_text(rest)})", False, lvalue
         if index is not None and item.bits == bits:
             return f"{item.name}[{index_text(index)}]", item.signed, lvalue
+        if LOADED_TABLES and not lvalue:
+            # a loaded table read at another width than its elements': by its name and the offset in bytes
+            return f"TABLE{bits}({item.name}, {index_text(rest)})", False, False
         macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
         start = "GAME_VARIABLES" if base == VARIABLES else f"{item.name}_ADDRESS"
         return f"{macro}({start} + {index_text(rest)})", False, lvalue
@@ -490,12 +499,40 @@ class Memory:
             kind = kind[1:]
         constness = "const " if macro == ROM_MACRO else ""
         lines = [f"#define {item.name}_ADDRESS 0x{item.address:0{ADDRESS_DIGITS}X}u"]
+        if macro == ROM_MACRO and LOADED_TABLES:
+            lines.append(f"extern const void *{item.name}_data;")
+            if item.indexed:
+                lines.append(f"#define {item.name} ((const {kind} *){item.name}_data)")
+            else:
+                lines.append(f"#define {item.name} (*(const {kind} *){item.name}_data)")
+            return lines
         if item.indexed:
             lines.append(f"#define {item.name} (({constness}{kind} *){function}({item.name}_ADDRESS))")
         else:
             suffix = "S" if item.signed else ""
             lines.append(f"#define {item.name} {macro}{item.bits}{suffix}({item.name}_ADDRESS)")
         return lines
+
+    def loaded_tables(self):
+        """[(address, name)] of the tables the game loads (LOADED_TABLES): the plain ones and the tables of
+        records."""
+        if not LOADED_TABLES:
+            return []
+        found = [(address, item.name) for address, item in self.tables.items()]
+        found += [(address, name) for address, (name, _) in pointers.RECORD_TABLES.items()]
+        return sorted(found)
+
+
+def table_registry(tables, digits, prefix="game"):
+    """The C of the table registry (LOADED_TABLES): each table's pointer and what sets it, the table's
+    name and its address, which say which piece of the assets it is ('prefix': game_tables, of type
+    game_table; sound_tables for the sound program)."""
+    lines = [f"const void *{name}_data;" for _, name in tables]
+    lines += ["", "/* the tables the game loads from its assets: their names, addresses and pointers */",
+              f"const {prefix}_table {prefix}_tables[] =", "{"]
+    lines += [f"\t{{ \"{name}\", 0x{address:0{digits}X}u, &{name}_data }}," for address, name in tables]
+    lines += ["};", "", f"const size_t {prefix}_table_count = {len(tables)};"]
+    return lines
 
 
 def index_limit(rest):

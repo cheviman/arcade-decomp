@@ -1576,8 +1576,13 @@ class Layouts:
         if RECORD_TABLES:
             lines += ["", "/* the program ROM's tables of records, by name: name[i].field */"]
             digits = 4 if ADDRESS_MASK <= 0xFFFF else 6
+            from . import memory
             for address, (name, struct) in sorted(RECORD_TABLES.items()):
                 lines.append(f"#define {name}_ADDRESS 0x{address:0{digits}X}u")
+                if memory.LOADED_TABLES:
+                    lines.append(f"extern const void *{name}_data;")
+                    lines.append(f"#define {name} ({self.pointer_type(struct).rpartition(')')[0]})({name}_data))")
+                    continue
                 lines.append(f"#define {name} ({self.pointer_type(struct)}({name}_ADDRESS))")
         for struct, (first, count) in ARRAYS.items():
             lines.append(f"#define {struct.upper()}_ADDRESS(n) (0x{first:X}u + (n) * 0x{STRUCTS[struct]:X}u)    "

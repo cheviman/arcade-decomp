@@ -41,6 +41,7 @@ def use_memory_map(names, arrays):
     memory.ADDRESS_DIGITS = 4
     memory.RAM_MACRO, memory.ROM_MACRO = "SOUND_RAM", "SOUND_ROM"
     memory.RAM_FUNCTION, memory.ROM_FUNCTION = "sound_ram_at", "sound_rom_at"
+    memory.LOADED_TABLES = getattr(game_profile, "SOUND_LOADED_TABLES", False)
     memory.PAGED = False
     memory.PLAYER_FIELDS = None
     memory.CANONICAL = lambda address: address

@@ -172,6 +172,36 @@ def switch_index(value, keys, read32):
     return None
 
 
+def largest_value(node):
+    """The largest value 'node' can have, from its own bits: a number, a read as wide as it is, a mask, a
+    shift, a cut, a sum; None when nothing bounds it below its width."""
+    width = (1 << getattr(node, "bits", 32)) - 1 if getattr(node, "bits", 32) <= 64 else None
+    if isinstance(node, ir.Const):
+        return node.value
+    if isinstance(node, ir.Load):
+        return width
+    if isinstance(node, ir.Op):
+        if node.name in ("zext", "fits", "trunc"):
+            inner = largest_value(node.args[0])
+            return min(inner, width) if inner is not None else width
+        if node.name == "and":
+            bounds = [largest_value(arg) for arg in node.args]
+            known = [bound for bound in bounds if bound is not None]
+            return min(known) if known else width
+        if node.name == "shr" and isinstance(node.args[1], ir.Const):
+            inner = largest_value(node.args[0])
+            return inner >> node.args[1].value if inner is not None else None
+        if node.name in ("or", "xor"):
+            bounds = [largest_value(arg) for arg in node.args]
+            if None not in bounds:
+                return min((1 << max(bound.bit_length() for bound in bounds)) - 1, width)
+        if node.name == "add":
+            bounds = [largest_value(arg) for arg in node.args]
+            if None not in bounds and sum(bounds) <= width:
+                return sum(bounds)
+    return None
+
+
 def offset_switch(value, keys):
     """For code at base + offset with an offset that is no index times a stride: (the offset, {case address:
     its offset}), or None."""
@@ -209,6 +239,10 @@ class Names:
 
     def slot(self, node):
         return self.writer.slot_name(node), (32 if node.offset == 0 else self.writer.slot_bits(node))
+
+    def pointer(self, node):
+        """True if 'node' reads a variable the function reads fields through (FunctionWriter.typed_bases)."""
+        return isinstance(node, ir.Reg) and self.writer.register_read(node)[0] in self.writer.pointer_names
 
     def link(self, load):
         """True if 'load' reads a field or variable that holds the low half of an object's address."""
@@ -333,17 +367,18 @@ ASSIGNED = re.compile(r"([A-Za-z_]\w*) (?:[-+*/%&|^]|<<|>>)?= ")
 TEMP_NAME = re.compile(r"Temp\(name='([^']+)'")
 
 
-def renumbered(head, body, local_name):
+def renumbered(head, body, local_name, given=frozenset()):
     """A local variable the C numbered (move_destination_63) because others had its name, which the function
     no longer has (a run rerolled into a loop keeps one group's): its name, in place (the declarations in
-    'head', the lines of 'body')."""
+    'head', the lines of 'body'). A name symbols.txt gives as it is ('given': a label's, a local line's,
+    release_note_screen_1) is no number of the C's."""
     words = re.compile(r"(?<![\w.>])[A-Za-z_]\w*")
     used = set(words.findall("\n".join(head + body)))
     declared = [name for line in head if line.startswith("\t") and not line.startswith("\t/*")
                 for name in re.findall(r"([A-Za-z_]\w*) = ", line)]
     for name in sorted(declared, key=lambda found: (len(found), found)):
         found = re.fullmatch(r"(\w+)_(\d+)", name)
-        if found is None or found.group(1) in used or local_name(found.group(1)) is None:
+        if found is None or name in given or found.group(1) in used or local_name(found.group(1)) is None:
             continue
         base = found.group(1)
         pattern = re.compile(rf"(?<![\w.>]){re.escape(name)}\b")
@@ -519,10 +554,28 @@ class FunctionWriter:
                                         self.really_reads, self.fresh_outputs, emitter.split_webs,
                                         self.passes_only, self.reads_input)
         self.widths = self.vars.declarations()
+        self.pointer_names = self.typed_bases()
         self.handled = self.handler_families()
         emitter.param_widths[function.entry] = {
             value[1]: self.widths.get(self.vars.entry_name(value[1]) or "", 32)
             for value in self.params if value[0] == "r"}
+
+    def typed_bases(self):
+        """The C names of the variables the function reads fields through (the base of an access that is a
+        field of a structure): pointers, whatever else their webs hold."""
+        names = set()
+        for block in self.function.blocks.values():
+            for statement in block.statements + [block.end]:
+                addresses = [statement.address] if isinstance(statement, ir.Store) and id(statement) in self.fields \
+                    else []
+                for expression in ir.statement_expressions(statement):
+                    addresses += [node.address for node in ir.walk(expression)
+                                  if isinstance(node, ir.Load) and id(node) in self.fields]
+                for address in addresses:
+                    for node in ir.walk(address):
+                        if isinstance(node, ir.Reg):
+                            names.add(self.register_read(node)[0])
+        return names
 
     def statement_reading(self, node):
         """id of the statement or block end whose expressions hold 'node' (the one being written when the
@@ -2362,8 +2415,13 @@ class FunctionWriter:
                     for number in sorted(n for value in values for n in numbers[value]):
                         lines.append(pad + f"case {number}:")
                     lines += self.nodes(body, depth + 1)
-                lines += [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({self.expr(node.value)});", pad + "}"]
-                return lines
+                # an index whose own bits keep it inside the table (quadrant >> 14 of a halfword, 0-3, for
+                # four entries) takes no way past it
+                covered = {n for found in numbers.values() for n in found}
+                largest = largest_value(index)
+                if largest is None or largest >= len(covered) or not all(n in covered for n in range(largest + 1)):
+                    lines += [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({self.expr(node.value)});"]
+                return lines + [pad + "}"]
             offsets = offset_switch(node.value, [value for values, _ in node.cases for value in values])
             if offsets is not None:
                 offset, positions = offsets
@@ -2438,7 +2496,10 @@ class FunctionWriter:
         declarations = self.declarations(set(re.findall(r"(?<![\w.>])[A-Za-z_]\w*", "\n".join(body))))
         text += ["\t" + line for line in declarations]
         body = list(body)
-        renumbered(text, body, self.emitter.local_name)
+        # (a control variable keeps the name of the code it leads to, a label's, as name_controls gave it)
+        renumbered(text, body, self.emitter.local_name,
+                   set(self.emitter.names.values()) | set(self.emitter.local_names.values())
+                   | {found for name, found in self.controls.items() if found == name})
         if self.emitter.trace:
             text.append(f"\tgame_trace(0x{self.entry:06X}u);")
         if declarations:

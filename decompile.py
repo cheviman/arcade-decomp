@@ -925,6 +925,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     if emitter.wrapper(RESET_ADDRESS) is not None:
         raise SystemExit("the reset code takes parameters")
     entry_text = f"/* the code at the reset vector */\nvoid game_entry(void)\n{{\n\t{names[RESET_ADDRESS]}();\n}}\n"
+    loaded = named.loaded_tables()
+    registry = ("\n".join(memory.table_registry(loaded, 6)) + "\n\n") if loaded else ""
     (out_dir / "table.c").write_text(
         file_header("table.c", "the registers the whole program shares, the code calls through memory "
                     "slots reach (by address), and the reset entry")
@@ -936,7 +938,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         f"const size_t game_context_count = {len(signatures.CONTEXT)};\n\n" + "\n".join(wrappers) + "\n"
         "/* the code calls through memory slots and interrupts can reach, by address */\n"
         "const game_code_entry game_code[] =\n{\n" + "\n".join(rows) + "\n};\n\n"
-        f"const size_t game_code_count = {len(rows)};\n\n" + entry_text, encoding="ascii")
+        f"const size_t game_code_count = {len(rows)};\n\n" + registry + entry_text, encoding="ascii")
     branches = sum(isinstance(block.end, ir.Branch) for function in built.values() for block in function.blocks.values())
     gotos = sum(text.count("goto ") for text in texts.values())
     with_gotos = sum(1 for text in texts.values() if "goto " in text)

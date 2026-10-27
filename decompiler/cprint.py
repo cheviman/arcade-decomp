@@ -60,6 +60,20 @@ def part_read(text):
     return f"(uint{bits}_t){inner}"
 
 
+
+def fits16(node):
+    """True if 'node' holds no more than 16 bits: a halfword read, a value cut or widened from 16 bits or
+    fewer, a mask of them, a small number."""
+    if isinstance(node, ir.Const):
+        return node.value <= 0xFFFF
+    if isinstance(node, ir.Load):
+        return node.bits <= 16
+    if isinstance(node, ir.Op) and node.name in ("zext", "fits", "trunc"):
+        return getattr(node.args[0], "bits", 32) <= 16 or (node.name in ("fits", "trunc") and node.bits <= 16)
+    if isinstance(node, ir.Op) and node.name == "and":
+        return any(isinstance(arg, ir.Const) and arg.value <= 0xFFFF for arg in node.args)
+    return getattr(node, "bits", 32) <= 16
+
 class Value:
     """Printed C for an IR value. 'signed' is the width of a value the C already holds as a signed number
     of that width (a signed field, a sign extension), 0 otherwise: a signed comparison needs no cast."""
@@ -349,6 +363,13 @@ class Printer:
                 # an object reached through a link field: LINKED(base, link) in game/support.h
                 base = self.any(left_node.args[0])
                 return Value(f"LINKED({base.text}, {self.any(link).text})", PRIMARY, True, "u32")
+        if name == "or" and bits == 32 and isinstance(left_node, ir.Op) and left_node.name == "and" \
+                and left_node.args[1] == ir.Const(0xFFFF0000, 32) and self.names.pointer(left_node.args[0]) \
+                and fits16(right_node):
+            # a pointer moved to another place of its 64 KB page (a link the code reads, the next entry of
+            # a list): LINKED(base, link) in game/support.h
+            base = self.any(left_node.args[0])
+            return Value(f"LINKED({base.text}, {self.any(right_node).text})", PRIMARY, True, "u32")
         if name == "or" and bits == 32 and ir.Const(0x200000, 32) in (left_node, right_node):
             link = right_node if left_node == ir.Const(0x200000, 32) else left_node
             while isinstance(link, ir.Op) and link.name in ("zext", "fits"):

@@ -87,6 +87,9 @@ def run_native(script, out, game, video, sound=False):
     extra = ["--video-hashes", str(out / "game_video_hashes.txt")] if video else []
     if sound:
         extra += ["--sound-hashes", str(out / "game_sound_hashes.txt")]
+    # a run that writes nothing must not leave an earlier run's hashes to be compared
+    for stale in (hashes, "game_video_hashes.txt", "game_sound_hashes.txt"):
+        (out / stale).unlink(missing_ok=True)
     try:
         result = subprocess.run([str(executable(name)), "--script", str(script),
                                  "--hashes", str(out / hashes)] + extra, capture_output=True, text=True, timeout=900)
@@ -99,6 +102,8 @@ def run_native(script, out, game, video, sound=False):
 
 def compare(reference_file, native_file):
     """(frames compared, first frame whose hash differs or None)"""
+    if not native_file.exists():
+        return 0, 0
     reference = reference_file.read_text(encoding="ascii").split("\n")
     native = native_file.read_text(encoding="ascii").split("\n")
     reference = [line for line in reference if line]

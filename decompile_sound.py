@@ -398,6 +398,12 @@ def write_c(program, out_dir, variables_path=None):
         + "\n".join(emitter.layouts.declarations()) + "\n\n"
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
     write_sources(out_dir, files, texts, "sound.h", header=file_header)
+    loaded = named.loaded_tables()
+    if loaded:
+        (out_dir / "tables.c").write_text(
+            file_header("tables.c", "the tables the sound program reads by name, which the board sets")
+            + "#include \"sound.h\"\n\n" + "\n".join(memory.table_registry(loaded, 4, "sound")) + "\n",
+            encoding="ascii")
     left = sum(len(block.statements) for function in built.values() for block in function.blocks.values())
     gotos = sum(text.count("goto ") for text in texts.values())
     print(f"functions:  {len(entries)} in {out_dir}")
