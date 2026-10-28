@@ -98,6 +98,7 @@ class Mark:
 
 EXIT = "exit"
 LOOP_EXIT = "loop exit"
+CASE_EXIT = "case exit"
 
 
 def successors(block):
@@ -234,7 +235,8 @@ class Graph:
             if isinstance(block.end, ir.Return) and getattr(self.function, "single_exit", False):
                 return False    # (the one way back: the ways into it meet there, join_exits)
             if isinstance(block.end, (ir.Return, ir.TailCall, ir.InterruptReturn)):
-                return len(block.statements) <= SMALL_EXIT
+                # (with CASE_STOPS, one only one block jumps to, however long: written there, it is not copied)
+                return len(block.statements) <= SMALL_EXIT or CASE_STOPS and len(self.predecessors[label]) == 1
             # a short way out: code that only ends the function, small enough to be written where it is
             # jumped to ("if (hit) { ...; return; }")
             reach = self.reachable_from(label)
@@ -932,8 +934,16 @@ class Structurer:
                     return chain + [Break()], None
                 # (a copy of the way out, from inside the loop: its jumps to where the loop goes on are break)
                 return self.goto(target, None, loop if not loop.in_switch else None), None
+        if CASE_STOPS and loop is None and getattr(self, "current_case", None) is not None \
+                and target == self.case_follow and target != stop:
+            return [Break()], None    # (where the switch goes on, from inside one of its ifs)
         if target == stop:
             return [], None
+        if CASE_STOPS and target in getattr(self, "case_starts", ()) and target != getattr(self, "current_case", None) \
+                and target not in self.emitted:
+            # another case of the switch being written: a goto to where it starts
+            self.labels.add(target)
+            return [Goto(target)], None
         if loop is not None and COPY_LATCHES:
             latch = self.copied_latch(target, loop)
             if latch is not None:
@@ -1059,6 +1069,13 @@ class Structurer:
 
     def follow_of(self, label, stop, loop):
         """Where the two or more ways out of 'label' meet again inside the current region, or None."""
+        if CASE_STOPS and loop is None and getattr(self, "current_case", None) is not None:
+            # inside a case: its ways out (break, the start of another case, a small exit) do not meet the
+            # others
+            follow = self.case_ipdom().get(label)
+            if follow in (CASE_EXIT, None, label) or follow in self.emitted and follow != stop:
+                return None
+            return follow
         follow = self.graph.ipdom.get(label)
         if follow in (EXIT, None, label) or (loop is not None and (follow not in loop.region
                                                                    or follow == loop.header)):
@@ -1071,6 +1088,48 @@ class Structurer:
         if follow != stop and follow in self.emitted:
             return None
         return follow
+
+    def case_break(self, label):
+        """The nodes of a short way out of the case being written (a few statements on to where the switch
+        goes on, then break), or None."""
+        if label == self.case_follow:
+            return [Break()]
+        block = self.blocks[label]
+        if isinstance(block.end, ir.Goto) and block.end.target == self.case_follow \
+                and len(block.statements) <= SMALL_EXIT and label not in self.emitted:
+            self.emitted.add(label)
+            return [Label(label), Code(label, list(block.statements)), Break()]
+        return None
+
+    def case_ipdom(self):
+        """Immediate post-dominators inside the case being written (CASE_STOPS): its ways out (to where the
+        switch goes on, to where another case starts, a small exit) all end at CASE_EXIT."""
+        key = (self.current_case, self.case_follow, self.case_starts)
+        cache = self.__dict__.setdefault("case_ipdoms", {})
+        if key in cache:
+            return cache[key]
+        start = self.current_case
+
+        def out(target):
+            return target == self.case_follow or (target in self.case_starts and target != start) \
+                or self.small_exit(target)
+        region, stack = {start}, [start]
+        while stack:
+            for target in successors(self.blocks[stack.pop()]):
+                if not out(target) and target not in region:
+                    region.add(target)
+                    stack.append(target)
+        def written_in_place(target):
+            # (a break to where the switch goes on, a small exit: what the other ways meet at goes on)
+            return target == self.case_follow or self.small_exit(target)
+        after = {label: [CASE_EXIT if out(target) else target for target in successors(self.blocks[label])
+                         if not written_in_place(target)] or [CASE_EXIT] for label in region}
+        reaching = Graph.reach_back(after, CASE_EXIT)
+        for label in region:
+            if label not in reaching:
+                after[label].append(CASE_EXIT)    # (a loop inside the case nothing leaves)
+        cache[key] = post_dominator_tree(after, CASE_EXIT)
+        return cache[key]
 
     def loop_ipdom(self, loop):
         """Immediate post-dominators inside 'loop': its ways out (continue, break, a jump out of its region, a
@@ -1132,6 +1191,16 @@ class Structurer:
                 nodes, next_label = self.jump(other, stop, loop)
                 out += nodes
                 return next_label
+        if CASE_STOPS and loop is None and getattr(self, "current_case", None) is not None:
+            # inside a case, a short way to where the switch goes on: "if (x) { ...; break; }" first
+            for exit_label, other, condition in ((then_label, else_label, end.condition),
+                                                (else_label, then_label, negate(end.condition))):
+                nodes = self.case_break(exit_label)
+                if nodes is not None and self.case_break(other) is None and other != stop:
+                    out.append(If(condition, nodes))
+                    nodes, next_label = self.jump(other, stop, loop)
+                    out += nodes
+                    return next_label
         follow = self.follow_of(label, stop, loop)
         region_stop = follow if follow is not None else stop
         then_nodes = self.side(then_label, region_stop, loop)
@@ -1163,11 +1232,16 @@ class Structurer:
             by_target.setdefault(target, []).append(case)
         cases = []
         inner = loop.inside_switch() if loop is not None else None
+        saved = getattr(self, "case_starts", frozenset()), getattr(self, "current_case", None), \
+            getattr(self, "case_follow", None)
+        self.case_starts, self.case_follow = frozenset(by_target), region_stop
         for target, values in sorted(by_target.items(), key=lambda item: min(item[1])):
+            self.current_case = target
             body = self.side(target, region_stop, inner)
             if not ends_flow(body):
                 body.append(Break())
             cases.append((sorted(values), body))
+        self.case_starts, self.current_case, self.case_follow = saved
         out.append(Switch(end.address, cases))
         if follow is None:
             return None
@@ -1348,26 +1422,32 @@ def uses_continue(nodes):
 LARGER_COPIES = (40, 32, 8)    # (TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS) tried where the usual ones leave jumps a block cannot
                             # write (structured): copies that big where they take control variables away
 MEET_FOLLOW = False         # (experiment) a loop whose other ways out meet past its natural end goes on there
+CASE_STOPS = False          # a case of a switch stops where another case starts (a goto there, which falls through
+                            # into it when it goes just before it: fall_into_cases), rather than writing that case's
+                            # code as its own (structured tries it)
 LARGER_GROWTH = 30          # statements a function may grow by for that
 
 
-def structure(function, control_name=None, copies=None, meet_follow=False):
+def structure(function, control_name=None, copies=None, meet_follow=False, case_stops=False):
     """The tree for 'function', and the labels gotos still need: none when 'control_name' (label -> the name
     of a control variable for it) is given, as gotos.py then takes the gotos out. 'copies' are other
     (TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS); 'meet_follow' lets a loop go on where its other ways out meet past its
-    natural end (natural_follow)."""
-    global TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS, MEET_FOLLOW
-    usual = TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS, MEET_FOLLOW
+    natural end (natural_follow); 'case_stops' (CASE_STOPS) has a case stop where another starts."""
+    global TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS, MEET_FOLLOW, CASE_STOPS
+    usual = TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS, MEET_FOLLOW, CASE_STOPS
     if copies is not None:
         TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS = copies
     MEET_FOLLOW = meet_follow
+    CASE_STOPS = case_stops
     try:
         structurer = Structurer(function)
         tree = tidy(structurer.build(), structurer.labels)
     finally:
-        TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS, MEET_FOLLOW = usual
+        TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS, MEET_FOLLOW, CASE_STOPS = usual
     fallthrough_cases(tree)
     fall_into_cases(tree)
+    if case_stops:
+        copy_case_gotos(tree, (copies or (TAIL_COPY, REGION_COPY))[1])
     drop_fallthrough_gotos(tree)
     group_cases(tree)
     if control_name is not None and goto_targets(tree):
@@ -1385,7 +1465,8 @@ def structured(function, control_name):
     tree, labels = structure(function)
     best, chosen = (len(labels), size(tree)), (None, False)
     if labels:
-        for way in ((LARGER_COPIES, False), (None, True), (LARGER_COPIES, True)):
+        for way in ((LARGER_COPIES, False), (None, True), (LARGER_COPIES, True), (None, False, True),
+                    (LARGER_COPIES, False, True)):
             other, other_labels = structure(function, None, *way)
             found = (len(other_labels), size(other))
             if found[0] < best[0] and found[1] <= size(tree) + LARGER_GROWTH \
@@ -1498,8 +1579,12 @@ def fall_into_cases(nodes):
                     label = b_body[-1].label
                     a_index = next((index for index, (_, body) in enumerate(node.cases)
                                     if index != b_index and starts_at(body, label)), None)
-                    if a_index is None or a_index == b_index + 1:
+                    if a_index is None:
                         continue
+                    if a_index == b_index + 1:
+                        node.cases[b_index] = (b_values, b_body[:-1])    # (it is next: it falls into it)
+                        changed = True
+                        break
                     # (nothing may fall into the case that moves, nor into the one it goes before)
                     if b_index > 0 and not ends_flow(node.cases[b_index - 1][1]):
                         continue
@@ -1523,6 +1608,56 @@ def starts_at(nodes, label):
     if isinstance(first, Loop) and first.kind != "while":
         return starts_at(first.body, label)
     return False
+
+
+def copy_case_gotos(nodes, limit):
+    """A goto to the start of another case of the same switch, where that case is small (no more than
+    'limit' statements), ends (break, return) and has no gotos or labels of its own past its start: that
+    case's code written again where the goto is (song_title_show's state 2 going on into state 4)."""
+    for node in nodes:
+        if isinstance(node, If):
+            copy_case_gotos(node.then, limit)
+            copy_case_gotos(node.otherwise, limit)
+        elif isinstance(node, Loop):
+            copy_case_gotos(node.body, limit)
+        elif isinstance(node, Switch):
+            starts = {}
+            for _, body in node.cases:
+                if body and isinstance(body[0], Label):
+                    rest = body[1:]
+                    if ends_flow(rest) and size(rest) <= limit and not goto_targets(rest) \
+                            and not any(isinstance(inner, Label) for inner in walk_nodes(rest)):
+                        starts[body[0].label] = rest
+            for _, body in node.cases:
+                replace_gotos(body, starts)
+                copy_case_gotos(body, limit)
+
+
+def walk_nodes(nodes):
+    """Every node of 'nodes', the ones inside ifs, loops and switches too."""
+    for node in nodes:
+        yield node
+        if isinstance(node, If):
+            yield from walk_nodes(node.then)
+            yield from walk_nodes(node.otherwise)
+        elif isinstance(node, Loop):
+            yield from walk_nodes(node.body)
+        elif isinstance(node, Switch):
+            for _, body in node.cases:
+                yield from walk_nodes(body)
+
+
+def replace_gotos(nodes, starts):
+    """The gotos in 'nodes' (not inside loops or switches of their own, where break means another thing)
+    to a label of 'starts' replaced by a copy of its nodes."""
+    for index, node in enumerate(nodes):
+        if isinstance(node, Goto) and node.label in starts:
+            # (the same statements, as the other copies of code: what the decompiler noted about them holds)
+            nodes[index:index + 1] = without_labels(starts[node.label])
+            return replace_gotos(nodes, starts)
+        if isinstance(node, If):
+            replace_gotos(node.then, starts)
+            replace_gotos(node.otherwise, starts)
 
 
 def drop_labels(nodes, labels):

@@ -81,6 +81,8 @@ class KnownBits:
             return state.get(node.index, 0) & mask
         if isinstance(node, ir.Temp):
             return temps.get(node.name, 0) & mask
+        if isinstance(node, ir.Stack):
+            return state.get(("s", node.offset), 0) & mask    # (what was pushed there)
         if not isinstance(node, ir.Op):
             return 0
         name, args = node.name, node.args
@@ -182,6 +184,8 @@ class KnownBits:
             temps[statement.temp.name] = self.zero(statement.value, state, temps)
         elif isinstance(statement, ir.SetReg):
             state[statement.index] = self.zero(statement.value, state, temps)
+        elif isinstance(statement, ir.SetStack):
+            state[("s", statement.offset)] = self.zero(statement.value, state, temps)
         elif isinstance(statement, ir.Call):
             for index in self.call_results.get(id(statement), ()):
                 state[index] = self.handed_back(statement, index)
