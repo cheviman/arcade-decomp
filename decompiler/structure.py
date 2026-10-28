@@ -353,15 +353,16 @@ class Graph:
         return found
 
 
-def split_loop_entries(function, notes):
+def split_loop_entries(function, notes, limit=None, rounds_limit=8):
     """A loop the code enters at two places (an unrolled loop whose odd count starts at its second half)
     has no header C can write. When one of the ways in is a small block whose only way on is the other
     one, the code that comes from outside gets a copy of that block: the loop then starts at the other
-    block, and the copy runs before it. 'notes' as for split_small_exits."""
+    block, and the copy runs before it. 'notes' as for split_small_exits; 'limit' (statements) for the
+    piece split_entry_region copies, REGION_COPY when None."""
     blocks = function.blocks
     changed = True
     rounds = 0
-    while changed and rounds < 8:
+    while changed and rounds < rounds_limit:
         changed = False
         rounds += 1
         graph = Graph(function)
@@ -396,12 +397,12 @@ def split_loop_entries(function, notes):
                 changed = True
                 break
             if not changed:
-                changed = split_entry_region(function, component, entries, graph, notes)
+                changed = split_entry_region(function, component, entries, graph, notes, limit)
             if changed:
                 break
 
 
-def split_entry_region(function, component, entries, graph, notes):
+def split_entry_region(function, component, entries, graph, notes, limit=None):
     """The other case of split_loop_entries: one way in leads, through a small piece of the loop (with loops
     of its own, and ways out of it, the line drawing's odd half), to the other one; the code that comes from
     outside gets a copy of that piece, and the loop starts at the other way in. True if it split one."""
@@ -416,7 +417,7 @@ def split_entry_region(function, component, entries, graph, notes):
                 if successor != other and successor in component and successor not in piece:
                     piece.add(successor)
                     stack.append(successor)
-        if sum(len(blocks[label].statements) + 1 for label in piece) > REGION_COPY \
+        if sum(len(blocks[label].statements) + 1 for label in piece) > (limit or REGION_COPY) \
                 or not any(other in successors(blocks[label]) for label in piece):
             continue
         made = {}
@@ -555,6 +556,211 @@ def split_small_exits(function, notes):
                 end.cases = {case: twin.label if target == label else target for case, target in end.cases.items()}
 
 
+def split_shared_blocks(function, notes, heads_only=False):
+    """A small block (no more than SMALL_EXIT statements) that only jumps on, and that several blocks jump
+    to, gets a copy for each of them: where it heads a loop around another one (init_screen's course
+    length, added before the inner loop reads the next section), the inner loop is then the only one, left
+    by break. With 'heads_only', only such a head of a loop whose body starts with another loop, the inner
+    ones first (the loop around a loop it then heads is not one any more). Tried where the structure leaves
+    control variables (decompile.py). 'notes' as for split_small_exits."""
+    for _ in range(8 if heads_only else 1):
+        loops = Graph(function).loops if heads_only else {}
+        predecessors = {}
+        for label, block in function.blocks.items():
+            for successor in successors(block):
+                predecessors.setdefault(successor, []).append(label)
+
+        def shared(label):
+            block = function.blocks[label]
+            return isinstance(block.end, ir.Goto) and len(block.statements) <= SMALL_EXIT \
+                and len(set(predecessors.get(label, []))) >= 2 and label != function.entry \
+                and block.end.target != label \
+                and (not heads_only or label in loops and block.end.target in loops)
+        found = [label for label in function.blocks if shared(label)]
+        if heads_only:
+            found = [label for label in found if function.blocks[label].end.target not in found]
+        if not found:
+            return
+        for label in found:
+            block = function.blocks[label]
+            for number, source in enumerate(list(dict.fromkeys(predecessors[label]))[1:], 2):
+                made = {}
+                twin = copy.copy(block)
+                twin.label = ("shared", label, number)
+                twin.statements = [copy.deepcopy(statement, made) for statement in block.statements]
+                twin.end = copy.deepcopy(block.end, made)
+                for note in notes:
+                    for key in [key for key in note if isinstance(key, int) and key in made]:
+                        note[id(made[key])] = copied_note(note[key], made)
+                    if ("end", id(block)) in note:
+                        note[("end", id(twin))] = note[("end", id(block))]
+                function.blocks[twin.label] = twin
+                retarget(function.blocks[source].end, label, twin.label)
+
+
+def redispatch_states(function, notes, read, apply=True):
+    """A jump into the code of a case of a switch over a state kept in memory, right after the number of
+    that case was stored there, does what the switch does when it runs again: the jump goes to the switch
+    instead, and the C writes continue in a loop around it (car_radio_update's state = 5, then on into
+    state 5's code; the loops a state machine makes through its states then have one way in). Only where
+    the switch's block reads nothing but memory (the state, tables in the ROM) and writes nothing live
+    where the jump went, and not where a case goes on into the one after it (C's fall through). 'read'
+    (address, bits) is the ROM's value there, None outside it; 'notes' as for split_small_exits,
+    cleanup.py's liveness first. Returns how many jumps go to the switch (with 'apply' false, would go).
+    decompile.py keeps it where the C is shorter (a case written once, not copied where the jump is)."""
+    live = notes[0]
+    found = 0
+    predecessors = {}
+    for label, block in function.blocks.items():
+        for successor in successors(block):
+            predecessors.setdefault(successor, []).append(label)
+    idom = Graph(function).idom
+    for label, block in list(function.blocks.items()):
+        end = block.end
+        if not isinstance(end, ir.Switch) or not end.cases or isinstance(end.address, ir.EntryPoint) \
+                or any(not isinstance(statement, (ir.SetTemp, ir.SetReg, ir.SetFlag)) for statement in block.statements):
+            continue
+        values = {}
+        for statement in block.statements:
+            values[statement_key(statement)] = inline(statement.value, values)
+        address = inline(end.address, values)
+
+        def in_rom(load):
+            place = evaluate(load.address, lambda _: None)
+            return place is not None and read(place, load.bits) is not None
+        states = {(load.address, load.bits) for load in loads_in(address) if not loads_in(load.address) and not in_rom(load)}
+        if len(states) != 1:
+            continue
+        (state, bits), = states
+        written = {key for key in values if not isinstance(key, ir.Temp)}
+        by_target = {}
+        for case, target in end.cases.items():
+            by_target.setdefault(target, []).append(case)
+        order = [target for target, _ in sorted(by_target.items(), key=lambda item: min(item[1]))]
+        next_case = dict(zip(order, order[1:]))
+
+        def case_of(source):
+            # (the case whose start the code passes through to get there)
+            while source not in by_target and source != label and idom.get(source, source) != source:
+                source = idom[source]
+            return source
+        for target in by_target:
+            for source in predecessors.get(target, []):
+                source_block = function.blocks[source]
+                if source == label or isinstance(source_block.end, ir.Switch) or next_case.get(case_of(source)) == target:
+                    continue
+                stored = stored_value(source_block, state, bits)
+                if stored is None:
+                    continue
+
+                def load(node, stored=stored):
+                    if node.address == state and node.bits == bits:
+                        return stored
+                    place = evaluate(node.address, load)
+                    return None if place is None else read(place, node.bits)
+                if end.cases.get(evaluate(address, load)) != target \
+                        or any(variable[:2] in written for variable in live.get(("end", id(source_block)), ())):
+                    continue
+                found += 1
+                if apply:
+                    retarget(source_block.end, target, label)
+    return found
+
+
+def statement_key(statement):
+    """What a statement of a block sets, as inline() looks it up."""
+    if isinstance(statement, ir.SetTemp):
+        return statement.temp
+    return ("r", statement.index) if isinstance(statement, ir.SetReg) else ("f", statement.name)
+
+
+def inline(expression, values):
+    """'expression' with the temporaries, registers and flags 'values' knows written as their values."""
+    if isinstance(expression, ir.Temp):
+        return values.get(expression, expression)
+    if isinstance(expression, ir.Reg):
+        value = values.get(("r", expression.index))
+        if value is None:
+            return expression
+        return value if expression.bits == 32 else ir.Op("trunc", (value,), expression.bits)
+    if isinstance(expression, ir.Flag):
+        return values.get(("f", expression.name), expression)
+    if isinstance(expression, ir.Load):
+        return ir.Load(inline(expression.address, values), expression.bits)
+    if isinstance(expression, ir.Op):
+        return ir.Op(expression.name, tuple(inline(arg, values) for arg in expression.args), expression.bits)
+    return expression
+
+
+def loads_in(expression):
+    """The memory reads in an expression."""
+    if isinstance(expression, ir.Load):
+        return [expression] + loads_in(expression.address)
+    if isinstance(expression, ir.Op):
+        return [load for arg in expression.args for load in loads_in(arg)]
+    return []
+
+
+def evaluate(expression, load):
+    """The value of an expression of constants, with load(node) the value of a memory read; None when
+    something in it is not known."""
+    if isinstance(expression, ir.Const):
+        return expression.value
+    if isinstance(expression, ir.Load):
+        return load(expression)
+    if not isinstance(expression, ir.Op):
+        return None
+    args = [evaluate(arg, load) for arg in expression.args]
+    if any(arg is None for arg in args):
+        return None
+    name, mask = expression.name, (1 << expression.bits) - 1
+    if name in ("zext", "trunc"):
+        return args[0] & mask
+    if name == "sext":
+        value = args[0] & ((1 << args[1]) - 1)
+        return (value - (1 << args[1]) if value >> (args[1] - 1) else value) & mask
+    operations = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b,
+                  "and": lambda a, b: a & b, "or": lambda a, b: a | b, "xor": lambda a, b: a ^ b,
+                  "shl": lambda a, b: a << (b & 31), "shr": lambda a, b: a >> (b & 31)}
+    if name not in operations or len(args) != 2:
+        return None
+    return operations[name](*args) & mask
+
+
+def stored_value(block, state, bits):
+    """The constant 'block' stores last at the address 'state' ('bits' wide), when after that store it
+    writes no memory and calls nothing, and the registers the address is made of keep their values; else
+    None."""
+    values, touched, found = {}, set(), None
+    for statement in block.statements:
+        if isinstance(statement, ir.Store):
+            if inline(statement.address, values) == state and statement.bits == bits:
+                value = inline(statement.value, values)
+                found = value.value if isinstance(value, ir.Const) else None
+            elif found is not None:
+                return None    # (memory written after it: it may be the state)
+        elif isinstance(statement, (ir.SetTemp, ir.SetReg, ir.SetFlag)):
+            if isinstance(statement, ir.SetReg):
+                touched.add(statement.index)
+            values[statement_key(statement)] = inline(statement.value, values)
+        elif found is not None:
+            return None
+        else:
+            values, touched = {}, set()    # (a call: the registers hold what it left)
+    return None if found is None or registers_in(state) & touched else found
+
+
+def registers_in(expression):
+    """The registers an expression reads."""
+    if isinstance(expression, ir.Reg):
+        return {expression.index}
+    if isinstance(expression, ir.Load):
+        return registers_in(expression.address)
+    if isinstance(expression, ir.Op):
+        return set().union(*(registers_in(arg) for arg in expression.args))
+    return set()
+
+
 def join_exits(function, notes, tail_calls=False):
     """Every way back to the caller of a function that hands results back through pointers goes on to one
     block that ends it, written at the end: the C writes the results back once, there, rather than before
@@ -682,9 +888,11 @@ class LoopContext:
     region: set          # the body, and code only the loop leads to that never comes back: written inside
     follow: object       # where the loop goes on
     in_switch: bool = False
+    switch_leaves: bool = False    # in a switch whose cases go round again or leave the loop: break leaves the
+                                   # switch, and the break after it the loop
 
-    def inside_switch(self):
-        return LoopContext(self.header, self.body, self.region, self.follow, True)
+    def inside_switch(self, leaves=False):
+        return LoopContext(self.header, self.body, self.region, self.follow, True, leaves)
 
 
 class Structurer:
@@ -852,6 +1060,9 @@ class Structurer:
         copy.function, copy.blocks, copy.graph = self.function, self.blocks, self.graph
         copy.emitted, copy.labels, copy.pending = set(), set(), []
         copy.meeting_ends, copy.loop_ipdoms, copy.met_past = self.meeting_ends, self.loop_ipdoms, self.met_past
+        for name in ("case_starts", "current_case", "case_follow", "case_loop", "case_order"):
+            if hasattr(self, name):
+                setattr(copy, name, getattr(self, name))
         nodes = copy.region(target, None, None)
         if copy.labels:
             return None
@@ -890,6 +1101,9 @@ class Structurer:
         copy.function, copy.blocks, copy.graph = self.function, self.blocks, self.graph
         copy.emitted, copy.labels, copy.pending = set(), set(), []
         copy.meeting_ends, copy.loop_ipdoms, copy.met_past = self.meeting_ends, self.loop_ipdoms, self.met_past
+        for name in ("case_starts", "current_case", "case_follow", "case_loop", "case_order"):
+            if hasattr(self, name):
+                setattr(copy, name, getattr(self, name))
         copy.copying = copying | {target}
         if leaving:
             # (written as if it were in the loop: its jumps to where the loop goes on are break)
@@ -920,8 +1134,8 @@ class Structurer:
                 return [Continue()], None
             if target not in loop.region:
                 if target == loop.follow:
-                    # inside a switch, break would only leave the switch
-                    return (self.goto(target) if loop.in_switch else [Break()]), None
+                    # inside a switch, break would only leave the switch (unless a break after it leaves the loop)
+                    return (self.goto(target) if loop.in_switch and not loop.switch_leaves else [Break()]), None
                 if self.small_exit(target):
                     return self.copy_exit(target), None
                 block = self.blocks[target]
@@ -934,7 +1148,7 @@ class Structurer:
                     return chain + [Break()], None
                 # (a copy of the way out, from inside the loop: its jumps to where the loop goes on are break)
                 return self.goto(target, None, loop if not loop.in_switch else None), None
-        if CASE_STOPS and loop is None and getattr(self, "current_case", None) is not None \
+        if CASE_STOPS and (loop is None or loop.in_switch) and getattr(self, "current_case", None) is not None \
                 and target == self.case_follow and target != stop:
             return [Break()], None    # (where the switch goes on, from inside one of its ifs)
         if target == stop:
@@ -1069,7 +1283,7 @@ class Structurer:
 
     def follow_of(self, label, stop, loop):
         """Where the two or more ways out of 'label' meet again inside the current region, or None."""
-        if CASE_STOPS and loop is None and getattr(self, "current_case", None) is not None:
+        if CASE_STOPS and (loop is None or loop.in_switch) and getattr(self, "current_case", None) is not None:
             # inside a case: its ways out (break, the start of another case, a small exit) do not meet the
             # others
             follow = self.case_ipdom().get(label)
@@ -1090,40 +1304,83 @@ class Structurer:
         return follow
 
     def case_break(self, label):
-        """The nodes of a short way out of the case being written (a few statements on to where the switch
-        goes on, then break), or None."""
+        """True for a short way out of the case being written: where the switch goes on, or a few statements
+        on to there (case_break_nodes writes it)."""
+        if label == self.case_follow:
+            return True
+        block = self.blocks[label]
+        return isinstance(block.end, ir.Goto) and block.end.target == self.case_follow \
+            and len(block.statements) <= SMALL_EXIT and label not in self.emitted
+
+    def case_break_nodes(self, label):
+        """The nodes of a short way out of the case being written: its statements, then break."""
         if label == self.case_follow:
             return [Break()]
-        block = self.blocks[label]
-        if isinstance(block.end, ir.Goto) and block.end.target == self.case_follow \
-                and len(block.statements) <= SMALL_EXIT and label not in self.emitted:
-            self.emitted.add(label)
-            return [Label(label), Code(label, list(block.statements)), Break()]
-        return None
+        self.emitted.add(label)
+        return [Label(label), Code(label, list(self.blocks[label].statements)), Break()]
 
     def case_ipdom(self):
         """Immediate post-dominators inside the case being written (CASE_STOPS): its ways out (to where the
-        switch goes on, to where another case starts, a small exit) all end at CASE_EXIT."""
+        switch goes on, to where another case starts, a small exit, continue) all end at CASE_EXIT, and are
+        written where they are reached, so they are no place for the other ways to meet; nor is a way that
+        only ends so (break, continue, return) when the other way goes on into another case: what meets is
+        the code before that case."""
         key = (self.current_case, self.case_follow, self.case_starts)
         cache = self.__dict__.setdefault("case_ipdoms", {})
         if key in cache:
             return cache[key]
         start = self.current_case
+        loop = self.case_loop
+
+        def leaves(target):
+            # (inside a loop: going round again or out of it, continue or a way out of the loop)
+            return loop is not None and (target == loop.header or target not in loop.region)
+
+        def onward(target):
+            return target in self.case_starts and target != start and target != self.case_follow
 
         def out(target):
-            return target == self.case_follow or (target in self.case_starts and target != start) \
-                or self.small_exit(target)
+            return target == self.case_follow or onward(target) or self.small_exit(target) or leaves(target)
         region, stack = {start}, [start]
         while stack:
             for target in successors(self.blocks[stack.pop()]):
                 if not out(target) and target not in region:
                     region.add(target)
                     stack.append(target)
+        # the case it goes on into: the next one in the switch's order it can go on into, else the first
+        targets = {target for label in region for target in successors(self.blocks[label]) if onward(target)}
+        order = self.case_order
+        later = [case for case in order[order.index(start) + 1:] if case in targets] if start in order else []
+        main = later[0] if later else next((case for case in self.case_order if case in targets), None)
+
+        def ends(target):
+            # (a way out written where it is: break, a small exit, continue, a jump into another case)
+            return target == self.case_follow or self.small_exit(target) or leaves(target) \
+                or onward(target) and target != main
+
         def written_in_place(target):
-            # (a break to where the switch goes on, a small exit: what the other ways meet at goes on)
-            return target == self.case_follow or self.small_exit(target)
-        after = {label: [CASE_EXIT if out(target) else target for target in successors(self.blocks[label])
-                         if not written_in_place(target)] or [CASE_EXIT] for label in region}
+            if ends(target):
+                return True
+            # (a few statements on the way to one of those)
+            block = self.blocks[target]
+            return isinstance(block.end, ir.Goto) and len(block.statements) <= SMALL_EXIT and ends(block.end.target)
+        # the blocks from which the case can go on into the case it goes on into
+        going_on = {label for label in region if main in successors(self.blocks[label])}
+        stack = list(going_on)
+        while stack:
+            label = stack.pop()
+            for other in region:
+                if other not in going_on and label in successors(self.blocks[other]):
+                    going_on.add(other)
+                    stack.append(other)
+
+        def kept(label):
+            targets = [target for target in successors(self.blocks[label]) if not written_in_place(target)]
+            if any(target in going_on for target in targets):
+                # (a way that only ends, beside one that goes on into another case)
+                targets = [target for target in targets if target in going_on]
+            return [CASE_EXIT if out(target) else target for target in targets] or [CASE_EXIT]
+        after = {label: kept(label) for label in region}
         reaching = Graph.reach_back(after, CASE_EXIT)
         for label in region:
             if label not in reaching:
@@ -1191,13 +1448,12 @@ class Structurer:
                 nodes, next_label = self.jump(other, stop, loop)
                 out += nodes
                 return next_label
-        if CASE_STOPS and loop is None and getattr(self, "current_case", None) is not None:
+        if CASE_STOPS and (loop is None or loop.in_switch) and getattr(self, "current_case", None) is not None:
             # inside a case, a short way to where the switch goes on: "if (x) { ...; break; }" first
             for exit_label, other, condition in ((then_label, else_label, end.condition),
                                                 (else_label, then_label, negate(end.condition))):
-                nodes = self.case_break(exit_label)
-                if nodes is not None and self.case_break(other) is None and other != stop:
-                    out.append(If(condition, nodes))
+                if self.case_break(exit_label) and not self.case_break(other) and other != stop:
+                    out.append(If(condition, self.case_break_nodes(exit_label)))
                     nodes, next_label = self.jump(other, stop, loop)
                     out += nodes
                     return next_label
@@ -1224,24 +1480,46 @@ class Structurer:
             return nodes
         return nodes + self.region(next_label, stop, loop)
 
+    def leaves_to(self, start, loop):
+        """True if the code from 'start' gets to where 'loop' goes on, staying in it on the way."""
+        seen, stack = {start}, [start]
+        while stack:
+            label = stack.pop()
+            if label == loop.follow:
+                return True
+            if label == loop.header or label not in loop.region:
+                continue
+            for successor in successors(self.blocks[label]):
+                if successor not in seen:
+                    seen.add(successor)
+                    stack.append(successor)
+        return False
+
     def switch(self, label, end, out, stop, loop):
         follow = self.follow_of(label, stop, loop)
-        region_stop = follow if follow is not None else stop
         by_target = {}
         for case, target in end.cases.items():
             by_target.setdefault(target, []).append(case)
+        # a switch in a loop whose cases go round again, end, or leave the loop (init_screen's course walk):
+        # the loop goes on where the switch does, and a break after the switch leaves it
+        leaves = follow is None and loop is not None and not loop.in_switch and loop.follow is not None \
+            and any(self.leaves_to(target, loop) for target in by_target)
+        if leaves:
+            follow = loop.follow
+        region_stop = follow if follow is not None else stop
         cases = []
-        inner = loop.inside_switch() if loop is not None else None
+        inner = loop.inside_switch(leaves) if loop is not None else None
         saved = getattr(self, "case_starts", frozenset()), getattr(self, "current_case", None), \
-            getattr(self, "case_follow", None)
-        self.case_starts, self.case_follow = frozenset(by_target), region_stop
+            getattr(self, "case_follow", None), getattr(self, "case_loop", None), getattr(self, "case_order", [])
+        self.case_starts, self.case_follow, self.case_loop = frozenset(by_target), region_stop, inner
+        self.case_order = [target for target, _ in sorted(by_target.items(), key=lambda item: min(item[1]))]
         for target, values in sorted(by_target.items(), key=lambda item: min(item[1])):
             self.current_case = target
             body = self.side(target, region_stop, inner)
             if not ends_flow(body):
                 body.append(Break())
             cases.append((sorted(values), body))
-        self.case_starts, self.current_case, self.case_follow = saved
+        self.case_starts, self.current_case, self.case_follow, self.case_loop, self.case_order = saved
         out.append(Switch(end.address, cases))
         if follow is None:
             return None
@@ -1447,7 +1725,7 @@ def structure(function, control_name=None, copies=None, meet_follow=False, case_
     fallthrough_cases(tree)
     fall_into_cases(tree)
     if case_stops:
-        copy_case_gotos(tree, (copies or (TAIL_COPY, REGION_COPY))[1])
+        copy_case_gotos(tree, 2 * (copies or (TAIL_COPY, REGION_COPY))[1])    # (structured keeps it only where the function grows little)
     drop_fallthrough_gotos(tree)
     group_cases(tree)
     if control_name is not None and goto_targets(tree):
@@ -1610,27 +1888,37 @@ def starts_at(nodes, label):
     return False
 
 
-def copy_case_gotos(nodes, limit):
+def copy_case_gotos(nodes, limit, targeted=None):
     """A goto to the start of another case of the same switch, where that case is small (no more than
-    'limit' statements), ends (break, return) and has no gotos or labels of its own past its start: that
-    case's code written again where the goto is (song_title_show's state 2 going on into state 4)."""
+    'limit' statements), ends (break, return) and has no gotos of its own nor labels a goto jumps to past
+    its start: that case's code written again where the goto is (song_title_show's state 2 going on into
+    state 4)."""
+    if targeted is None:
+        targeted = goto_targets(nodes)
     for node in nodes:
         if isinstance(node, If):
-            copy_case_gotos(node.then, limit)
-            copy_case_gotos(node.otherwise, limit)
+            copy_case_gotos(node.then, limit, targeted)
+            copy_case_gotos(node.otherwise, limit, targeted)
         elif isinstance(node, Loop):
-            copy_case_gotos(node.body, limit)
+            copy_case_gotos(node.body, limit, targeted)
         elif isinstance(node, Switch):
             starts = {}
-            for _, body in node.cases:
+            for index, (_, body) in enumerate(node.cases):
                 if body and isinstance(body[0], Label):
-                    rest = body[1:]
+                    rest = list(body[1:])
+                    # (a case that falls through into the next ones: those too, up to one that ends)
+                    following = index + 1
+                    while not ends_flow(rest) and following < len(node.cases):
+                        after = node.cases[following][1]
+                        rest += after[1:] if after and isinstance(after[0], Label) else after
+                        following += 1
                     if ends_flow(rest) and size(rest) <= limit and not goto_targets(rest) \
-                            and not any(isinstance(inner, Label) for inner in walk_nodes(rest)):
+                            and not any(isinstance(inner, Label) and inner.label in targeted
+                                        for inner in walk_nodes(rest)):
                         starts[body[0].label] = rest
             for _, body in node.cases:
                 replace_gotos(body, starts)
-                copy_case_gotos(body, limit)
+                copy_case_gotos(body, limit, targeted)
 
 
 def walk_nodes(nodes):

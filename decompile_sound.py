@@ -42,6 +42,7 @@ ROOT = game_profile.ROOT
 import disassemble  # noqa: E402
 from decompile import call_results  # noqa: E402
 from decompile import grouped_prototypes  # noqa: E402
+from decompile import fewer_controls  # noqa: E402
 from decompile import fewer_write_backs  # noqa: E402
 from decompile import twin  # noqa: E402
 from decompile import source_files  # noqa: E402
@@ -371,8 +372,12 @@ def write_c(program, out_dir, variables_path=None):
                 continue    # (a way of writing it the structure cannot take: the other one stays)
             if fewer_write_backs(text, texts[entry]):
                 writers[entry], texts[entry] = other, text
+    split = fewer_controls(
+        texts, writers,
+        lambda entry, way: emit.SoundWriter(emitter, way, live_after[entry], fields[entry], live_at_start[entry]),
+        lambda entry: (live_after[entry], fields[entry]))
     emitter.shared_results = emit.emit.shared_results(texts.values())
-    for entry in joined:
+    for entry in set(joined) | split:
         if entry in texts and emitter.shared_results.get(emitter.names.get(entry)):
             texts[entry] = writers[entry].write()
     if problems:

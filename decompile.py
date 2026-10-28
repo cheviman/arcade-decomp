@@ -714,6 +714,61 @@ def fewer_write_backs(text, other):
     return mine[0] < theirs[0] and mine[1] <= theirs[1]
 
 
+SPLIT_COPY = 64      # statements, at most, of the piece of a loop entered at two places that fewer_controls copies
+SPLIT_GROWTH = 40    # lines a function's C may grow by for that
+
+
+def rom_value(program, address, bits):
+    """The program ROM's value at 'address', 'bits' wide; None outside it."""
+    if game_profile.rom.canonical_address(address) is None:
+        return None
+    return {8: program.mem.r8, 16: program.mem.r16, 32: program.mem.r32}[bits](address)
+
+
+def fewer_controls(texts, writers, write_way, notes_of, read=None):
+    """A function the structure leaves control variables in, written again with more code copied: a loop
+    entered at two places from a larger piece of it (split_loop_entries with SPLIT_COPY), small blocks
+    several jump to, one each (split_shared_blocks: the heads of loops whose body starts with another loop,
+    or all of them), and, given 'read' (rom_value), jumps into a state's case right after storing its number
+    made the switch run again (redispatch_states). The way with the fewest control variables, then the
+    fewest lines, is kept, when it has fewer than the usual one and is no more than SPLIT_GROWTH lines
+    longer. 'write_way' (entry, function) is the writer of a way, 'notes_of' (entry) the function's notes.
+    Returns the entries kept another way."""
+    changed = set()
+    ways = [(limit, shared, again) for again in (False, True) for shared in (None, "heads", "all")
+            for limit in (None, SPLIT_COPY) if again or shared or limit]
+    for entry in list(texts):
+        _, controls, lines = write_backs(texts[entry])
+        if not controls:
+            continue
+        notes = notes_of(entry)
+        base, usual = writers[entry].function, texts[entry]
+        registers = set(re.findall(r"\br\d+\b", usual))
+        best = (controls, lines)
+        for limit, shared, again in ways:
+            if again and read is None:
+                continue
+            way = twin(base, notes)
+            if shared:
+                structure.split_shared_blocks(way, notes, heads_only=shared == "heads")
+            if again:
+                structure.redispatch_states(way, notes, read)
+            structure.split_loop_entries(way, notes, limit, 16)
+            other = write_way(entry, way)
+            try:
+                text = other.write()
+            except (emit.EmitError, GotoError):
+                continue    # (a way of writing it the structure cannot take)
+            _, other_controls, other_lines = write_backs(text)
+            if set(re.findall(r"\br\d+\b", text)) - registers:
+                continue    # (a register the copy's notes do not find a variable for: not the same C)
+            if other_controls < controls and other_lines <= lines + SPLIT_GROWTH and (other_controls, other_lines) < best:
+                best = (other_controls, other_lines)
+                writers[entry], texts[entry] = other, text
+                changed.add(entry)
+    return changed
+
+
 def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False, fields_path=None):
     built, failures = build_functions(program)
     if failures:
@@ -895,9 +950,21 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     # where they are jumped to (each copy can leave out the results that come back unchanged), and with all its
     # ways back going on to one end (join_exits), where it writes them once; the C keeps the second when it
     # writes them back again before fewer returns, with no more control variables
+    # a state machine whose cases jump into another case right after storing its number is written both
+    # ways too: with the jumps (the case's code copied where it is small) and with the switch running again
+    # (redispatch_states); the C keeps the second when it is shorter, with no more control variables
     joined = {}
+    redispatched = {}
+    read = lambda address, bits: rom_value(program, address, bits)    # noqa: E731
     for entry, function in built.items():
         notes = (live_after[entry], fields[entry])
+        if structure.redispatch_states(function, notes, read, apply=False):
+            way = twin(function, notes)
+            structure.redispatch_states(way, notes, read)
+            if emitter.by_pointer(entry):
+                structure.split_small_exits(way, notes)
+            structure.split_loop_entries(way, notes)
+            redispatched[entry] = way
         if emitter.by_pointer(entry):
             joined[entry] = []
             for tail_calls in (False, True):
@@ -929,8 +996,26 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                 continue    # (a way of writing it the structure cannot take: the other one stays)
             if fewer_write_backs(text, texts[entry]):
                 writers[entry], texts[entry] = other, text
+    for entry, way in redispatched.items():
+        if entry not in texts:
+            continue
+        other = emit.FunctionWriter(emitter, way, live_after[entry], fields[entry], live_at_start[entry])
+        try:
+            text = other.write()
+        except (emit.EmitError, GotoError):
+            continue
+        _, controls, lines = write_backs(text)
+        _, usual_controls, usual_lines = write_backs(texts[entry])
+        if set(re.findall(r"r\d+", text)) - set(re.findall(r"r\d+", texts[entry])):
+            continue    # (a register the copy's notes do not find a variable for: not the same C)
+        if controls < usual_controls or controls == usual_controls and lines < usual_lines:
+            writers[entry], texts[entry] = other, text
+    split = fewer_controls(
+        texts, writers,
+        lambda entry, way: emit.FunctionWriter(emitter, way, live_after[entry], fields[entry], live_at_start[entry]),
+        lambda entry: (live_after[entry], fields[entry]), read)
     emitter.shared_results = emit.shared_results(texts.values())
-    for entry in joined:
+    for entry in set(joined) | set(redispatched) | split:
         if entry in texts and emitter.shared_results.get(emitter.names.get(entry)):
             texts[entry] = writers[entry].write()
     if variables_path is not None:
@@ -1023,7 +1108,13 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     reports = REPORTS if out_dir.resolve() == (ROOT / "src").resolve() else out_dir
     reports.mkdir(parents=True, exist_ok=True)
     write_index(reports, program, built, flow, names, texts, entries)
-    raw = [f"{address:06X}  {' '.join(sorted(users))}" for address, users in sorted(emitter.raw_addresses.items())]
+    # (only those the C kept says: a way of writing a function that was tried and dropped may have said others)
+    kept = {names.get(entry, ""): text for entry, text in texts.items()}
+    raw = []
+    for address, users in sorted(emitter.raw_addresses.items()):
+        found = sorted(user for user in users if re.search(rf"\b0x0*{address:X}u", kept.get(user, "")))
+        if found:
+            raw.append(f"{address:06X}  {' '.join(found)}")
     (reports / "unnamed_addresses.txt").write_text(
         "# ROM addresses the C uses as values that symbols.txt does not name (table or data lines), and the\n"
         "# functions that use them\n" + "\n".join(raw) + "\n", encoding="ascii")
