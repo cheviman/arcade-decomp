@@ -929,18 +929,23 @@ class FunctionWriter:
         while changed:
             changed = False
             for block in self.function.blocks.values():
-                for statement in block.statements:
+                for statement in block.statements + ([block.end] if block.end is not None else []):
                     self.current = statement
                     if isinstance(statement, ir.SetReg) and statement.index in floating:
-                        name = self.register_set(statement.index)
+                        names = [self.register_set(statement.index)]
                     elif isinstance(statement, ir.SetTemp) and (floats.is_float(statement.value)
                                                                 or self.float_kind(statement.value)):
-                        name = "temp " + statement.temp.name
+                        names = ["temp " + statement.temp.name]
+                    elif isinstance(statement, (ir.Call, ir.TailCall)) and statement.target is not None:
+                        # what a call hands back in one of the registers (a double it returns)
+                        target = self.emitter.resolve(statement.target & 0xFFFFFF, getattr(statement, "entry", None))[0]
+                        names = [self.register_set(value[1]) for value in self.emitter.float_results(target)]
                     else:
                         continue
-                    if kinds.get(name) != "f64":
-                        kinds[name] = "f64"     # the floating-point unit's registers are doubles (floats.py)
-                        changed = True
+                    for name in names:
+                        if kinds.get(name) != "f64":
+                            kinds[name] = "f64"     # the floating-point unit's registers are doubles (floats.py)
+                            changed = True
         self.current = saved
         return kinds
 
@@ -2704,8 +2709,9 @@ class FunctionWriter:
             if name in self.forwarded:
                 continue    # (the caller's pointer goes straight on: forward_results)
             width = self.widths.get(name, 32)
-            cast = "" if width == 32 else f"({cprint.UNSIGNED[width]})"
-            lines.append(f"{cprint.UNSIGNED[width]} {name} = {cast}*p_{self.emitter.param_name(self.entry, value)};")
+            ctype = self.emitter.value_type(value, width)
+            cast = "" if width == 32 or ctype == "double" else f"({ctype})"
+            lines.append(f"{ctype} {name} = {cast}*p_{self.emitter.param_name(self.entry, value)};")
             declared.add(name)
         if self.controls:
             lines.append("bool " + ", ".join(f"{name} = false" for name in sorted(self.controls.values())) + ";")
@@ -2985,6 +2991,21 @@ class Emitter:
         results = self.signatures[entry].results
         return next(iter(results)) if len(results) == 1 else None
 
+    def float_results(self, entry):
+        """The values a function hands back in a floating-point register (floats.py): doubles in C."""
+        floating = getattr(cpu.current, "float_registers", ())
+        if not floating or entry not in self.signatures:
+            return []
+        returned = self.returned(entry)
+        values = self.by_pointer(entry) + ([returned] if returned is not None else [])
+        return [value for value in values if value[0] == "r" and value[1] in floating]
+
+    def value_type(self, value, bits):
+        """The C type of a parameter or result 'bits' wide: a double for a floating-point register's."""
+        if value[0] == "r" and value[1] in getattr(cpu.current, "float_registers", ()):
+            return "double"
+        return cprint.UNSIGNED[bits]
+
     def param_name(self, entry, value):
         """C name of a parameter or result of a function: the one symbols.txt gives the register, when no
         global takes it, else the register's."""
@@ -3080,13 +3101,13 @@ class Emitter:
         widths = self.param_widths.get(entry, {})
         for value in self.by_value(entry):
             width = widths.get(value[1], register_bits(value[1])) if value[0] == "r" else 32
-            params.append(f"{cprint.UNSIGNED[width]} {self.param_name(entry, value)}")
+            params.append(f"{self.value_type(value, width)} {self.param_name(entry, value)}")
         for value in self.by_pointer(entry):
             width = register_bits(value[1]) if value[0] == "r" else 32
-            params.append(f"{cprint.UNSIGNED[width]} *p_{self.param_name(entry, value)}")
+            params.append(f"{self.value_type(value, width)} *p_{self.param_name(entry, value)}")
         returned = self.returned(entry)
         kind = "void" if returned is None \
-            else cprint.UNSIGNED[self.result_bits.get(entry, register_bits(returned[1])) if returned[0] == "r" else 32]
+            else self.value_type(returned, self.result_bits.get(entry, register_bits(returned[1])) if returned[0] == "r" else 32)
         return f"{kind} {self.names[entry]}({', '.join(params) if params else 'void'})"
 
     def definition(self, entry):
