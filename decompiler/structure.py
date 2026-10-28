@@ -1367,6 +1367,7 @@ def structure(function, control_name=None, copies=None, meet_follow=False):
     finally:
         TAIL_COPY, REGION_COPY, WAY_OUT_BLOCKS, MEET_FOLLOW = usual
     fallthrough_cases(tree)
+    fall_into_cases(tree)
     drop_fallthrough_gotos(tree)
     group_cases(tree)
     if control_name is not None and goto_targets(tree):
@@ -1473,6 +1474,55 @@ def fallthrough_cases(nodes):
                         break
                     if changed:
                         break
+
+
+def fall_into_cases(nodes):
+    """A case that ends going on to the start of another case (lap_timer_update's state 3 goes back to
+    state 2's loop) goes just before that case and falls through into it, the way C cases do, where nothing
+    else falls into either of them: no control variable to go round the switch again."""
+    for node in nodes:
+        if isinstance(node, If):
+            fall_into_cases(node.then)
+            fall_into_cases(node.otherwise)
+        elif isinstance(node, Loop):
+            fall_into_cases(node.body)
+        elif isinstance(node, Switch):
+            for _, body in node.cases:
+                fall_into_cases(body)
+            changed = True
+            while changed:
+                changed = False
+                for b_index, (b_values, b_body) in enumerate(node.cases):
+                    if not b_body or not isinstance(b_body[-1], Goto):
+                        continue
+                    label = b_body[-1].label
+                    a_index = next((index for index, (_, body) in enumerate(node.cases)
+                                    if index != b_index and starts_at(body, label)), None)
+                    if a_index is None or a_index == b_index + 1:
+                        continue
+                    # (nothing may fall into the case that moves, nor into the one it goes before)
+                    if b_index > 0 and not ends_flow(node.cases[b_index - 1][1]):
+                        continue
+                    if a_index > 0 and not ends_flow(node.cases[a_index - 1][1]):
+                        continue
+                    moved = (b_values, b_body[:-1])
+                    del node.cases[b_index]
+                    a_index = next(index for index, (_, body) in enumerate(node.cases) if starts_at(body, label))
+                    node.cases.insert(a_index, moved)
+                    changed = True
+                    break
+
+
+def starts_at(nodes, label):
+    """True if 'nodes' start with the code at 'label': its label, its block, or a loop that starts there."""
+    if not nodes:
+        return False
+    first = nodes[0]
+    if isinstance(first, Label) or isinstance(first, Code):
+        return first.label == label
+    if isinstance(first, Loop) and first.kind != "while":
+        return starts_at(first.body, label)
+    return False
 
 
 def drop_labels(nodes, labels):

@@ -191,6 +191,9 @@ def whole_elements(rest, bits):
         for value, other in ((rest.args[1], rest.args[0]), (rest.args[0], rest.args[1])):
             if isinstance(value, ir.Const) and value.value == size:
                 return other
+            if isinstance(value, ir.Const) and value.value > size and value.value % size == 0:
+                # (so many elements of a row: index * 8 bytes in a table of longs is element index * 2)
+                return ir.op("mul", (other, ir.Const(value.value // size, other.bits)), rest.bits)
     if isinstance(rest, ir.Op) and rest.name == "shl" and isinstance(rest.args[1], ir.Const) \
             and 1 << rest.args[1].value == size:
         return rest.args[0]
@@ -370,9 +373,11 @@ class Memory:
             return name if byte == 0 and bits == array.bits else cprint.part(bits, name, byte, array.bits)
         return None
 
-    def access(self, address, bits, index_text):
+    def access(self, address, bits, index_text, indexed=False):
         """C for an access of 'bits' at 'address' (an IR expression): (text, signed, is RAM) or None. The
-        text is an lvalue for work RAM and an rvalue for the ROM. 'index_text' prints an index."""
+        text is an lvalue for work RAM and an rvalue for the ROM. 'index_text' prints an index. With
+        'indexed', what is added to the constant is an index whatever its size (a pointer to a variable
+        moved by it: no pointer of its own)."""
         if bits not in TYPES:
             return None
         value = constant_address(address)
@@ -404,7 +409,7 @@ class Memory:
         # of the table's elements; a register that may hold anything could be a pointer with a
         # displacement, and that read stays on the bus
         index = element_index(rest, bits)
-        if not table_index(rest, bits):
+        if not indexed and not table_index(rest, bits):
             return None
         ram = work_ram(base)
         board = plain_hardware(base) and base in self.board
@@ -422,12 +427,22 @@ class Memory:
             return f"RAM{bits}(GAME_VARIABLES + {index_text(rest)})", False, True
         if base not in items:
             found = self.element(items, base)
+            following = items.get(base + bits // 8)
+            if found is None and following is not None and following.bits == bits and index is not None:
+                # one element before an array, where the code counts from 1 (car_numbers[players_left - 1])
+                before = ir.op("sub", (index, ir.Const(1, index.bits)), index.bits)
+                return f"{following.name}[{index_text(before)}]", following.signed, lvalue
             if found is None:
                 return None
             # an index from an element of an array past its first (the scrolls of the second tile layer)
             array, number, byte = found
             if byte == 0 and index is not None and array.bits == bits:
                 return f"{array.name}[{number} + {index_text(index)}]", array.signed, lvalue
+            narrow = element_index(rest, array.bits) if byte == 0 and array.bits < bits and lvalue else None
+            if narrow is not None:
+                # several elements at once, as the original's one wider access (AS32(video_registers[32 +
+                # index * 2u]): two halfword registers cleared together)
+                return cprint.part(bits, f"{array.name}[{number} + {index_text(narrow)}]", 0, array.bits), False, lvalue
             if LOADED_TABLES and not lvalue:
                 return f"TABLE{bits}({array.name}, 0x{base - array.address:X}u + {index_text(rest)})", False, False
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)

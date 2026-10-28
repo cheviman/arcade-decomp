@@ -800,13 +800,20 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         if function in entries_by_name:
             hints.setdefault(entries_by_name[function], {})[register] = pointers.link_kind(struct)
     site_hints = {}
+    variable_addresses = {name: address for address, (name, _) in known.variables.items()}
+
+    def hinted_kind(struct):
+        # &NAME: a pointer to that variable (the test mode's R20 at its settings, settings_magic)
+        if struct.startswith("&"):
+            return "global", variable_addresses[struct[1:]]
+        return pointers.link_kind(struct)
     for (function, spot, value), struct in known.local_structs.items():
         if not value.startswith("r"):
             continue    # (a temporary or a stack slot: the structure is for registers only)
         if spot == "entry" and function in entries_by_name:
-            hints.setdefault(entries_by_name[function], {})[int(value[1:])] = pointers.link_kind(struct)
+            hints.setdefault(entries_by_name[function], {})[int(value[1:])] = hinted_kind(struct)
         elif spot != "entry":
-            site_hints[(spot, int(value[1:]))] = pointers.link_kind(struct)
+            site_hints[(spot, int(value[1:]))] = hinted_kind(struct)
     # the object a function of a family runs on is that family's: the longest family (scoped object lines)
     # whose name starts the function's (fire_front_chase is fire_front's), as emit.py reads its fields
     object_families = sorted({family for (struct, family) in known.scoped if struct == "object"}, key=len, reverse=True)

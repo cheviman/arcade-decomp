@@ -312,18 +312,22 @@ def indexed_address(expression):
 
 
 def only_addresses(statements, name):
-    """True if every use of temporary 'name' in 'statements' is the address of a read or a write."""
+    """True if every use of temporary 'name' in 'statements' is the address of a read or a write, or that
+    address plus a displacement (the second word of a 64-bit move: mov.d R2, [R1])."""
+    def addressed(address):
+        if isinstance(address, ir.Op) and address.name == "add" and isinstance(address.args[1], ir.Const):
+            address = address.args[0]
+        return isinstance(address, ir.Temp) and address.name == name
     for statement in statements:
         uses = temp_uses(statement, name)
         if not uses:
             continue
         addresses = 0
-        if isinstance(statement, ir.Store) and isinstance(statement.address, ir.Temp) \
-                and statement.address.name == name:
+        if isinstance(statement, ir.Store) and addressed(statement.address):
             addresses += 1
         for expression in ir.statement_expressions(statement):
             for node in ir.walk(expression):
-                if isinstance(node, ir.Load) and isinstance(node.address, ir.Temp) and node.address.name == name:
+                if isinstance(node, ir.Load) and addressed(node.address):
                     addresses += 1
         if addresses != uses:
             return False

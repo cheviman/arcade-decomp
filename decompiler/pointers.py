@@ -125,6 +125,9 @@ BELOW = {}
 # how far into it): the blocks of the two screens (up to the game's variables at 0x20E000) and the race
 # records (each screen's, and the copy of them each screen keeps)
 INSTANCES = {}
+# records at a fixed address the code reaches only by a number (a constant there is a name of its own, not their
+# field): start -> struct
+NUMBERED_RECORDS = {}
 RUNS = set()                   # structures laid one after another wherever a pointer starts (no fixed base,
                                # unlike ARRAYS): a pointer moved past one points into the next
 ELEMENTS = {}                  # structure -> element type: an array of one value per element (symbols.txt
@@ -282,6 +285,9 @@ def instance_record(value):
     for address, (struct, extent) in INSTANCES.items():
         if struct in STRUCTS and 0 <= value - address < min(extent, STRUCTS[struct]):
             return struct, value - address
+    for address, struct in NUMBERED_RECORDS.items():
+        if struct in STRUCTS and 0 <= value - address < STRUCTS[struct]:
+            return struct, value - address
     return None
 
 
@@ -428,6 +434,11 @@ def merge(a, b):
             found[index] = kind
         elif other is not None and kind[:2] == other[:2] and kind[0] in STRUCTS:
             found[index] = kind[:2]    # one structure, of two families (or of one and of none): of none
+        elif other is not None and kind[0] == other[0] and kind[0] in RUNS and kind[0] in STRUCTS \
+                and (kind[1] - other[1]) % STRUCTS[kind[0]] == 0:
+            # records laid one after another: past the end of one is the start of the next (time_digits_draw's
+            # digit_record, the next digit's record once it has walked through one)
+            found[index] = (kind[0], kind[1] % STRUCTS[kind[0]])
         elif other is not None and {kind[0], other[0]} & {"global"}:
             pointer, structure = (kind, other) if kind[0] == "global" else (other, kind)
             if structure[0] in STRUCTS and structure[1] == 0 and in_work_ram(pointer[1]):
@@ -1279,6 +1290,10 @@ class Program:
             for index in written:
                 state.pop(index, None)
                 zeros.pop(index, None)
+                # what symbols.txt says a register the instruction leaves points at (the byte a search found)
+                hinted = self.site_hints.get((getattr(statement, "origin", None), index))
+                if hinted is not None:
+                    state[index] = hinted
         elif isinstance(statement, ir.Store) and isinstance(statement.value, ir.Const) and HANDLER_FIELD is not None:
             # an object whose handler is set to a function of a family is that family's: what start_object
             # hands back, once its handler is set, reads as the family's code reads it (not the function's own

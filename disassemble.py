@@ -475,7 +475,10 @@ def load_names(path, registers=None):
         if not structure(pointed) and pointed not in ("rom", "io"):
             raise SystemExit(f"{path.name}: a parameter of {function} points at '{pointed}', which is no struct "
                              "(nor 'rom' or 'io')")
+    variable_names = {name for name, _ in names.variables.values()}
     for (function, _, _), pointed in names.local_structs.items():
+        if pointed.startswith("&") and pointed[1:] in variable_names:
+            continue    # (a pointer to a variable: &NAME, the test mode's R20 at its settings)
         if not structure(pointed) and pointed not in ("rom", "io"):
             raise SystemExit(f"{path.name}: a local of {function} points at '{pointed}', which is no struct "
                              "(nor 'rom' or 'io')")

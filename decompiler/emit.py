@@ -1123,7 +1123,7 @@ class FunctionWriter:
         if field is not None and field[0] == "global":
             # through a pointer to a variable: as the variable
             own = self.own_variable(field[1], bits)
-            return own if own is not None else self.emitter.memory.access(field[1], bits, self.exact)
+            return own if own is not None else self.emitter.memory.access(field[1], bits, self.exact, indexed=True)
         if field is not None:
             text, signed = self.field_access(field, bits)
             return text, signed, True
