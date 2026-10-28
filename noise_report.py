@@ -19,9 +19,15 @@ the board puts its own in place of. The counts are compared with tools/noise_bas
 Two measures of how much of the C is clean, function by function and line by line: with nothing at all
 of the above (clean), and with nothing but what the C has to keep to do what the original does
 (faithful): the registers the C keeps as globals, where a value goes from one function to another
-through them (the scratch ones are locals wherever it does not), and several fields read or written in
-one access, as the original's one instruction does (AS/AT, a table read at another width). The README
-explains each of those.
+through them (the scratch ones are locals wherever it does not), several fields read or written in
+one access, as the original's one instruction does (AS/AT, a table read at another width), and a part
+of a value changed in place, the rest of it kept, as a byte or halfword instruction on a wider value does
+(x = (x & ~0xFFu) | ..., or a pointer moved within its 64 KB page, (p & ~0xFFFFu) | (uint16_t)(p + d)).
+A partial write that puts a part of one value into another ((y & ~0xFFu) | x) is a leftover in both
+measures (mixed_partial_writes). Memory reached through an address the code works out is faithful only in
+the routines the game's profile lists as working on memory by its address, whatever is there
+(game_profile.MEMORY_ROUTINES: a memory test, a checksum, a copy), each with why. The README explains
+each of those.
 
 Usage: python tools/noise_report.py [--save] [--src DIR] [--files]
   --save   write the counts as the new baseline (after a round that took something away)
@@ -35,6 +41,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import game_profile  # noqa: E402  (the game's: its root)
 ROOT = game_profile.ROOT
+# function -> why it works on memory by its address (the faithful measure takes its mem_access as the original's)
+MEMORY_ROUTINES = getattr(game_profile, "MEMORY_ROUTINES", {})
 BASELINE = ROOT / "tools" / "noise_baseline.txt"
 UNNAMED_ADDRESSES = ROOT / "build" / "decompile" / "unnamed_addresses.txt"
 
@@ -82,11 +90,12 @@ INFORMATION = {
     "lines": "lines of C",
     "casts": "casts",
     "partial_writes": "partial writes of a variable ((x & ~0xFFFFu) | ...)",
+    "mixed_partial_writes": "of those, the ones that put a part of one value into another ((y & ~0xFFu) | x)",
     "board_registers": "reads and writes of a device of the board, through the bus (io_read8...)",
     "clean_functions": "functions with nothing of the above in them (the partial writes too), per thousand",
     "clean_lines": "lines of code in the functions with nothing of the above, per thousand",
     "faithful_functions": "functions with nothing of the above but the faithful leftovers (the globals' registers, "
-                          "fields at once), per thousand",
+                          "fields at once, parts changed in place, the memory routines' addresses), per thousand",
     "faithful_lines": "lines of code in those functions with nothing but those, per thousand",
 }
 # the kinds the original's own doing leaves in the C (see the module's notes), with the registers kept as globals
@@ -144,11 +153,35 @@ def count(paths):
                     counts["copy_backs"] += end - index
             counts["casts"] += len(re.findall(r"\((?:u?int\d+_t)\)", line))
             counts["partial_writes"] += len(re.findall(r"& ~0xF+u\) \|", line))
+            if PARTIAL_WRITE.search(line) and not in_place(line):
+                counts["mixed_partial_writes"] += 1
             counts["board_registers"] += len(re.findall(r"\bio_(?:read|write)\d+\(", line))
     return counts
 
 
 PARTIAL_WRITE = re.compile(r"& ~0xF+u\) \|")
+# one partial write: the value whose other parts it keeps, (VALUE & ~0xFFu) |
+PARTIAL_OCCURRENCE = re.compile(r"\(((?:[^()]|\([^()]*\))+?) & ~0xF+u\) \|")
+
+
+def in_place(line):
+    """True if every partial write on 'line' changes a part of a value and keeps the rest of that same
+    value: the variable it assigns ("x = (x & ~0xFFu) | ..."), or a part worked out from the value itself
+    ("(p & ~0xFFFFu) | (uint16_t)(p + d)")."""
+    target = re.match(r"^\s*(\*?[\w>().\-\[\]]+?) = ", line)
+    found = False
+    for match in PARTIAL_OCCURRENCE.finditer(line):
+        found = True
+        kept = match.group(1).strip()
+        while kept.startswith("(") and kept.endswith(")") and kept[1:-1].count("(") == kept[1:-1].count(")"):
+            kept = kept[1:-1]
+        rest = line[match.end():]
+        if target and kept == target.group(1):
+            continue
+        if re.match(r"\s*\(uint\d+_t\)\(\(?" + re.escape(kept) + r"\b", rest):
+            continue
+        return False
+    return found
 
 
 def clean_measure(paths, extra, registers=None, faithful=False):
@@ -156,21 +189,25 @@ def clean_measure(paths, extra, registers=None, faithful=False):
     leftover is any kind of KINDS on the line, a table over an address ('extra'), a register the C keeps
     as a global ('registers'), a partial write, a bool control variable, a result written back before an
     early return; a parameter named after a register leaves its function unclean. With 'faithful', the
-    FAITHFUL kinds and the registers kept as globals are no leftovers."""
+    FAITHFUL kinds, the registers kept as globals, the partial writes in place and the memory routines'
+    memory reached by address (MEMORY_ROUTINES) are no leftovers."""
     patterns = [pattern for kind, (_, pattern) in KINDS.items()
                 if pattern is not None and not (faithful and kind in FAITHFUL)] + list(extra) \
-        + ([registers] if registers is not None and not faithful else []) + [PARTIAL_WRITE]
+        + ([registers] if registers is not None and not faithful else [])
+    by_address = KINDS["mem_access"][1]
+    routine_patterns = [pattern for pattern in patterns if pattern is not by_address]
     clean_functions = functions = clean_lines = lines = 0
     for path in paths:
         text = path.read_text(encoding="ascii", errors="replace").splitlines()
         z80 = "sound" in path.parts
-        inside, dirty = False, False
+        inside, dirty, checked = False, False, patterns
         for index, line in enumerate(text):
             if line.startswith(("/*", "   ", " *")):
                 continue
             found = FUNCTION.match(line)
             if found and index + 1 < len(text) and text[index + 1] == "{":
                 inside = True
+                checked = routine_patterns if faithful and found.group(1) in MEMORY_ROUTINES else patterns
                 dirty = bool(re.findall(r"(?<!\w)(?:p_)?r\d+(?:_\d+)?(?=[,)]|$)", found.group(2))) or \
                     (z80 and bool(re.findall(rf"(?<!\w)(?:p_)?{Z80_REGISTER}(?=[,)]|$)", found.group(2))))
                 continue
@@ -184,7 +221,8 @@ def clean_measure(paths, extra, registers=None, faithful=False):
             if line.strip() in ("", "{", "}"):
                 continue
             lines += 1
-            leftover = any(pattern.search(line) for pattern in patterns) or line.startswith("\tbool ")
+            leftover = any(pattern.search(line) for pattern in checked) or line.startswith("\tbool ") \
+                or bool(PARTIAL_WRITE.search(line)) and not (faithful and in_place(line))
             if not leftover and COPY_BACK.match(line):
                 end = index
                 while end < len(text) and COPY_BACK.match(text[end]):
@@ -253,7 +291,8 @@ def main():
           f"{measure[2]} of {measure[3]} lines of code ({measure[2] * 100 / max(measure[3], 1):.1f}%)")
     print(f"faithful: {faithful[0]} of {faithful[1]} functions ({faithful[0] * 100 / max(faithful[1], 1):.1f}%), "
           f"{faithful[2]} of {faithful[3]} lines of code ({faithful[2] * 100 / max(faithful[3], 1):.1f}%) "
-          "with nothing but the globals' registers and fields at once")
+          "with nothing but the globals' registers, fields at once, parts changed in place and the memory "
+          "routines' addresses")
     if "--files" in arguments:
         print()
         print(f"{'rom_reads':>9s} {'rom_names':>9s}")

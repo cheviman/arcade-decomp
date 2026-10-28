@@ -16,9 +16,12 @@ on every path.
 Across calls (across): a parameter has the bits every call of the function passes as zero, when the C
 has all its calls (no memory slot, task or interrupt reaches it, nor a second way in), and a call hands
 back the bits every way back of the function leaves zero in that result. Both are worked out again until
-nothing changes, from nothing known: each round's are true of the C, and the next one only adds to them.
-"add.b #1F, R0" on a stage number every caller passes as a byte is then a byte's sum, not a partial
-write of R0.
+nothing changes, from every bit of every parameter and result zero: each round takes back what a call or
+a way back does not leave zero, and only what is left when nothing changes is true of the C (a round
+that has not settled is not). That finds what holds through recursion and through a value that goes
+round between calls: insert_coin's credits_given, 0 at the first call and what the last call handed back
+at the next. "add.b #1F, R0" on a stage number every caller passes as a byte is then a byte's sum, not a
+partial write of R0.
 
 A cast that cuts nothing becomes Op("fits", (value,), bits): the value, already within that width.
 The index of a table read ("base + r0 * 2") known to fit in 16 bits says so the same way,
@@ -256,7 +259,7 @@ def call_targets(statement):
     return list(statement.choices)
 
 
-def across(functions, signatures, context, call_results, closed, rounds=20):
+def across(functions, signatures, context, call_results, closed, rounds=100):
     """({function: {parameter register: bits every call passes as zero}}, {function: {result register: bits
     every way back leaves zero}}) (see the module's notes); 'call_results' is each function's
     {id(call): registers it hands back}, 'closed' the functions the C does not have every call of."""
@@ -264,7 +267,9 @@ def across(functions, signatures, context, call_results, closed, rounds=20):
     registers = {entry: ({value[1] for value in signature.params if value[0] == "r"} - context,
                          {value[1] for value in signature.results if value[0] == "r"} - context)
                  for entry, signature in signatures.items()}
-    passed, handed = {}, {}
+    passed = {entry: {index: FULL for index in registers[entry][0]} for entry in functions
+              if entry not in closed and registers[entry][0]}
+    handed = {entry: {index: FULL for index in registers[entry][1]} for entry in functions if registers[entry][1]}
     for _ in range(rounds):
         calls, ends = {}, {}
 
@@ -295,9 +300,9 @@ def across(functions, signatures, context, call_results, closed, rounds=20):
         new_passed = {entry: found for entry, found in new_passed.items() if found}
         new_handed = {entry: found for entry, found in new_handed.items() if found}
         if new_passed == passed and new_handed == handed:
-            break
+            return passed, handed
         passed, handed = new_passed, new_handed
-    return passed, handed
+    raise RuntimeError("the bits known across calls do not settle")
 
 
 def simplify(function, signature, context, call_results, passed=None, handed=None):

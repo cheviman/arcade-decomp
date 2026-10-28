@@ -34,6 +34,8 @@ from . import signatures
 # function -> the bits of the register it returns that its callers read (decompile.py's result_widths): the C
 # returns that much, so only those bits are live where it ends
 RESULT_BITS = {}
+# function -> {register it hands back through a pointer: the parts its callers read} where not all of them
+RESULT_PARTS = {}
 
 # address >> 20 of the areas where a read has no side effect
 PLAIN_MEMORY = {0x0, 0x1, 0x2, 0x3, 0x4, 0x6, 0x7, 0xF}
@@ -87,7 +89,7 @@ class Liveness:
         if isinstance(statement, ir.SetFlag):
             return ("f", statement.name) in live
         if isinstance(statement, ir.SetStack):
-            return ("s", statement.offset) in live
+            return any(("s", statement.offset, part) in live for part in (0, 1, 2))
         return True
 
     def end_live(self, block, live_in):
@@ -213,10 +215,13 @@ def eliminate(flow, function, results, context, arguments=None):
     it (RESULT_BITS, else whole): the caller takes the whole variable, even where the original only wrote
     part of the register and the caller's other bits go through it ("and.b #FF, R0"). Results it hands
     back through pointers are copied back only in the parts the function may write (emit.py), so only
-    those are live."""
+    those are live, and of those only the ones its callers read (RESULT_PARTS): the caller's variable
+    takes the rest as the C has it, which nothing reads."""
     if len(results) > 1:
         written = flow.summaries[function.entry].writes
-        exit_live = {variable for variable in written if (variable[0], variable[1]) in set(results)}
+        read = RESULT_PARTS.get(function.entry, {})
+        exit_live = {variable for variable in written if (variable[0], variable[1]) in set(results)
+                     and (variable[0] != "r" or variable[2] in read.get(variable[1], (0, 1, 2)))}
     elif function.entry in RESULT_BITS and next(iter(results))[0] == "r":
         exit_live = dataflow.register_parts(next(iter(results))[1], ir.MASKS[RESULT_BITS[function.entry]])
     else:

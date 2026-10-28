@@ -285,6 +285,51 @@ def cheap(expression):
     return False
 
 
+def indexed_address(expression):
+    """True for an address an index mode works out: a pointer, a displacement and an index, the element's
+    size apart (inc.b F0[R20](R1): r20 + 0xF0 + r1), no more than three terms of registers and constants."""
+    if not (isinstance(expression, ir.Op) and expression.name == "add"):
+        return False
+    terms = []
+
+    def gather(node):
+        if isinstance(node, ir.Op) and node.name == "add" and node.bits == expression.bits:
+            gather(node.args[0])
+            gather(node.args[1])
+        else:
+            terms.append(node)
+    gather(expression)
+
+    def simple(node):
+        while isinstance(node, ir.Op) and node.name in ("trunc", "zext", "fits"):
+            node = node.args[0]
+        if isinstance(node, ir.Op) and node.name in ("mul", "shl") and isinstance(node.args[1], ir.Const):
+            node = node.args[0]
+            while isinstance(node, ir.Op) and node.name in ("trunc", "zext", "fits"):
+                node = node.args[0]
+        return isinstance(node, (ir.Const, ir.Reg, ir.Stack, ir.Temp))
+    return len(terms) <= 3 and all(simple(term) for term in terms)
+
+
+def only_addresses(statements, name):
+    """True if every use of temporary 'name' in 'statements' is the address of a read or a write."""
+    for statement in statements:
+        uses = temp_uses(statement, name)
+        if not uses:
+            continue
+        addresses = 0
+        if isinstance(statement, ir.Store) and isinstance(statement.address, ir.Temp) \
+                and statement.address.name == name:
+            addresses += 1
+        for expression in ir.statement_expressions(statement):
+            for node in ir.walk(expression):
+                if isinstance(node, ir.Load) and isinstance(node.address, ir.Temp) and node.address.name == name:
+                    addresses += 1
+        if addresses != uses:
+            return False
+    return True
+
+
 def temp_uses(statement, name):
     count = 0
     for expression in ir.statement_expressions(statement):
@@ -312,8 +357,9 @@ def inline_block(block, flow):
         total = sum(count for _, count in uses)
         if total == 0:
             continue
-        if total > 1 and not cheap(value):
-            continue
+        if total > 1 and not cheap(value) and not (
+                indexed_address(value) and only_addresses([everything[position] for position, _ in uses], name)):
+            continue    # (an index mode's address goes into its read and its write: the field it reaches)
         last = uses[-1][0]
         movable = True
         for between in everything[index + 1:last]:

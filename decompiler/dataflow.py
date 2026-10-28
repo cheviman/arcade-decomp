@@ -8,8 +8,9 @@ Author:      Sebastian Toyos
 
 Variables are the parts of the V60 registers (("r", n, part): part 0 is bits 0-7, part 1 bits 8-15,
 part 2 bits 16-31, since byte and halfword instructions change only the low part of a register), the
-four flags (("f", name)) and a function's stack slots (("s", offset)), which stack.py made of its pushes
-and pops. Temporaries never outlive the statements of one instruction; inside a block they carry the
+four flags (("f", name)) and the parts of a function's stack slots (("s", offset, part), the same parts),
+which stack.py made of its pushes and pops: a register pushed whole and popped for its low byte keeps only
+that byte live. Temporaries never outlive the statements of one instruction; inside a block they carry the
 bits their readers ask for back to the expressions that compute them.
 
 Liveness is by demanded bits: a statement only needs the parts of its inputs that can reach the bits
@@ -72,6 +73,10 @@ def register_parts(index, mask):
     return {("r", index, part) for part, bits in PARTS if mask & bits}
 
 
+def stack_parts(offset, mask):
+    return {("s", offset, part) for part, bits in PARTS if mask & bits}
+
+
 def parts_mask(variables, index):
     mask = 0
     for part, bits in PARTS:
@@ -107,7 +112,7 @@ def demanded(node, mask, out, temps):
         out.add(("f", node.name))
         return
     if isinstance(node, ir.Stack):
-        out.add(("s", node.offset))
+        out |= stack_parts(node.offset, mask & width(node.bits))
         return
     if isinstance(node, ir.Temp):
         temps[node.name] = temps.get(node.name, 0) | mask
@@ -170,7 +175,7 @@ def expression_reads(expression):
         elif isinstance(node, ir.Flag):
             found.add(("f", node.name))
         elif isinstance(node, ir.Stack):
-            found.add(("s", node.offset))
+            found |= stack_parts(node.offset, FULL)
     return found
 
 
@@ -473,11 +478,15 @@ class Program:
                 demanded(statement.value, 1, live, temps)
             return {variable}, {variable}
         if isinstance(statement, ir.SetStack):
-            variable = ("s", statement.offset)
-            if variable in live:
-                live.discard(variable)
-                demanded(statement.value, width(statement.bits), live, temps)
-            return {variable}, {variable}
+            written = stack_parts(statement.offset, width(statement.bits))
+            needed = 0
+            for part, bits in PARTS:
+                if ("s", statement.offset, part) in live:
+                    needed |= bits
+            live -= written
+            if needed:
+                demanded(statement.value, needed & width(statement.bits), live, temps)
+            return written, written
         if isinstance(statement, ir.Store):
             demanded(statement.address, FULL, live, temps)
             demanded(statement.value, width(statement.bits), live, temps)
@@ -783,9 +792,37 @@ class Program:
             self.solve_summaries()
             outputs = self.outputs()
             if all(outputs[entry] <= self.exit_live.get(entry, frozenset()) for entry in self.functions):
+                self.context_passes()
                 return
             for entry in self.functions:
                 self.exit_live[entry] = frozenset(self.exit_live.get(entry, frozenset()) | outputs[entry])
+
+    def context_passes(self):
+        """What each function reads for the context registers it writes, kept as for a value it hands back.
+        The C keeps them where every function ends (global variables), and the outputs are only what callers
+        read after their calls: without this, a call that writes one would read all its function may read
+        (draw_object's R0, which it only hands back). Worked out until none changes, as a call reads less
+        once its callee's are known."""
+        changed = True
+        rounds = 0
+        while changed:
+            changed = False
+            rounds += 1
+            if rounds > 50:
+                raise RuntimeError("the context registers' reads do not settle")
+            for entry, summary in self.summaries.items():
+                keys = {(variable[0], variable[1]) for variable in summary.writes & self.context}
+                zeroed = self.zeroed.get(entry, ())
+                start = self.functions[entry].entry
+                for key in sorted(keys):
+                    exit_live = frozenset(v for v in self.context if (v[0], v[1]) == key) \
+                        | frozenset(v for v in self.exit_live.get(entry, ()) if (v[0], v[1]) == key)
+                    found, _ = self.liveness(entry, exit_live=exit_live)
+                    reads = {variable for variable in found[start] if variable[0] in ("r", "f")
+                             and (variable[0], variable[1]) not in zeroed}
+                    if summary.passes.get(key) != reads:
+                        summary.passes[key] = reads
+                        changed = True
 
     def live_after_calls(self, entry):
         return self.liveness(entry, record_calls=True)[1]

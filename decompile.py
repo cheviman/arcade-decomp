@@ -588,41 +588,56 @@ def code_table(program, flow):
 
 
 def result_widths(built, found, flow, closed):
-    """{function: 8 or 16} for the functions that return one register of which no caller reads more after
-    the call (a tail call: what its own callers read, when it returns the same register; all of it when it
-    hands it back among others; none when it does not hand it back):
-    the C returns that much (cleanup.RESULT_BITS). The ones in 'closed' (calls through memory slots, a second
-    way in, nothing calling them) return all of it."""
-    returned = {}
-    for entry, signature in found.items():
-        values = list(signature.results)
-        if len(values) == 1 and values[0][0] == "r" and entry not in closed:
-            returned[entry] = values[0][1]
-    read = {entry: set() for entry in returned}
+    """({function: 8 or 16} for the functions that return one register, {function: {register: its parts}}
+    for those that hand back several), where no caller reads more of it after the call (a tail call: what
+    its own callers read of that register, all of it where they are not known; none when it does not hand
+    it back): the C returns that much, and works out that much of what it hands back through pointers
+    (cleanup.RESULT_BITS, cleanup.RESULT_PARTS). The ones in 'closed' (a second way in) and the ones nothing
+    calls hand back all of it; a call through a memory slot reads nothing back (signatures.py)."""
+    handed = {entry: {value[1] for value in signature.results if value[0] == "r"}
+              for entry, signature in found.items()}
+    read = {entry: {register: set() for register in registers}
+            for entry, registers in handed.items() if registers and entry not in closed}
+    called = set()
     tails = {}
     for caller, function in built.items():
         for call, after in flow.live_after_calls(caller):
             if call.slot is not None:
                 continue
             for target in flow.call_targets(call):
-                if target in read:
-                    read[target] |= {variable[2] for variable in after
-                                     if variable[0] == "r" and variable[1] == returned[target]}
+                called.add(target)
+                for register, parts in read.get(target, {}).items():
+                    parts |= {variable[2] for variable in after if variable[0] == "r" and variable[1] == register}
         for block in function.blocks.values():
-            if isinstance(block.end, ir.TailCall) and block.end.target in read:
-                tails.setdefault(block.end.target, set()).add(caller)
+            if isinstance(block.end, ir.TailCall):
+                called.add(block.end.target)
+                if block.end.target in read:
+                    tails.setdefault(block.end.target, set()).add(caller)
     changed = True
     while changed:
         changed = False
         for target, callers in tails.items():
             for caller in callers:
-                # (a function that hands back no such register: its callers read none of it after it)
-                handed = {value[1] for value in found[caller].results if value[0] == "r"}
-                more = read[caller] if returned.get(caller) == returned[target]                     else {0, 1, 2} if returned[target] in handed else set()
-                if not more <= read[target]:
-                    read[target] |= more
-                    changed = True
-    return {entry: 8 if parts <= {0} else 16 for entry, parts in read.items() if parts and 2 not in parts}
+                for register, parts in read[target].items():
+                    # (a register the caller does not hand back: its callers read none of it after it)
+                    more = set() if register not in handed[caller] \
+                        else read[caller][register] if caller in read else {0, 1, 2}
+                    if not more <= parts:
+                        parts |= more
+                        changed = True
+    single, several = {}, {}
+    for entry, registers in read.items():
+        if entry not in called:
+            continue
+        if len(found[entry].results) == 1 and len(registers) == 1:
+            parts = next(iter(registers.values()))
+            if parts and 2 not in parts:
+                single[entry] = 8 if parts <= {0} else 16
+        else:
+            narrower = {register: parts for register, parts in registers.items() if parts != {0, 1, 2}}
+            if narrower:
+                several[entry] = narrower
+    return single, several
 
 
 def trampolines(built):
@@ -718,9 +733,11 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             registers.add(returned[1])
         arguments[entry] = registers
     whole = set(signatures.CONTEXT) - set(signatures.SCRATCH_CONTEXT)    # global variables in C
-    # of the functions the C has every call of (knownbits.across, result_widths)
+    # of the functions the C has every call of (knownbits.across)
     closed = set(code_table(program, flow)) | set(signatures.OPEN) | set(program.second_entries) | {RESET_ADDRESS}
-    cleanup.RESULT_BITS = result_widths(built, found, flow, closed)
+    # (what they hand back: calls through slots, tasks and interrupts read none of it)
+    cleanup.RESULT_BITS, cleanup.RESULT_PARTS = result_widths(
+        built, found, flow, set(signatures.OPEN) | set(program.second_entries) | {RESET_ADDRESS})
     live_after = {}
     live_at_start = {}
     for entry, function in built.items():

@@ -1013,6 +1013,12 @@ class FunctionWriter:
         if overlay is not None and not exact:
             return overlay[0]
         if found is None or found[0] != hit[1]:
+            for (array_struct, start), (element_bits, count) in pointers.FIELD_ARRAYS.items():
+                width = element_bits // 8
+                if array_struct == hit[0] and count and start < hit[1] < start + count * width \
+                        and not (hit[1] - start) % width:
+                    # (an element at a constant place: lcd_text_4 for lcd_text[4] and the ones after it)
+                    return f"{layouts.names[hit[0]][start]}_{(hit[1] - start) // width}"
             return None
         name = layouts.names[hit[0]][found[0]]
         return None if name.startswith(("unk_", "var_")) else name
@@ -1563,6 +1569,15 @@ class FunctionWriter:
             start = self.printer.any(base).text
             pointer = f"{struct.upper()}({start})" if not base_offset else \
                 f"{struct.upper()}({start} - 0x{base_offset:X}u)"
+        if element_number is None and offset not in layouts.fields.get(struct, {}):
+            for (array_struct, start), (element_bits, count) in pointers.FIELD_ARRAYS.items():
+                width = element_bits // 8
+                if array_struct == struct and count and start < offset < start + count * width:
+                    # a constant place inside a field that is an array: its element (lcd_text[4], and
+                    # AS32(lcd_text[4]) for the four characters written at once)
+                    element_number = ir.Const((offset - start) // width, 32)
+                    offset = start + (offset - start) % width
+                    break
         element = struct in pointers.ELEMENTS
         if index is not None or element or table is not None:
             # a record (or an element) by its number: STRUCT(p)[i].field, NAME(p)[i]
@@ -1599,7 +1614,8 @@ class FunctionWriter:
             scoped = layouts.scoped_field(struct, family, offset)
             if scoped is not None:
                 view, scoped_name, scoped_offset, scoped_bits, scoped_signed = scoped
-                text = f"{pointer}{member}{view}.{scoped_name}" +                     self.scoped_element(struct, family, scoped_offset, element_number)
+                text = f"{pointer}{member}{view}.{scoped_name}" + \
+                    self.scoped_element(struct, family, scoped_offset, element_number)
                 if scoped_offset == offset and scoped_bits == bits:
                     if field_offset == offset and field_bits == bits and layouts.names[struct][offset] == scoped_name \
                             and layouts.signed[struct][offset] == scoped_signed:
@@ -2333,6 +2349,9 @@ class FunctionWriter:
             live = self.after.get(id(self.current))
             if live is not None and not any(variable[0] == "r" and variable[1] == returned[1] for variable in live):
                 return f"{call};"    # nothing reads what it returns
+        if returned[0] == "r" and isinstance(self.current, ir.TailCall) \
+                and returned[1] not in self.end_registers(ir.Return()):
+            return f"{call};"    # a tail call whose value this function does not hand back
         target_name = self.register_set(returned[1]) if returned[0] == "r" else self.use(returned)
         return f"{target_name} = {call};"
 
@@ -2381,7 +2400,8 @@ class FunctionWriter:
         if isinstance(end, ir.Return):
             return self.copy_out() + [self.return_text()]
         if isinstance(end, ir.TailCall):
-            if self.returned is not None and self.emitter.returned(self.emitter.resolve(end.target, end.entry)[0])                     == self.returned:
+            if self.returned is not None and self.emitter.returned(self.emitter.resolve(end.target, end.entry)[0]) \
+                    == self.returned:
                 self.not_copied.update(self.results)
                 return [f"return {self.call_expression(end.target, None, end.entry)};"]
             return [self.call_text(end.target, None, end.entry)] + self.copy_out() + [self.return_text()]

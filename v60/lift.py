@@ -400,7 +400,10 @@ def lift_data(lifter, instruction):
 
     if mnemonic == "test1":
         number, value = lifter.f12_operands(instruction, "value", 2, "value", 2)
-        masked = ir.op("and", (value, ir.op("shl", (ir.const(1), number), 32)), 32)
+        # a constant bit number is a constant mask, so that only that bit of the value is read
+        mask = ir.const(1 << number.value) if isinstance(number, ir.Const) and number.value < 32 \
+            else ir.op("shl", (ir.const(1), number), 32)
+        masked = ir.op("and", (value, mask), 32)
         emit(ir.SetFlag("cy", ir.op("ne", (masked, ir.const(0)), 1)))
         emit(ir.SetFlag("z", ir.op("eq", (masked, ir.const(0)), 1)))
         return True

@@ -275,6 +275,16 @@ def record_table(value):
     return None
 
 
+def instance_record(value):
+    """(structure, offset into it) for an address in the first record of a structure at a fixed address
+    (INSTANCES), which the code counts records on from: a record's number times its size plus this address
+    reads RACE(RACE_COPY_1)[player].segment; None otherwise."""
+    for address, (struct, extent) in INSTANCES.items():
+        if struct in STRUCTS and 0 <= value - address < min(extent, STRUCTS[struct]):
+            return struct, value - address
+    return None
+
+
 def record_table_name(value):
     """(name, structure, offset) of the table of records whose first record 'value' is in, or None."""
     for address, (name, struct) in RECORD_TABLES.items():
@@ -765,6 +775,11 @@ def access(address, state, zeros=None):
     if found is not None:
         # the base points that far past the start of the structure below (screen - 0x8000u: its objects' area)
         return found[0], found[1], base, found[1] - (offset - kind[1]), None
+    if kind[0] in RUNS:
+        # past the record the pointer is in, of records laid one after another: a field of the next one, or
+        # of one before (PROJECTED_SEGMENT(view_record)[1].y)
+        record, inside = divmod(offset, STRUCTS[kind[0]])
+        return kind[0], inside, base, kind[1], family_of(kind), ir.Const(record & 0xFFFFFFFF, 32)
     return None
 
 
@@ -796,7 +811,19 @@ def array_access(kind, pointer, constant, rest, zeros=None, whole_records=True):
     element number) for an access to an element of a field that is an array (FIELD_ARRAYS): the pointer's
     record (or the one so many records on) plus the field's offset plus the element's; None otherwise. The
     terms 'rest' are a record's number times its size and an element's number times the element's; without
-    'whole_records' (a structure the work RAM or the board has one of there), an element's number only."""
+    'whole_records' (a structure the work RAM or the board has one of there), an element's number only, or
+    the sum of several (an array by checkpoint and player: checkpoint_orders[checkpoint * 8 + player]),
+    and the displacement may be the element's before the array's start, where the code counts from 1
+    (route_branches[forks_reached - 1], with no array where it points)."""
+    for before in (False, True):
+        found = array_element(kind, pointer, constant, rest, zeros, whole_records, before)
+        if found is not None:
+            return found
+    return None
+
+
+def array_element(kind, pointer, constant, rest, zeros, whole_records, before):
+    """array_access(), with 'before' the element the displacement points one before the array's start."""
     size = STRUCTS[kind[0]]
     for start, bits, count in arrays_of(kind[0], family_of(kind)):
         width = bits // 8
@@ -807,7 +834,7 @@ def array_access(kind, pointer, constant, rest, zeros=None, whole_records=True):
             by_element = scaled_count(term, width, zeros)
             if by_record is not None and not records:
                 records.append(by_record)
-            elif by_element is not None and not element_terms:
+            elif by_element is not None and (not element_terms or not whole_records):
                 element_terms.append(by_element)
             else:
                 break
@@ -817,16 +844,52 @@ def array_access(kind, pointer, constant, rest, zeros=None, whole_records=True):
             if record and not whole_records:
                 continue
             within = inside - start
-            if within < 0 or within % width or (count is not None and within >= count * width):
+            if before:
+                if within != -width or not element_terms or whole_records:
+                    continue
+            elif within < 0 or within % width or (count is not None and within >= count * width):
                 continue
             element = ir.Const(within // width, 32)
             if element_terms:
-                element = element_terms[0] if not within else ir.op("add", (element_terms[0], element), 32)
+                summed = element_terms[0]
+                for term in element_terms[1:]:
+                    summed = ir.op("add", (summed, term), 32)
+                element = summed if not within \
+                    else ir.op("sub", (summed, ir.Const(1, 32)), 32) if before \
+                    else ir.op("add", (summed, element), 32)
             if records:
                 number = records[0] if not record else ir.op("add", (records[0], ir.Const(record & 0xFFFFFFFF, 32)), 32)
             else:
                 number = ir.Const(record & 0xFFFFFFFF, 32) if record or isinstance(pointer, ir.Const) else None
             return kind[0], start, pointer, kind[1], family_of(kind), number, element
+    return None
+
+
+def moved(pointer, distance):
+    """'pointer' plus 'distance' bytes, as an IR expression."""
+    if not distance:
+        return pointer
+    if distance < 0:
+        return ir.op("sub", (pointer, ir.Const(-distance, POINTER_BITS)), POINTER_BITS)
+    return ir.op("add", (pointer, ir.Const(distance, POINTER_BITS)), POINTER_BITS)
+
+
+def nested_access(kind, pointer, constant, rest):
+    """(struct, field offset, pointer, 0, None) for a field of a record in a run of records inside a
+    structure (NESTED, a structure there more than once: the screen's ring of road segments), at a byte
+    offset the code works out from its start ('rest'): ROAD_SEGMENT(screen + 0x2000u + offset)->half_width;
+    None otherwise."""
+    if not rest:
+        return None
+    offset = kind[1] + constant
+    runs = NESTED.get(kind[0], ())
+    for start, size, inner in runs:
+        if start <= offset < start + size and inner in STRUCTS \
+                and sum(1 for _, other_size, other in runs if other == inner and other_size == size) > 1:
+            at = moved(pointer, start - kind[1])
+            for term in rest:
+                at = ir.op("add", (at, term), POINTER_BITS)
+            return inner, offset - start, at, 0, None
     return None
 
 
@@ -891,17 +954,31 @@ def indexed_access(address, state, in_fields=True, zeros=None):
     if pointer is None:
         if in_fields and len(terms) <= 3:
             # an element of a field that is an array, in a structure of the work RAM or the board, by a
-            # number the code works out (SCREEN(screen)->lap_times[player]) or a constant one
+            # number the code works out (SCREEN(screen)->lap_times[player]) or a constant one; the same in
+            # the structure below it (BELOW: OBJECT_AREA(screen - 0x8000u)->slots[slot]); a field of a
+            # record in a run of them inside it, at an offset the code works out (nested_access)
             for term, found in zip(terms, kinds):
-                if found is not None and found[0] in STRUCTS and not records_kind(found) \
-                        and any(True for _ in arrays_of(found[0], family_of(found))):
-                    rest = [other for other in terms if other is not term]
-                    hit = array_access(found, term, constant, rest, zeros, whole_records=False)
+                if found is None or found[0] not in STRUCTS or records_kind(found):
+                    continue
+                rest = [other for other in terms if other is not term]
+                at = found[1] + constant
+                placed = below(found[0], at)
+                if placed is not None:
+                    here, pointer_here, constant_here = (placed[0], 0), moved(term, at - placed[1] - found[1]), placed[1]
+                else:
+                    here, pointer_here, constant_here = found, term, constant
+                if any(True for _ in arrays_of(here[0], family_of(here))):
+                    hit = array_access(here, pointer_here, constant_here, rest, zeros, whole_records=False)
                     if hit is not None:
                         return hit
+                hit = nested_access(here, pointer_here, constant_here, rest)
+                if hit is not None:
+                    return hit
         if any(found is not None and (found[0] in STRUCTS or found[0] == "global") for found in kinds):
             return None    # (a field of a structure a register points at: the constant is its offset, no table)
         table = record_table(constant & ADDRESS_MASK)
+        if table is None and terms:
+            table = instance_record(constant & ADDRESS_MASK)
         if table is None:
             return None
         pointer, kind, constant = ir.Const(constant - table[1] & ADDRESS_MASK, 32), (table[0], 0), table[1]
