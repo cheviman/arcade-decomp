@@ -38,6 +38,7 @@ from . import cprint
 from . import dataflow
 from . import memory
 from . import pointers
+from . import signatures
 from . import structure
 from . import variables
 
@@ -170,6 +171,20 @@ def switch_index(value, keys, read32):
                 if all(numbers.values()):
                     return index, numbers
     return None
+
+
+# A jump through a table the original does not check the index of: the C's switch has the cases the table
+# holds and no default, as the original's own source would (an index past the table is a jump the game
+# never makes). A build for the checks (decompile.py --checks) has one, which stops the program with the
+# address the original would have jumped to.
+CHECKED_JUMPS = False
+
+
+def checked_default(pad, target):
+    """The lines of a switch's default for a jump past its table: none, or the check (CHECKED_JUMPS)."""
+    if not CHECKED_JUMPS:
+        return []
+    return [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({target});"]
 
 
 def largest_value(node):
@@ -552,7 +567,10 @@ class FunctionWriter:
                                          if name != register_name(register)},
                                         {key: name for key, name in self.chosen.items() if key[1][0] == "r"},
                                         self.really_reads, self.fresh_outputs, emitter.split_webs,
-                                        self.passes_only, self.reads_input)
+                                        self.passes_only, self.reads_input, self.scratch_context,
+                                        self.context_effects,
+                                        {index: emitter.context_name(index) for index in self.scratch_context},
+                                        self.returned_value)
         self.widths = self.vars.declarations()
         self.pointer_names = self.typed_bases()
         self.handled = self.handler_families()
@@ -562,18 +580,28 @@ class FunctionWriter:
 
     def typed_bases(self):
         """The C names of the variables the function reads fields through (the base of an access that is a
-        field of a structure): pointers, whatever else their webs hold."""
+        field of a structure), and of those any other memory access starts from (its address, or the
+        register it adds a number or an index to): pointers, whatever else their webs hold."""
         names = set()
         for block in self.function.blocks.values():
             for statement in block.statements + [block.end]:
                 addresses = [statement.address] if isinstance(statement, ir.Store) and id(statement) in self.fields \
                     else []
+                others = [statement.address] if isinstance(statement, ir.Store) and id(statement) not in self.fields \
+                    else []
                 for expression in ir.statement_expressions(statement):
                     addresses += [node.address for node in ir.walk(expression)
                                   if isinstance(node, ir.Load) and id(node) in self.fields]
+                    others += [node.address for node in ir.walk(expression)
+                               if isinstance(node, ir.Load) and id(node) not in self.fields]
                 for address in addresses:
                     for node in ir.walk(address):
                         if isinstance(node, ir.Reg):
+                            names.add(self.register_read(node)[0])
+                for address in others:
+                    base = address.args if isinstance(address, ir.Op) and address.name == "add" else (address,)
+                    for node in base:
+                        if isinstance(node, ir.Reg) and node.bits == cpu.current.address_bits:
                             names.add(self.register_read(node)[0])
         return names
 
@@ -689,6 +717,50 @@ class FunctionWriter:
         return families.pop() if len(families) == 1 else None
 
     # ---- registers: the variables of variables.py ----
+
+    @property
+    def scratch_context(self):
+        """The context registers the game uses as scratch (signatures.SCRATCH_CONTEXT): variables.py makes
+        locals of their webs that carry nothing between functions."""
+        return set(signatures.SCRATCH_CONTEXT) & set(self.emitter.context)
+
+    def context_effects(self, statement):
+        """(the scratch context registers a call or an effect reads, or may leave partly as they were; those
+        it may write), as the data flow has them: the callee's, a memory slot's code all of them, the
+        interrupt handlers' where an effect lets them in."""
+        scratch = self.scratch_context
+        flow = self.emitter.flow
+        if isinstance(statement, ir.Call):
+            reads, writes, always = flow.call_effect(statement)
+        elif isinstance(statement, ir.TailCall):
+            reads, writes, always = flow.combine([statement.target])
+        elif isinstance(statement, ir.Effect):
+            reads, writes, always = flow.effect(statement)
+        else:
+            return set(), set()
+        written = {variable[1] for variable in writes if variable[0] == "r" and variable[1] in scratch}
+        read = {variable[1] for variable in reads if variable[0] == "r" and variable[1] in scratch}
+        partly = {index for index in written if not dataflow.register_parts(index, dataflow.FULL) <= set(always)}
+        return read | partly, written
+
+    def returned_value(self, statement):
+        """{the register a call hands back as the value of the C function it calls (every function it may
+        call returns it so): the bits of that value}; empty for the rest (results through pointers, calls
+        through slots)."""
+        if not isinstance(statement, ir.Call) or statement.slot is not None:
+            return {}
+        targets = [statement.target & 0xFFFFFF] if statement.target is not None else list(statement.choices)
+        found, bits = None, 0
+        for target in targets:
+            target = self.emitter.resolve(target)[0]
+            if target not in self.emitter.signatures:
+                return {}
+            returned = self.emitter.returned(target)
+            if returned is None or returned[0] != "r" or found not in (None, returned[1]):
+                return {}
+            found = returned[1]
+            bits = max(bits, self.emitter.result_bits.get(target, register_bits(found)))
+        return {found: bits} if found is not None else {}
 
     def call_registers(self, statement):
         """(registers a call or tail call reads as arguments, registers it hands back) in C."""
@@ -832,27 +904,27 @@ class FunctionWriter:
         return set()
 
     def register_read(self, node):
-        if node.index in self.emitter.context:
+        if node.index in self.emitter.context and node.index not in self.scratch_context:
             return self.emitter.context_name(node.index), 32
         name = self.vars.use_name(node) or cpu.variable_name(node.index)
         return name, self.widths.get(name, 32)
 
     def register_value(self, index):
         """The variable a call or the end of the function reads for a register."""
-        if index in self.emitter.context:
+        if index in self.emitter.context and index not in self.scratch_context:
             return self.emitter.context_name(index)
         return self.vars.def_name(self.current, index) or self.vars.implicit_name(self.current, index) \
             or cpu.variable_name(index)
 
     def register_set(self, index):
         """The variable a statement writes for a register."""
-        if index in self.emitter.context:
+        if index in self.emitter.context and index not in self.scratch_context:
             return self.emitter.context_name(index)
         return self.vars.def_name(self.current, index) or cpu.variable_name(index)
 
     def implicit_value(self, index):
         """The variable a call reads as an argument (before the call writes anything)."""
-        if index in self.emitter.context:
+        if index in self.emitter.context and index not in self.scratch_context:
             return self.emitter.context_name(index)
         return self.vars.implicit_name(self.current, index) or cpu.variable_name(index)
 
@@ -1828,7 +1900,8 @@ class FunctionWriter:
         inner = value
         while isinstance(inner, ir.Op) and inner.name in ("zext", "fits", "trunc"):
             inner = inner.args[0]
-        if isinstance(inner, ir.Reg) and inner.index not in self.emitter.context:
+        if isinstance(inner, ir.Reg) and (inner.index not in self.emitter.context
+                                          or inner.index in self.scratch_context):
             width = self.widths.get(self.register_read(inner)[0], 32)
         elif isinstance(inner, ir.Load):
             width = inner.bits
@@ -2073,7 +2146,8 @@ class FunctionWriter:
                     addresses += [node.address for node in ir.walk(expression) if isinstance(node, ir.Load)]
                 for address in addresses:
                     for node in ir.walk(address):
-                        if isinstance(node, ir.Reg) and node.index not in self.emitter.context:
+                        if isinstance(node, ir.Reg) and (node.index not in self.emitter.context
+                                                         or node.index in self.scratch_context):
                             found.add(self.vars.use_name(node))
         found.discard(None)
         return found
@@ -2277,7 +2351,7 @@ class FunctionWriter:
             for choice in sorted(statement.choices, key=lambda choice: min(numbers[choice])):
                 lines += [f"case {number}:" for number in sorted(numbers[choice])]
                 lines += ["\t" + self.call_text(choice, statement.return_address), "\tbreak;"]
-            lines += ["default:", f"\t{cpu.current.invalid_jump}({self.expr(statement.address)});", "}"]
+            lines += checked_default("", self.expr(statement.address)) + ["}"]
             return lines
         offsets = offset_switch(statement.address, statement.choices)
         if offsets is not None:
@@ -2287,7 +2361,7 @@ class FunctionWriter:
             for choice in sorted(statement.choices, key=lambda choice: positions[choice]):
                 lines += [f"case 0x{positions[choice]:X}u:", "\t" + self.call_text(choice, statement.return_address),
                           "\tbreak;"]
-            lines += ["default:", f"\t{cpu.current.invalid_jump}({self.expr(statement.address)});", "}"]
+            lines += checked_default("", self.expr(statement.address)) + ["}"]
             return lines
         target = self.expr(statement.address)
         lines = [f"switch ({target})", "{"]
@@ -2298,7 +2372,7 @@ class FunctionWriter:
             lines = [f"{target} = {value};", f"switch ({target})", "{"]
         for choice in statement.choices:
             lines += [f"case 0x{choice:06X}u:", "\t" + self.call_text(choice, statement.return_address), "\tbreak;"]
-        lines += ["default:", f"\t{cpu.current.invalid_jump}({target});", "}"]
+        lines += checked_default("", target) + ["}"]
         return lines
 
     def ending(self, end):
@@ -2420,7 +2494,7 @@ class FunctionWriter:
                 covered = {n for found in numbers.values() for n in found}
                 largest = largest_value(index)
                 if largest is None or largest >= len(covered) or not all(n in covered for n in range(largest + 1)):
-                    lines += [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({self.expr(node.value)});"]
+                    lines += checked_default(pad, self.expr(node.value))
                 return lines + [pad + "}"]
             offsets = offset_switch(node.value, [value for values, _ in node.cases for value in values])
             if offsets is not None:
@@ -2429,7 +2503,7 @@ class FunctionWriter:
                 for values, body in node.cases:
                     lines += [pad + f"case 0x{positions[value]:X}u:" for value in values]
                     lines += self.nodes(body, depth + 1)
-                lines += [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({self.expr(node.value)});", pad + "}"]
+                lines += checked_default(pad, self.expr(node.value)) + [pad + "}"]
                 return lines
             target = self.expr(node.value)
             lines = []
@@ -2442,7 +2516,7 @@ class FunctionWriter:
             for values, body in node.cases:
                 lines += [pad + f"case 0x{value:06X}u:" for value in values]
                 lines += self.nodes(body, depth + 1)
-            lines += [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({target});", pad + "}"]
+            lines += checked_default(pad, target) + [pad + "}"]
             return lines
         raise EmitError(f"{self.function.name}: tree node {node!r}")
 
@@ -2531,6 +2605,7 @@ class FunctionWriter:
             lines.append("bool " + ", ".join(f"{name} = false" for name in sorted(self.controls.values())) + ";")
         flags = ordered(value for value in self.used if value[0] == "f" and value not in params
                         and value not in self.results and value_name(value) in words)
+        declared |= {self.emitter.context_name(index) for index in self.emitter.context}    # (globals)
         if flags:
             lines.append("uint32_t " + ", ".join(f"{value_name(value)} = 0" for value in flags) + ";")
         for bits in (8, 16, 32):
@@ -2558,6 +2633,7 @@ class Emitter:
         self.read32 = read32    # reads the program ROM (switch tables)
         self.register_names = {}    # context register -> its name (symbols.txt)
         self.param_widths = {}      # entry -> {register: width of the parameter} (FunctionWriter)
+        self.result_bits = {}       # entry -> bits of the register it returns, where narrower (cleanup.RESULT_BITS)
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
         self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
@@ -2893,7 +2969,8 @@ class Emitter:
             width = register_bits(value[1]) if value[0] == "r" else 32
             params.append(f"{cprint.UNSIGNED[width]} *p_{self.param_name(entry, value)}")
         returned = self.returned(entry)
-        kind = "void" if returned is None else cprint.UNSIGNED[register_bits(returned[1]) if returned[0] == "r" else 32]
+        kind = "void" if returned is None \
+            else cprint.UNSIGNED[self.result_bits.get(entry, register_bits(returned[1])) if returned[0] == "r" else 32]
         return f"{kind} {self.names[entry]}({', '.join(params) if params else 'void'})"
 
     def definition(self, entry):

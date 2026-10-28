@@ -4,7 +4,7 @@ Description: splits each register of a function into the variables it really hol
              definitions and uses), each with the width its uses need
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    20-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 Hand-written assembly reuses a register for one thing after another. A definition (an assignment, a call
@@ -33,7 +33,12 @@ expressions, as a parameter of a call, or as its result) is instead a variable o
 holds the screen y, then whether the object went off screen, then a sound, and each is a variable
 (r5, r5_2...) that a "local" line can name by the instructions that write it.
 
-The context registers are global variables and stay as they are. A web the caller can say more about
+The context registers are global variables and stay as they are, but for the ones the game uses as scratch
+(signatures.SCRATCH_CONTEXT: R12, R14). Their webs are made like any register's, and only the webs that
+carry a value between functions are the global variable: the one with what the register held when the
+function started, the ones a call (or an interrupt) leaves in it, and the ones that reach code that reads
+it: a call, or the function's end (the code that runs next may read it). The rest, which the function
+works out and uses up itself, are locals. A web the caller can say more about
 (hint: what its values are, an object the code reads fields through, a field it was read from, the
 parameter it is passed as) is named for it, with a number when the name repeats: object, object_2,
 kind; webs with the same name and width share a variable. symbols.txt can name any of them ("local" lines): by the address of an instruction that writes it,
@@ -81,9 +86,19 @@ class Variables:
 
     def __init__(self, function, context, call_info, end_reads, entry_registers, after, live_in, hint=None,
                  entry_names=None, chosen=None, really_reads=None, fresh=None, split=False, passes_only=None,
-                 reads_input=None):
+                 reads_input=None, scratch_context=None, context_effects=None, context_names=None,
+                 returned_value=None):
         self.function = function
         self.context = set(context)
+        # the context registers used as scratch (see the module's notes); statement -> (those it reads, or may
+        # leave partly as they were, those it may write), for calls and effects; the global variables' names
+        self.scratch_context = set(scratch_context or ())
+        self.context_effects = context_effects or (lambda statement: (set(), set()))
+        self.context_names = context_names or {}
+        # call -> {register it hands back as the value the C function returns (not through a pointer): the
+        # bits of that value}
+        self.returned_value = returned_value or (lambda statement: {})
+        self.returned_bits = {}    # definition -> the bits of the value a call returns into it
         self.call_info = call_info
         self.end_reads = end_reads
         self.entry_registers = entry_registers    # parameters and results: defined when the function starts
@@ -113,24 +128,31 @@ class Variables:
     # ---- definitions and uses of one statement ----
 
     def scratch(self, index):
-        return cpu.kept(index) and index not in self.context
+        return cpu.kept(index) and (index not in self.context or index in self.scratch_context)
 
     def statement_defs(self, statement):
         """Registers a statement defines."""
         if isinstance(statement, ir.SetReg):
             return [statement.index] if self.scratch(statement.index) else []
         if isinstance(statement, (ir.Call, ir.TailCall)):
-            return [index for index in self.call_info(statement)[1] if self.scratch(index)]
+            found = [index for index in self.call_info(statement)[1] if self.scratch(index)]
+            return found + sorted(self.context_effects(statement)[1] - set(found))
         if isinstance(statement, ir.Effect):
-            if statement.name in ("move_string", "move_bits_down", "move_bits_up", "search_bytes"):
-                return [index for index in (27, 28) if self.scratch(index)]
-            if statement.name == "search_bits_up":
-                return [index for index in (statement.args[4].value, 28) if self.scratch(index)]
-            if statement.name == "refresh_read":
-                return [statement.args[1].value] if self.scratch(statement.args[1].value) else []
-            if statement.name in ("divx", "divux") and isinstance(statement.args[1], ir.Const):
-                low = statement.args[1].value
-                return [index for index in (low, low + 1) if self.scratch(index)]
+            found = self.effect_defs(statement)
+            # (and what an interrupt that may run there leaves in the scratch context registers)
+            return found + sorted(self.context_effects(statement)[1] - set(found))
+        return []
+
+    def effect_defs(self, statement):
+        if statement.name in ("move_string", "move_bits_down", "move_bits_up", "search_bytes"):
+            return [index for index in (27, 28) if self.scratch(index)]
+        if statement.name == "search_bits_up":
+            return [index for index in (statement.args[4].value, 28) if self.scratch(index)]
+        if statement.name == "refresh_read":
+            return [statement.args[1].value] if self.scratch(statement.args[1].value) else []
+        if statement.name in ("divx", "divux") and isinstance(statement.args[1], ir.Const):
+            low = statement.args[1].value
+            return [index for index in (low, low + 1) if self.scratch(index)]
         return []
 
     def implicit_uses(self, statement):
@@ -139,20 +161,28 @@ class Variables:
             arguments, handed_back = self.call_info(statement)
             # a result is copied in by the callee: the caller's value is read too, unless the callee always
             # writes all of it first, or what it may leave as it was is nothing the caller reads afterwards
-            return [index for index in set(arguments) | (set(handed_back) - self.new_values(statement))
-                    if self.scratch(index)]
-        if isinstance(statement, ir.Effect) and statement.name in ("divx", "divux") \
-                and isinstance(statement.args[1], ir.Const):
-            low = statement.args[1].value
-            return [index for index in (low, low + 1) if self.scratch(index)]
-        if isinstance(statement, ir.Effect) and statement.name == "move_string" \
-                and not (isinstance(statement.args[5], ir.Const) and not statement.args[5].value):
-            return [26] if self.scratch(26) else []    # (the fill, R26, where the move fills)
+            found = {index for index in set(arguments) | (set(handed_back) - self.new_values(statement))
+                     if self.scratch(index)}
+            return sorted(found | self.context_effects(statement)[0])
+        if isinstance(statement, ir.Effect):
+            found = self.effect_uses(statement)
+            # (and the scratch context registers an interrupt that may run there reads)
+            return found + sorted(self.context_effects(statement)[0] - set(found))
         if isinstance(statement, (ir.Return, ir.TailCall, ir.InterruptReturn)):
             reads = set(self.end_reads(statement))
             if isinstance(statement, ir.TailCall):
                 reads -= self.new_values(statement)    # the function it goes on in writes them, whatever they held
-            return [index for index in reads if self.scratch(index)]
+            # (and the code that runs next may read the scratch context registers)
+            return sorted({index for index in reads if self.scratch(index)} | self.scratch_context)
+        return []
+
+    def effect_uses(self, statement):
+        if statement.name in ("divx", "divux") and isinstance(statement.args[1], ir.Const):
+            low = statement.args[1].value
+            return [index for index in (low, low + 1) if self.scratch(index)]
+        if statement.name == "move_string" \
+                and not (isinstance(statement.args[5], ir.Const) and not statement.args[5].value):
+            return [26] if self.scratch(26) else []    # (the fill, R26, where the move fills)
         return []
 
     def new_values(self, statement):
@@ -188,7 +218,10 @@ class Variables:
                         if isinstance(node, ir.Reg) and node.index == index:
                             for previous in self.uses.get(id(node), ()):
                                 self.webs.join(previous, definition)
-                if not isinstance(statement, ir.SetReg):
+                returned = self.returned_value(statement) if not isinstance(statement, ir.SetReg) else {}
+                if index in returned:
+                    self.returned_bits[definition] = returned[index]
+                elif not isinstance(statement, ir.SetReg):
                     self.through_pointer.add(definition)
                 if isinstance(statement, (ir.Call, ir.TailCall)) and index in self.call_info(statement)[1] \
                         or (isinstance(statement, ir.Effect) and statement.name in ("divx", "divux")):
@@ -242,7 +275,22 @@ class Variables:
         for index in registers:
             self.webs.find(("entry", index))
         self.read = self.read_definitions()
+        self.global_roots = self.crossing_webs()
         self.name_webs()
+
+    def crossing_webs(self):
+        """The roots of the scratch context registers' webs that carry a value between functions: the global
+        variable's (see the module's notes)."""
+        found = set()
+        for index in self.scratch_context & self.registers:
+            found.add(self.webs.find(("entry", index)))
+        for (statement_id, index), definition in self.defined.items():
+            if index in self.scratch_context and not isinstance(self.statement_of(statement_id), ir.SetReg):
+                found.add(self.webs.find(definition))
+        for (statement_id, index), definitions in self.implicit.items():
+            if index in self.scratch_context:
+                found |= {self.webs.find(definition) for definition in definitions}
+        return found
 
     def read_definitions(self):
         """The definitions something reads: an expression of the function, a call that takes the register
@@ -276,7 +324,15 @@ class Variables:
             if root not in used_roots:
                 continue    # nothing reads it (a result the function always writes before it reads it)
             register = root[2] if root[0] == "def" else root[1]
+            if root in self.global_roots:
+                # (a scratch context register's web that carries a value between functions: the global
+                # variable, whole)
+                self.names[root] = self.context_names.get(register, cpu.variable_name(register))
+                self.widths[root] = 32
+                continue
             by_register.setdefault(register, []).append((root, items))
+        for register in sorted(self.scratch_context):
+            self.unused(self.context_names.get(register, cpu.variable_name(register)))    # (no local's name)
         # the parameters' names first: the prototype has them as they are
         for register in sorted(by_register):
             if register in self.entry_registers and register in self.entry_names:
@@ -430,10 +486,16 @@ class Variables:
 
     def width(self, register, items):
         """Bits of the web anyone reads: 8, 16 or 32, at most the register's own. A variable a call or an
-        effect writes (through a pointer, or as a return value) keeps the whole register."""
+        effect writes through a pointer keeps the whole register, and one a call returns a value into is
+        as wide as that value (the C assigns it as it is)."""
         whole = cpu.current.register_bits.get(register, 32)
         if any(item in self.through_pointer for item in items):
             return whole
+        returned = max((self.returned_bits.get(item, 8) for item in items), default=8)
+        return max(returned, self.live_width(register, items, whole))
+
+    def live_width(self, register, items, whole):
+        """width()'s bits that anyone reads."""
         parts = set()
         for item in items:
             if item[0] == "entry":

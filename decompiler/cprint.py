@@ -61,6 +61,40 @@ def part_read(text):
 
 
 
+
+def bitwise_merge(node):
+    """(x & ~M) | low, where low is x's low part (the bits M) worked out with |, & or ^ at that width: the same
+    operation on all of x (x | (y & M), x & (y | ~M), x ^ (y & M)); None for anything else."""
+    if not (isinstance(node, ir.Op) and node.name == "or" and node.bits <= 64):
+        return None
+    bits = node.bits
+    full = (1 << bits) - 1
+    for keep, low in ((node.args[0], node.args[1]), (node.args[1], node.args[0])):
+        if not (isinstance(keep, ir.Op) and keep.name == "and" and isinstance(keep.args[1], ir.Const)):
+            continue
+        operation = low.args[0] if isinstance(low, ir.Op) and low.name == "zext" else None
+        if not (isinstance(operation, ir.Op) and operation.name in ("or", "and", "xor")):
+            continue
+        low_mask = (1 << operation.bits) - 1
+        if keep.args[1].value != full & ~low_mask:
+            continue
+        whole = keep.args[0]
+        narrow = ir.trunc(whole, operation.bits)
+        if narrow not in operation.args:
+            continue
+        other = operation.args[1] if operation.args[0] == narrow else operation.args[0]
+        if isinstance(other, ir.Const):
+            # a number: the bits it sets or keeps, folded (mixer_bits | 4u, x & 0xFFFFFFF0u)
+            value = other.value & low_mask
+            return ir.op(operation.name, (whole, ir.Const(value | (full & ~low_mask) if operation.name == "and"
+                                                         else value, bits)), bits)
+        other = ir.zext(other, bits)
+        if operation.name == "and":
+            other = ir.op("or", (other, ir.Const(full & ~low_mask, bits)), bits)
+        return ir.op(operation.name, (whole, other), bits)
+    return None
+
+
 def fits16(node):
     """True if 'node' holds no more than 16 bits: a halfword read, a value cut or widened from 16 bits or
     fewer, a mask of them, a small number."""
@@ -370,6 +404,11 @@ class Printer:
             # a list): LINKED(base, link) in game/support.h
             base = self.any(left_node.args[0])
             return Value(f"LINKED({base.text}, {self.any(right_node).text})", PRIMARY, True, "u32")
+        merged = bitwise_merge(node)
+        if merged is not None:
+            # (x & ~0xFFu) | (uint8_t)(x | y) is x | (y & 0xFFu): what the original does to the low byte
+            # alone, said of the whole (bitwise operations carry nothing from one bit to another)
+            return self.any(merged)
         if name == "or" and bits == 32 and ir.Const(0x200000, 32) in (left_node, right_node):
             link = right_node if left_node == ir.Const(0x200000, 32) else left_node
             while isinstance(link, ir.Op) and link.name in ("zext", "fits"):

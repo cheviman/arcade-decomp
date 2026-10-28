@@ -4,7 +4,7 @@ Description: makes the statements of a function read as expressions: temporaries
              uses them, constants fold, and register writes that keep bits nobody reads write the value
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    20-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 The lifter binds every value an instruction reads or computes to a temporary, in the order MAME's core
@@ -15,6 +15,10 @@ Cheap values (a constant, a register, a stack slot, a part of one) can be copied
 
 "mov.b X, R2" keeps bits 8-31 of R2: R2 = (R2 & 0xFFFFFF00) | X. When nothing reads those bits before
 they are written again, it is just R2 = X.
+
+A part put back into the register it was copied from, the register unchanged since (the Z80's E taken
+out of DE after a call and put back before the next one: DE = (DE & 0xFF00) | E), leaves the register
+as it was: the write goes (drop_repacks), and the copy with it when nothing else reads it.
 """
 from v60 import ir
 
@@ -376,6 +380,96 @@ def tidy(function, flow, after, whole=()):
     sink_increments(function)
     inline_temporaries(function, flow)
     simplify_function(function)
+
+
+# ---- a part put back where it came from ----
+
+def copy_of_part(value):
+    """(register, shift, bits) when 'value' is a part of a register: its low byte or halfword (shift 0),
+    or the byte above its low one (shift 8); None for anything else."""
+    if not (isinstance(value, ir.Op) and value.name == "trunc"):
+        return None
+    inner = value.args[0]
+    if isinstance(inner, ir.Reg):
+        return inner.index, 0, value.bits
+    if isinstance(inner, ir.Op) and inner.name == "shr" and isinstance(inner.args[0], ir.Reg) \
+            and isinstance(inner.args[1], ir.Const) and inner.args[1].value == 8 and value.bits == 8:
+        return inner.args[0].index, 8, 8
+    return None
+
+
+def repack(statement, copies):
+    """True if 'statement' writes into a register a part of it that 'copies' says another register holds,
+    the register unchanged since the copy: r = (r & ~M) | copy leaves r as it was."""
+    if not (isinstance(statement, ir.SetReg) and isinstance(statement.value, ir.Op)
+            and statement.value.name == "or"):
+        return False
+    bits = statement.value.bits
+    for keep, part in (statement.value.args, statement.value.args[::-1]):
+        if not (isinstance(keep, ir.Op) and keep.name == "and" and isinstance(keep.args[1], ir.Const)
+                and isinstance(keep.args[0], ir.Reg) and keep.args[0].index == statement.index):
+            continue
+        shift = 0
+        if isinstance(part, ir.Op) and part.name == "shl" and isinstance(part.args[1], ir.Const):
+            shift, part = part.args[1].value, part.args[0]
+        if not (isinstance(part, ir.Op) and part.name == "zext" and isinstance(part.args[0], ir.Reg)):
+            continue
+        copy = part.args[0]
+        if copies.get(copy.index) == (statement.index, shift, copy.bits) \
+                and keep.args[1].value == mask_of(bits) & ~(mask_of(copy.bits) << shift):
+            return True
+    return False
+
+
+def drop_repacks(function, flow):
+    """Takes out the writes that put a part back into the register it was copied from (see the module's
+    notes); returns how many went. Which register holds a copy of which part is followed forwards, on
+    every way into a block."""
+    blocks = function.blocks
+
+    def step(statement, copies):
+        if repack(statement, copies):
+            return copies
+        written = set()
+        if isinstance(statement, ir.SetReg):
+            written.add(statement.index)
+        elif isinstance(statement, (ir.Call, ir.Effect)):
+            written |= {variable[1] for variable in flow.statement_writes(statement) if variable[0] == "r"}
+        if written:
+            copies = {copy: source for copy, source in copies.items()
+                      if copy not in written and source[0] not in written}
+        if isinstance(statement, ir.SetReg):
+            found = copy_of_part(statement.value)
+            if found is not None and found[0] != statement.index:
+                copies = dict(copies)
+                copies[statement.index] = found
+        return copies
+
+    start = {function.entry: {}}
+    pending = [function.entry]
+    while pending:
+        label = pending.pop()
+        copies = start[label]
+        for statement in blocks[label].statements:
+            copies = step(statement, copies)
+        for successor in blocks[label].successors():
+            old = start.get(successor)
+            new = dict(copies) if old is None else {copy: source for copy, source in old.items()
+                                                    if copies.get(copy) == source}
+            if old is None or new != old:
+                start[successor] = new
+                pending.append(successor)
+    removed = 0
+    for label, copies in start.items():
+        kept = []
+        for statement in blocks[label].statements:
+            if repack(statement, copies):
+                removed += 1
+                continue
+            copies = step(statement, copies)
+            kept.append(statement)
+        blocks[label].statements = kept
+    return removed
 
 
 # ---- registers into their one use ----

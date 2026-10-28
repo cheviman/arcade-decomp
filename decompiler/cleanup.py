@@ -4,7 +4,7 @@ Description: removes the statements whose results nothing reads (flags no branch
              before use), once every function's signature is known
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    13-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 Liveness runs backwards over each function with the data flow's own rules (demanded bits, what calls
@@ -27,6 +27,10 @@ from . import cpu
 
 from . import dataflow
 from . import signatures
+
+# function -> the bits of the register it returns that its callers read (decompile.py's result_widths): the C
+# returns that much, so only those bits are live where it ends
+RESULT_BITS = {}
 
 # address >> 20 of the areas where a read has no side effect
 PLAIN_MEMORY = {0x0, 0x1, 0x2, 0x3, 0x4, 0x6, 0x7, 0xF}
@@ -168,13 +172,16 @@ def eliminate(flow, function, results, context, arguments=None):
     """Removes the dead statements of 'function' in place. 'results' are its C results, 'context' the
     registers that are global variables, 'arguments' {callee: the registers it takes by value} (see the
     module's notes). Returns {id(statement): variables live after it} for the statements that stay, and
-    the variables live at the start. Where it ends, a result it returns is live whole: the caller takes
-    the whole variable, even where the original only wrote part of the register and the caller's other
-    bits go through it ("and.b #FF, R0"). Results it hands back through pointers are copied back only in
-    the parts the function may write (emit.py), so only those are live."""
+    the variables live at the start. Where it ends, a result it returns is live as wide as the C returns
+    it (RESULT_BITS, else whole): the caller takes the whole variable, even where the original only wrote
+    part of the register and the caller's other bits go through it ("and.b #FF, R0"). Results it hands
+    back through pointers are copied back only in the parts the function may write (emit.py), so only
+    those are live."""
     if len(results) > 1:
         written = flow.summaries[function.entry].writes
         exit_live = {variable for variable in written if (variable[0], variable[1]) in set(results)}
+    elif function.entry in RESULT_BITS and next(iter(results))[0] == "r":
+        exit_live = dataflow.register_parts(next(iter(results))[1], ir.MASKS[RESULT_BITS[function.entry]])
     else:
         exit_live = variables_of(results)
     exit_live |= context_live(flow, function.entry, context)

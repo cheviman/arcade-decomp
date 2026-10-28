@@ -3,12 +3,14 @@ Name:        decompile_sound.py
 Description: decompiles the Z80 sound program into readable C, one C function per original function
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    21-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
-Usage: python tools/decompile_sound.py [--check] [--out DIR] [--timing FILE]
+Usage: python tools/decompile_sound.py [--check] [--checks] [--out DIR] [--timing FILE]
   --check     build every function's IR and report what does not lift and what the analysis finds,
               without writing anything
+  --checks    a jump through a table with an index the table does not have stops the program
+              (sound_invalid_jump), as decompile.py --checks does
   --out       where to write the C (src/sound/ by default)
   --timing    where to write the blocks of the timing model for system32/reference/s32ref (--sound-timing;
               build/sound/timing.txt by default)
@@ -252,6 +254,7 @@ def write_c(program, out_dir, variables_path=None):
     live_after = {}
     live_at_start = {}
     for entry, function in built.items():
+        expressions.drop_repacks(function, flow)
         after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
         expressions.tidy(function, flow, after, whole)
         results_of_calls = call_results(function, found, flow)
@@ -517,6 +520,8 @@ def main():
         position = arguments.index("--variables")
         variables_path = Path(arguments[position + 1])
         del arguments[position:position + 2]
+    from decompiler import emit as decompiler_emit
+    decompiler_emit.CHECKED_JUMPS = "--checks" in arguments
     timing_path = ROOT / "build" / "sound" / "timing.txt"
     if "--timing" in arguments:
         position = arguments.index("--timing")

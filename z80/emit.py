@@ -17,6 +17,7 @@ its bus by name (game_profile.SOUND_HARDWARE). A computed address no structure e
 (runtime/include/sound/support.h). The timing model's Effects (z80_block, z80_cycles), DI and EI, OUT and
 the block moves print as calls of that header, the ports by the names sound_symbols.txt gives them.
 """
+from decompiler import cprint
 from decompiler import emit
 from v60 import ir
 
@@ -88,13 +89,35 @@ class SoundNames(emit.Names):
         if found is not None:
             return found
         # a computed address: over the board's bus
-        return f"z80_read{load.bits}({self.writer.exact(load.address)})", False
+        return f"z80_read{load.bits}({self.writer.address(load.address)})", False
+
+
+def fits8(node):
+    """True if 'node' holds no more than 8 bits: a byte, a value cut or widened from one, a small number."""
+    if isinstance(node, ir.Const):
+        return node.value <= 0xFF
+    if isinstance(node, ir.Op) and node.name in ("zext", "fits"):
+        return getattr(node.args[0], "bits", 16) <= 8
+    return getattr(node, "bits", 16) <= 8
 
 
 class SoundPrinter(emit.Printer):
     def __init__(self, writer):
         super().__init__(writer)
         self.names = SoundNames(writer)
+        self.addressing = False    # printing the address of a memory access (SoundWriter.address)
+
+    def bitwise(self, node):
+        name, args, bits = node.name, node.args, node.bits
+        if name == "or" and bits == 16:
+            for keep, low in (args, args[::-1]):
+                if isinstance(keep, ir.Op) and keep.name == "and" and keep.args[1] == ir.Const(0xFF00, 16) \
+                        and fits8(low) and (self.addressing or self.names.pointer(keep.args[0])):
+                    # a pointer moved to another place of its 256-byte page (the MIDI queue's next byte,
+                    # a field of the page's sequence player): IN_PAGE(pointer, low) in sound/support.h
+                    return cprint.Value(f"IN_PAGE({self.any(keep.args[0]).text}, {self.any(low).text})",
+                                        cprint.PRIMARY, True, "int")
+        return super().bitwise(node)
 
 
 class SoundWriter(emit.FunctionWriter):
@@ -109,8 +132,16 @@ class SoundWriter(emit.FunctionWriter):
                 return [self.assignment(target[0], statement, target[1])]
             if target is not None:
                 raise emit.EmitError(f"{self.function.name}: writes the program ROM")
-            return [f"z80_write{statement.bits}({self.exact(statement.address)}, {self.stored(statement.value, statement.bits)});"]
+            return [f"z80_write{statement.bits}({self.address(statement.address)}, {self.stored(statement.value, statement.bits)});"]
         return super().statement(statement)
+
+    def address(self, node):
+        """C for the address of a memory access over the bus (a pointer: SoundPrinter.bitwise)."""
+        self.printer.addressing = True
+        try:
+            return self.exact(node)
+        finally:
+            self.printer.addressing = False
 
     def port(self, node):
         name = self.emitter.ports.get(node.value) if isinstance(node, ir.Const) else None

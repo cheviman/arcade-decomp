@@ -6,10 +6,13 @@ Created:     11-10-2026
 Modified:    27-10-2026
 Author:      Sebastian Toyos
 
-Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--out DIR] [--symbols FILE]
+Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--checks] [--out DIR] [--symbols FILE]
                                  [--variables FILE] [--split-webs] [--fields FILE]
   --check     build every function's IR and report what does not lift, without writing anything
   --trace     every function and block reports itself when it runs (game_trace in runtime/src/game.c)
+  --checks    a jump through a table with an index the table does not have stops the program
+              (invalid_jump): a build for the checks; the game's own C has no such default, as the original
+              does not check
   --out       where to write the C (src/ by default, the game's source; CMake reads ORUNNERS_DECOMPILED_DIR)
   --symbols   the names to use instead of symbols.txt
   --variables also list every function's local variables and the instructions that write them, in the
@@ -584,6 +587,41 @@ def code_table(program, flow):
     return sorted(address for address in addresses if address in flow.functions)
 
 
+def result_widths(built, found, flow, closed):
+    """{function: 8 or 16} for the functions that return one register of which no caller reads more after
+    the call (a tail call: what its own callers read, when it returns the same register; else all of it):
+    the C returns that much (cleanup.RESULT_BITS). The ones in 'closed' (calls through memory slots, a second
+    way in, nothing calling them) return all of it."""
+    returned = {}
+    for entry, signature in found.items():
+        values = list(signature.results)
+        if len(values) == 1 and values[0][0] == "r" and entry not in closed:
+            returned[entry] = values[0][1]
+    read = {entry: set() for entry in returned}
+    tails = {}
+    for caller, function in built.items():
+        for call, after in flow.live_after_calls(caller):
+            if call.slot is not None:
+                continue
+            for target in flow.call_targets(call):
+                if target in read:
+                    read[target] |= {variable[2] for variable in after
+                                     if variable[0] == "r" and variable[1] == returned[target]}
+        for block in function.blocks.values():
+            if isinstance(block.end, ir.TailCall) and block.end.target in read:
+                tails.setdefault(block.end.target, set()).add(caller)
+    changed = True
+    while changed:
+        changed = False
+        for target, callers in tails.items():
+            for caller in callers:
+                more = read[caller] if returned.get(caller) == returned[target] else {0, 1, 2}
+                if not more <= read[target]:
+                    read[target] |= more
+                    changed = True
+    return {entry: 8 if parts <= {0} else 16 for entry, parts in read.items() if parts and 2 not in parts}
+
+
 def trampolines(built):
     """Functions that only jump to another one (the "br" entries of jump tables) -> (that function, the
     way into it)."""
@@ -677,9 +715,13 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             registers.add(returned[1])
         arguments[entry] = registers
     whole = set(signatures.CONTEXT) - set(signatures.SCRATCH_CONTEXT)    # global variables in C
+    # of the functions the C has every call of (knownbits.across, result_widths)
+    closed = set(code_table(program, flow)) | set(signatures.OPEN) | set(program.second_entries) | {RESET_ADDRESS}
+    cleanup.RESULT_BITS = result_widths(built, found, flow, closed)
     live_after = {}
     live_at_start = {}
     for entry, function in built.items():
+        expressions.drop_repacks(function, flow)
         after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
         expressions.tidy(function, flow, after, whole)
         results_of_calls = call_results(function, found, flow)
@@ -691,10 +733,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         if expressions.switch_values(function, flow):
             after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
             expressions.tidy(function, flow, after, whole)
-        knownbits.simplify(function, found[entry], signatures.CONTEXT, results_of_calls)
-        expressions.simplify_function(function)
         live_after[entry] = after
         live_at_start[entry] = start
+    # the bits known zero, with what every call passes and every way back hands back (knownbits.across):
+    # of the functions the C has every call of
+    results_of_calls = {entry: call_results(function, found, flow) for entry, function in built.items()}
+    passed, handed = knownbits.across(built, found, signatures.CONTEXT, results_of_calls, closed)
+    for entry, function in built.items():
+        knownbits.simplify(function, found[entry], signatures.CONTEXT, results_of_calls[entry], passed.get(entry),
+                           handed)
+        expressions.simplify_function(function)
     known = disassemble.load_names(SYMBOLS)
     # the variables, tables and registers are macros: a field by the same name would be taken for one of them
     macros = {name for name, _ in list(known.variables.values()) + list(known.tables.values())
@@ -783,6 +831,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in table
                               if address >= 0x1000 and address in names}
     emitter.flow = flow
+    emitter.result_bits = dict(cleanup.RESULT_BITS)
     emitter.split_webs = split_webs
     emitter.trampolines = trampolines(built)
     emitter.data_labels = {address: name for address, name in data_names.items()
@@ -981,6 +1030,7 @@ def main():
     arguments = sys.argv[1:]
     checking = "--check" in arguments
     tracing = "--trace" in arguments
+    emit.CHECKED_JUMPS = "--checks" in arguments
     global SYMBOLS
     out_dir = ROOT / "src"
     if "--out" in arguments:
@@ -1002,7 +1052,8 @@ def main():
         position = arguments.index("--fields")
         fields_path = Path(arguments[position + 1])
         del arguments[position:position + 2]
-    arguments = [argument for argument in arguments if argument not in ("--check", "--trace", "--split-webs")]
+    arguments = [argument for argument in arguments
+                 if argument not in ("--check", "--trace", "--checks", "--split-webs")]
     program = load_program(Path(arguments[0]) if arguments else ROOT / "rom")
     if checking:
         return check(program)

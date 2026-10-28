@@ -4,7 +4,7 @@ Description: follows which bits of each variable are known to be zero, and simpl
              pointless: masks that clear nothing, casts that cut nothing
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    20-10-2026
+Modified:    27-10-2026
 Author:      Sebastian Toyos
 
 "mov.b [R18], R0" loads a byte into R0: in C, r0 = mem_read8(...), and bits 8-31 of r0 are zero from
@@ -12,6 +12,13 @@ then on. So a later "(r0 & 0xFFFF0000u) | x" is x, and "(uint16_t)r0" is r0. Thi
 emit.py writes it, after everything else: variables start at 0, a call changes only the results it
 hands back (and the global context registers), and where paths meet a bit is known zero only if it is
 on every path.
+
+Across calls (across): a parameter has the bits every call of the function passes as zero, when the C
+has all its calls (no memory slot, task or interrupt reaches it, nor a second way in), and a call hands
+back the bits every way back of the function leaves zero in that result. Both are worked out again until
+nothing changes, from nothing known: each round's are true of the C, and the next one only adds to them.
+"add.b #1F, R0" on a stage number every caller passes as a byte is then a byte's sum, not a partial
+write of R0.
 
 A cast that cuts nothing becomes Op("fits", (value,), bits): the value, already within that width.
 The index of a table read ("base + r0 * 2") known to fit in 16 bits says so the same way,
@@ -39,11 +46,25 @@ def highest(value):
 
 
 class KnownBits:
-    def __init__(self, function, results, context, call_results):
+    def __init__(self, function, results, context, call_results, passed=None, handed=None):
         self.function = function
         self.results = {value[1] for value in results if value[0] == "r"}
         self.context = set(context)
         self.call_results = call_results    # call statement -> registers it hands back
+        self.passed = passed or {}          # parameter register -> bits every call passes as zero (across)
+        self.handed = handed or {}          # function -> {result register: bits every way back leaves zero}
+        self.observe = None                 # (statement, state) at each call and block end (across)
+        self.params = set()
+
+    def handed_back(self, call, index):
+        """Bits known zero in a result 'call' hands back: those every function it may call leaves zero."""
+        targets = call_targets(call)
+        if not targets:
+            return 0
+        found = FULL
+        for target in targets:
+            found &= self.handed.get(target, {}).get(index, 0)
+        return found
 
     # ---- one expression ----
 
@@ -160,7 +181,7 @@ class KnownBits:
             state[statement.index] = self.zero(statement.value, state, temps)
         elif isinstance(statement, ir.Call):
             for index in self.call_results.get(id(statement), ()):
-                state[index] = 0
+                state[index] = self.handed_back(statement, index)
             for index in self.context:
                 state[index] = 0
         elif isinstance(statement, ir.Effect):
@@ -180,7 +201,7 @@ class KnownBits:
                 state[index] = 0
         return state
 
-    def run(self):
+    def run(self, rewrite=True):
         blocks = self.function.blocks
         entry = self.function.entry
         start = {entry: self.entry_state()}
@@ -206,18 +227,80 @@ class KnownBits:
             temps = {}
             block = blocks[label]
             for statement in block.statements:
-                self.step(statement, state, temps, True)
-            ir.map_statement(block.end, self.changer(state, temps))
+                if self.observe is not None and isinstance(statement, ir.Call):
+                    self.observe(statement, state)
+                self.step(statement, state, temps, rewrite)
+            if self.observe is not None:
+                self.observe(block.end, state)
+            if rewrite:
+                ir.map_statement(block.end, self.changer(state, temps))
 
     def entry_state(self):
         """Every local starts at 0 (all bits known zero); parameters, results and globals are unknown."""
         state = {index: FULL for index in cpu.current.registers}
         for index in self.results | self.context | self.params:
             state[index] = 0
+        for index in self.params - self.context:
+            state[index] = self.passed.get(index, 0)
         return state
 
 
-def simplify(function, signature, context, call_results):
-    analysis = KnownBits(function, signature.results, context, call_results)
+def call_targets(statement):
+    """The functions a call or tail call may go to; none for a call through a memory slot."""
+    if isinstance(statement, ir.TailCall):
+        return [statement.target]
+    if statement.slot is not None:
+        return []
+    if statement.target is not None:
+        return [statement.target & 0xFFFFFF]
+    return list(statement.choices)
+
+
+def across(functions, signatures, context, call_results, closed, rounds=20):
+    """({function: {parameter register: bits every call passes as zero}}, {function: {result register: bits
+    every way back leaves zero}}) (see the module's notes); 'call_results' is each function's
+    {id(call): registers it hands back}, 'closed' the functions the C does not have every call of."""
+    context = set(context)
+    registers = {entry: ({value[1] for value in signature.params if value[0] == "r"} - context,
+                         {value[1] for value in signature.results if value[0] == "r"} - context)
+                 for entry, signature in signatures.items()}
+    passed, handed = {}, {}
+    for _ in range(rounds):
+        calls, ends = {}, {}
+
+        def observe(statement, state, entry=None):
+            if isinstance(statement, (ir.Call, ir.TailCall)):
+                for target in call_targets(statement):
+                    found = calls.setdefault(target, {})
+                    for index in registers.get(target, (set(), set()))[0]:
+                        found[index] = found.get(index, FULL) & state.get(index, 0)
+            if isinstance(statement, (ir.Return, ir.TailCall)):
+                found = ends.setdefault(entry, {})
+                for index in registers[entry][1]:
+                    if isinstance(statement, ir.TailCall) and index in registers.get(statement.target, ((), ()))[1]:
+                        bits = handed.get(statement.target, {}).get(index, 0)
+                    else:
+                        bits = state.get(index, 0)
+                    found[index] = found.get(index, FULL) & bits
+
+        for entry, function in functions.items():
+            analysis = KnownBits(function, signatures[entry].results, context, call_results[entry],
+                                 passed.get(entry), handed)
+            analysis.params = registers[entry][0]
+            analysis.observe = lambda statement, state, entry=entry: observe(statement, state, entry)
+            analysis.run(rewrite=False)
+        new_passed = {target: {index: bits for index, bits in found.items() if bits}
+                      for target, found in calls.items() if target in functions and target not in closed}
+        new_handed = {entry: {index: bits for index, bits in found.items() if bits} for entry, found in ends.items()}
+        new_passed = {entry: found for entry, found in new_passed.items() if found}
+        new_handed = {entry: found for entry, found in new_handed.items() if found}
+        if new_passed == passed and new_handed == handed:
+            break
+        passed, handed = new_passed, new_handed
+    return passed, handed
+
+
+def simplify(function, signature, context, call_results, passed=None, handed=None):
+    analysis = KnownBits(function, signature.results, context, call_results, passed, handed)
     analysis.params = {value[1] for value in signature.params if value[0] == "r"}
     analysis.run()
