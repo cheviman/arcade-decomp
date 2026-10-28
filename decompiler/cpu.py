@@ -30,6 +30,7 @@ class Profile:
     flag_names: dict            # the C name of each flag
     variable_names: dict        # the base name of a register's variables, where it is not rN
     invalid_jump: str           # what a jump through a table calls for an entry the table does not have
+    float_registers: tuple = () # registers that hold floating-point values (floats.py): a float or a double
 
 
 V60 = Profile(

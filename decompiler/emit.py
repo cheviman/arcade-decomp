@@ -36,6 +36,7 @@ from v60 import ir
 from . import cpu
 from . import cprint
 from . import dataflow
+from . import floats
 from . import memory
 from . import pointers
 from . import signatures
@@ -235,6 +236,9 @@ class Names:
 
     def __init__(self, writer):
         self.writer = writer
+
+    def float_kind(self, node):
+        return self.writer.float_kind(node)
 
     def register(self, index):
         return self.writer.use(("r", index))
@@ -908,6 +912,45 @@ class FunctionWriter:
             return self.emitter.context_name(node.index), 32
         name = self.vars.use_name(node) or cpu.variable_name(node.index)
         return name, self.widths.get(name, 32)
+
+    def float_kinds(self):
+        """{C name of a variable, or "temp " and a temporary's IR name: "f64"} for those that hold
+        floating-point values (floats.py): a double, as the floating-point unit's registers."""
+        if getattr(self, "_float_kinds", None) is not None:
+            return self._float_kinds
+        floating = getattr(cpu.current, "float_registers", ())
+        kinds = self._float_kinds = {}
+        saved = self.current
+        changed = True
+        while changed:
+            changed = False
+            for block in self.function.blocks.values():
+                for statement in block.statements:
+                    self.current = statement
+                    if isinstance(statement, ir.SetReg) and statement.index in floating:
+                        name = self.register_set(statement.index)
+                    elif isinstance(statement, ir.SetTemp) and (floats.is_float(statement.value)
+                                                                or self.float_kind(statement.value)):
+                        name = "temp " + statement.temp.name
+                    else:
+                        continue
+                    if kinds.get(name) != "f64":
+                        kinds[name] = "f64"     # the floating-point unit's registers are doubles (floats.py)
+                        changed = True
+        self.current = saved
+        return kinds
+
+    def float_kind(self, node):
+        """"f32" or "f64" for a register or temporary an expression reads that holds a floating-point
+        value; None for any other."""
+        kinds = self.float_kinds()
+        if isinstance(node, ir.Reg):
+            if node.index not in getattr(cpu.current, "float_registers", ()):
+                return None
+            return kinds.get(self.register_read(node)[0], "f64")
+        if isinstance(node, ir.Temp):
+            return kinds.get("temp " + node.name)
+        return None
 
     def register_value(self, index):
         """The variable a call or the end of the function reads for a register."""
@@ -1877,6 +1920,13 @@ class FunctionWriter:
                 raise EmitError(f"{self.function.name}: writes its caller's stack at {statement.offset:+d}")
             name = self.slot_name(ir.Stack(statement.offset, statement.bits))
             return [f"{name} = {self.stored(statement.value, statement.bits)};"]
+        if isinstance(statement, ir.Store) and isinstance(statement.value, ir.Op)                 and statement.value.name in ("f.bits32", "f.bits64"):
+            # a float or a double written to memory (floats.py): rounded to a float for a float's bytes
+            stored = statement.value.args[0]
+            if statement.value.name == "f.bits32":
+                stored = ir.op("f.round32", (stored,), 64)
+            macro = "MEMF" if statement.value.name == "f.bits32" else "MEMD"
+            return [f"{macro}({self.expr(statement.address)}) = {self.expr(stored)};"]
         if isinstance(statement, ir.Store):
             value = statement.value
             field = self.fields.get(id(statement))
@@ -2628,9 +2678,11 @@ class FunctionWriter:
         declared |= {self.emitter.context_name(index) for index in self.emitter.context}    # (globals)
         if flags:
             lines.append("uint32_t " + ", ".join(f"{value_name(value)} = 0" for value in flags) + ";")
+        floating = self.float_kinds()
         for bits in (8, 16, 32):
             names = sorted((name for name, width in self.widths.items()
-                            if width == bits and name not in declared and name in words), key=variable_order)
+                            if width == bits and name not in declared and name in words and name not in floating),
+                           key=variable_order)
             if names:
                 lines.append(f"{cprint.UNSIGNED[bits]} " + ", ".join(f"{name} = 0" for name in names) + ";")
         for bits in (8, 16, 32):
@@ -2640,9 +2692,16 @@ class FunctionWriter:
                 lines.append(f"{cprint.UNSIGNED[bits]} " + ", ".join(f"{name} = 0" for name in names) + ";")
         for bits in (8, 16, 32, 64):
             names = [name for key, name in self.temps.items()
-                     if max(self.temp_bits[key], 32 if self.temp_bits[key] == 1 else 0) == bits and name in words]
+                     if max(self.temp_bits[key], 32 if self.temp_bits[key] == 1 else 0) == bits and name in words
+                     and "temp " + key not in floating]
             if names:
                 lines.append(f"{cprint.UNSIGNED[bits]} " + ", ".join(f"{name} = 0" for name in names) + ";")
+        for ctype, kind in (("float", "f32"), ("double", "f64")):
+            names = sorted(name for name, found in floating.items()
+                           if found == kind and not name.startswith("temp ") and name in words and name not in declared)
+            names += [name for key, name in self.temps.items() if floating.get("temp " + key) == kind and name in words]
+            if names:
+                lines.append(f"{ctype} " + ", ".join(f"{name} = 0" for name in names) + ";")
         return lines
 
 

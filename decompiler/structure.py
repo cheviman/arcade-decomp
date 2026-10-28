@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 
 from v60 import ir
 
+from . import floats
+
 SMALL_EXIT = 4    # statements of an ending block that is copied rather than jumped to
 COPY_LATCHES = True    # a jump to the few statements a loop goes round again after is written as a copy of
                         # them ending in continue or break (copied_latch): a walk over objects or voices
@@ -1589,6 +1591,8 @@ def negate(condition):
     """The opposite condition, said directly where it can be."""
     if isinstance(condition, ir.Op):
         name, args = condition.name, condition.args
+        if floats.is_compare(condition):
+            return floats.complement(condition)
         if name in NEGATED:
             if name == "eq" and args[1] == ir.Const(0, 1) and args[0].bits == 1:
                 return args[0]

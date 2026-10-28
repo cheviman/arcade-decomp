@@ -18,6 +18,7 @@ import re
 from v60 import ir
 
 from . import cpu
+from . import floats
 
 UNSIGNED = {8: "uint8_t", 16: "uint16_t", 32: "uint32_t", 64: "uint64_t"}
 SIGNED = {8: "int8_t", 16: "int16_t", 32: "int32_t", 64: "int64_t"}
@@ -226,6 +227,9 @@ class Printer:
             return Value(literal(node.value, node.bits), PRIMARY, True, "u64" if node.bits == 64 else "u32")
         if isinstance(node, ir.Reg):
             name, bits = self.names.register_node(node)
+            kind = self.float_kind(node)
+            if kind is not None:
+                return Value(name, PRIMARY, True, kind)
             return Value(name, PRIMARY, True, "u32" if bits == 32 else "int")
         if isinstance(node, ir.Flag):
             return Value(self.names.flag(node.name), PRIMARY, True, "u32")
@@ -233,6 +237,9 @@ class Printer:
             return Value(self.names.control(node.name), PRIMARY, True, "int")
         if isinstance(node, ir.Temp):
             name, bits = self.names.temp(node)
+            kind = self.float_kind(node)
+            if kind is not None:
+                return Value(name, PRIMARY, True, kind)
             return Value(name, PRIMARY, True, "u64" if bits == 64 else ("u32" if bits == 32 else "int"))
         if isinstance(node, ir.Stack):
             name, bits = self.names.slot(node)
@@ -260,8 +267,18 @@ class Printer:
             return self.operator(node)
         raise TypeError(f"not an expression: {node!r}")
 
+    def float_kind(self, node):
+        """"f32" or "f64" for a register or temporary that holds a floating-point value (floats.py)."""
+        finder = getattr(self.names, "float_kind", None)
+        return finder(node) if finder is not None else None
+
     def operator(self, node):
         name, args, bits = node.name, node.args, node.bits
+        if name.startswith("f."):
+            return floats.operator(self, node)
+        if name in ("eq", "ne") and floats.is_compare(args[0]) and args[1] == ir.Const(0, 1):
+            # a floating-point test said the other way round: its outcomes left out
+            return self.emit(floats.complement(args[0]) if name == "eq" else args[0])
         if name == "trunc":
             # the low bits are the value; exact() cuts it where that matters
             value = self.any(args[0])
