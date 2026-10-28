@@ -589,7 +589,8 @@ def code_table(program, flow):
 
 def result_widths(built, found, flow, closed):
     """{function: 8 or 16} for the functions that return one register of which no caller reads more after
-    the call (a tail call: what its own callers read, when it returns the same register; else all of it):
+    the call (a tail call: what its own callers read, when it returns the same register; all of it when it
+    hands it back among others; none when it does not hand it back):
     the C returns that much (cleanup.RESULT_BITS). The ones in 'closed' (calls through memory slots, a second
     way in, nothing calling them) return all of it."""
     returned = {}
@@ -615,7 +616,9 @@ def result_widths(built, found, flow, closed):
         changed = False
         for target, callers in tails.items():
             for caller in callers:
-                more = read[caller] if returned.get(caller) == returned[target] else {0, 1, 2}
+                # (a function that hands back no such register: its callers read none of it after it)
+                handed = {value[1] for value in found[caller].results if value[0] == "r"}
+                more = read[caller] if returned.get(caller) == returned[target]                     else {0, 1, 2} if returned[target] in handed else set()
                 if not more <= read[target]:
                     read[target] |= more
                     changed = True

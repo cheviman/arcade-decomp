@@ -16,6 +16,13 @@ out of a table, ROM addresses printed as numbers, functions without a comment, d
 address instead of a table or structure with a name, tables the C names over the ROM (src/ram.h), functions
 the board puts its own in place of. The counts are compared with tools/noise_baseline.txt; a count that went up makes the run fail.
 
+Two measures of how much of the C is clean, function by function and line by line: with nothing at all
+of the above (clean), and with nothing but what the C has to keep to do what the original does
+(faithful): the registers the C keeps as globals, where a value goes from one function to another
+through them (the scratch ones are locals wherever it does not), and several fields read or written in
+one access, as the original's one instruction does (AS/AT, a table read at another width). The README
+explains each of those.
+
 Usage: python tools/noise_report.py [--save] [--src DIR] [--files]
   --save   write the counts as the new baseline (after a round that took something away)
   --src    count another copy of the C (tools/decompile.py --out DIR) against the same baseline
@@ -78,7 +85,12 @@ INFORMATION = {
     "board_registers": "reads and writes of a device of the board, through the bus (io_read8...)",
     "clean_functions": "functions with nothing of the above in them (the partial writes too), per thousand",
     "clean_lines": "lines of code in the functions with nothing of the above, per thousand",
+    "faithful_functions": "functions with nothing of the above but the faithful leftovers (the globals' registers, "
+                          "fields at once), per thousand",
+    "faithful_lines": "lines of code in those functions with nothing but those, per thousand",
 }
+# the kinds the original's own doing leaves in the C (see the module's notes), with the registers kept as globals
+FAITHFUL = ("wide_access",)
 
 
 def count(paths):
@@ -139,12 +151,15 @@ def count(paths):
 PARTIAL_WRITE = re.compile(r"& ~0xF+u\) \|")
 
 
-def clean_measure(paths, extra):
+def clean_measure(paths, extra, registers=None, faithful=False):
     """(functions with no leftover, functions, lines of code with none, lines of code in functions): a
-    leftover is any kind of KINDS on the line, a register the C keeps as a global, a table over an address
-    ('extra'), a partial write, a bool control variable, a result written back before an early return; a
-    parameter named after a register leaves its function unclean."""
-    patterns = [pattern for _, pattern in KINDS.values() if pattern is not None] + list(extra) + [PARTIAL_WRITE]
+    leftover is any kind of KINDS on the line, a table over an address ('extra'), a register the C keeps
+    as a global ('registers'), a partial write, a bool control variable, a result written back before an
+    early return; a parameter named after a register leaves its function unclean. With 'faithful', the
+    FAITHFUL kinds and the registers kept as globals are no leftovers."""
+    patterns = [pattern for kind, (_, pattern) in KINDS.items()
+                if pattern is not None and not (faithful and kind in FAITHFUL)] + list(extra) \
+        + ([registers] if registers is not None and not faithful else []) + [PARTIAL_WRITE]
     clean_functions = functions = clean_lines = lines = 0
     for path in paths:
         text = path.read_text(encoding="ascii", errors="replace").splitlines()
@@ -214,7 +229,10 @@ def main():
     if UNNAMED_ADDRESSES.exists():
         counts["raw_rom_addresses"] = sum(1 for line in UNNAMED_ADDRESSES.read_text().splitlines()
                                           if line and not line.startswith("#"))
-    measure = clean_measure(sources, [pattern for pattern in (table_use, register_use) if pattern is not None])
+    measure = clean_measure(sources, [table_use] if table_use is not None else [], register_use)
+    faithful = clean_measure(sources, [table_use] if table_use is not None else [], register_use, faithful=True)
+    counts["faithful_functions"], counts["faithful_lines"] = faithful[0] * 1000 // max(faithful[1], 1), \
+        faithful[2] * 1000 // max(faithful[3], 1)
     counts["clean_functions"], counts["clean_lines"] = measure[0] * 1000 // max(measure[1], 1), \
         measure[2] * 1000 // max(measure[3], 1)
     saved = {}
@@ -233,6 +251,9 @@ def main():
             rose.append(kind)
     print(f"\nclean: {measure[0]} of {measure[1]} functions ({measure[0] * 100 / max(measure[1], 1):.1f}%), "
           f"{measure[2]} of {measure[3]} lines of code ({measure[2] * 100 / max(measure[3], 1):.1f}%)")
+    print(f"faithful: {faithful[0]} of {faithful[1]} functions ({faithful[0] * 100 / max(faithful[1], 1):.1f}%), "
+          f"{faithful[2]} of {faithful[3]} lines of code ({faithful[2] * 100 / max(faithful[3], 1):.1f}%) "
+          "with nothing but the globals' registers and fields at once")
     if "--files" in arguments:
         print()
         print(f"{'rom_reads':>9s} {'rom_names':>9s}")

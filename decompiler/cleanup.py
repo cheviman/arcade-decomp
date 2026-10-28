@@ -19,7 +19,10 @@ What a call passes by value is worked out as the original does it even where the
 not matter to this caller (point_to_screen works out a screen x the caller drops, from the projected x
 the caller loads into R0 for it): the C writes the argument, so it has to be what the code passes, not
 whatever the register held before. Where that takes a register this function's own callers do not hand
-it, the C reads the 0 its variable starts with, as for every input no caller sets.
+it, the C reads the 0 its variable starts with, as for every input no caller sets. A register the callee
+reads only to hand it back as it was (draw_object's R0, which it returns untouched when the object is
+not drawn) is what the code passes only where this caller reads it after the call: elsewhere nothing
+the callee does depends on it.
 """
 from v60 import ir
 
@@ -64,7 +67,9 @@ class Liveness:
         self.flow = flow
         self.function = function
         self.exit_live = exit_live
-        self.passed = passed or {}    # id(call or tail call) -> what it reads to pass by value, live anyway
+        # id(call or tail call) -> (what it reads to pass by value, live anyway; {register: what it reads of
+        # it, live where the register is live after the call}: the ones the callee only hands back)
+        self.passed = passed or {}
 
     def needed(self, statement, live, temps):
         if isinstance(statement, ir.SetTemp):
@@ -95,8 +100,20 @@ class Liveness:
         out = set(live)
         temps = {}
         self.flow.transfer(end, live, temps, end=True)
-        live |= self.passed.get(id(end), set())
+        live |= self.passed_parts(end, out)
         return live, temps, out
+
+    def passed_parts(self, statement, after):
+        """What 'statement' passes by value that is live anyway, given what is live after it."""
+        found = self.passed.get(id(statement))
+        if found is None:
+            return set()
+        always, handed_back = found
+        parts = set(always)
+        for index, read in handed_back.items():
+            if any(variable[0] == "r" and variable[1] == index for variable in after):
+                parts |= read
+        return parts
 
     def backwards(self, block, live_in, keep=None):
         """Live variables at the start of 'block'. With 'keep', records the statements to keep, each with the
@@ -109,8 +126,9 @@ class Liveness:
                 continue
             if keep is not None:
                 keep[id(statement)] = set(live)
+            after = set(live)
             self.flow.transfer(statement, live, temps)
-            live |= self.passed.get(id(statement), set())
+            live |= self.passed_parts(statement, after)
         return live
 
     def solve(self):
@@ -157,15 +175,34 @@ def passed_by_value(flow, function, arguments):
             if summary is None or not registers:
                 continue
             # the whole of what the C passes: every part up to the highest one the callee reads (its parameter
-            # is that wide), not only the parts it reads (add_to_touchable_list reads only R0's high half)
-            parts = set()
+            # is that wide), not only the parts it reads (add_to_touchable_list reads only R0's high half);
+            # of a register it reads only to hand it back, only where the caller reads it afterwards
+            parts, handed_back = set(), {}
             for index in registers:
                 read = [variable[2] for variable in summary.reads if variable[0] == "r" and variable[1] == index]
-                if read:
-                    parts |= {("r", index, part) for part in range(max(read) + 1)}
-            if parts:
-                found[id(statement)] = parts
+                if not read:
+                    continue
+                passed = {("r", index, part) for part in range(max(read) + 1)}
+                if only_handed_back(summary, index):
+                    handed_back[index] = passed
+                else:
+                    parts |= passed
+            if parts or handed_back:
+                found[id(statement)] = (parts, handed_back)
     return found
+
+
+def only_handed_back(summary, index):
+    """True if a function reads register 'index' only to hand it back: for no memory write, call or other
+    value it hands back."""
+    if not summary.passes:
+        return False
+    if any(variable[0] == "r" and variable[1] == index for variable in summary.base):
+        return False
+    for key, reads in summary.passes.items():
+        if key != ("r", index) and any(variable[0] == "r" and variable[1] == index for variable in reads):
+            return False
+    return ("r", index) in summary.passes
 
 
 def eliminate(flow, function, results, context, arguments=None):
