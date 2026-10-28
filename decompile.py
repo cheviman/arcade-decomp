@@ -707,11 +707,11 @@ def write_backs(text):
 
 def fewer_write_backs(text, other):
     """True when 'text' writes results back before fewer early returns than 'other', with no more control
-    variables."""
+    variables, or before as many in fewer lines (the ways out not copied)."""
     mine, theirs = write_backs(text), write_backs(other)
-    if len(re.findall(r"\br\d+\b", text)) > len(re.findall(r"\br\d+\b", other)):
+    if set(re.findall(r"\br\d+\b", text)) - set(re.findall(r"\br\d+\b", other)):
         return False    # (a register the copy's notes do not find a variable for: not the same C)
-    return mine[0] < theirs[0] and mine[1] <= theirs[1]
+    return mine[1] <= theirs[1] and (mine[0] < theirs[0] or mine[0] == theirs[0] and mine[2] < theirs[2])
 
 
 SPLIT_COPY = 64      # statements, at most, of the piece of a loop entered at two places that fewer_controls copies
@@ -967,9 +967,10 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             redispatched[entry] = way
         if emitter.by_pointer(entry):
             joined[entry] = []
-            for tail_calls in (False, True):
+            for tail_calls, meet in ((False, False), (True, False), (False, True), (True, True)):
                 way = twin(function, notes)
                 structure.join_exits(way, notes, tail_calls)
+                way.meet_at_exit = meet    # (the short ways to the one way back meet the others there)
                 structure.split_loop_entries(way, notes)
                 joined[entry].append(way)
             structure.split_small_exits(function, notes)

@@ -242,6 +242,9 @@ class Graph:
             # a short way out: code that only ends the function, small enough to be written where it is
             # jumped to ("if (hit) { ...; return; }")
             reach = self.reachable_from(label)
+            if getattr(self.function, "meet_at_exit", False) \
+                    and any(isinstance(self.blocks[inner].end, ir.Return) for inner in reach):
+                return False    # (a way to the one way back meets the others there: decompile.py tries it)
             return len(reach) <= WAY_OUT_BLOCKS and all(not successors(self.blocks[inner]) or
                                            all(after in reach for after in successors(self.blocks[inner]))
                                            for inner in reach) \
@@ -507,11 +510,25 @@ def strongly_connected(blocks, order):
 
 
 def copied_note(value, made):
-    """A note about a node, for its copy: the nodes it names (a field's base register) are the copy's."""
+    """A note about a node, for its copy: the nodes it names (a field's base register) are the copy's, also
+    inside an expression the note puts together itself (a base the code adds up: screen + 2000 + R1)."""
     if isinstance(value, tuple):
-        return tuple(made.get(id(part), part) if not isinstance(part, (int, str, bool, type(None))) else part
+        return tuple(copied_node(part, made) if not isinstance(part, (int, str, bool, type(None))) else part
                      for part in value)
     return value
+
+
+def copied_node(node, made):
+    """'node' in the copy of the code: the copy's own node, or an expression of them."""
+    if id(node) in made:
+        return made[id(node)]
+    if isinstance(node, ir.Op):
+        args = tuple(copied_node(arg, made) for arg in node.args)
+        return node if all(new is old for new, old in zip(args, node.args)) else ir.Op(node.name, args, node.bits)
+    if isinstance(node, ir.Load):
+        address = copied_node(node.address, made)
+        return node if address is node.address else ir.Load(address, node.bits)
+    return node
 
 
 def split_small_exits(function, notes):

@@ -1858,7 +1858,39 @@ class FunctionWriter:
             else:
                 continue
             self.forwarded.update(names)
+        # (then what is still copied back from a call's result as the function ends: handed_on)
+        for value in self.results:
+            param = self.emitter.param_name(self.entry, value) if value[0] == "r" else None
+            if param is not None and f"p_{param}" not in shared:
+                body = self.handed_on(body, param)
         return body
+
+    @staticmethod
+    def handed_on(body, param):
+        """'body' with a call whose result is the function's own as the function ends ("callee(&x); *p_x = x;
+        return;", the original's jump on into the callee): the caller's pointer goes to the call, with the
+        value the callee may take written there first ("*p_x = x; callee(p_x); return;"). The same either
+        way: the callee leaves in it what it would have left in the variable, or the variable's value."""
+        found = list(body)
+        for index in range(1, len(found)):
+            back = re.fullmatch(rf"(\t+)\*p_{param} = (\w+);", found[index])
+            if back is None:
+                continue
+            indent, name = back.groups()
+            # (the call, then the results copied back, then the end)
+            first = index
+            while first > 0 and re.fullmatch(rf"{indent}\*p_\w+ = \w+;", found[first - 1]):
+                first -= 1
+            last = index
+            while last + 1 < len(found) and re.fullmatch(rf"{indent}\*p_\w+ = \w+;", found[last + 1]):
+                last += 1
+            call = found[first - 1] if first > 0 else ""
+            ends = last + 1 == len(found) or found[last + 1] == f"{indent}return;"
+            if not ends or not call.startswith(indent) or call[len(indent)] == "\t" or not call.endswith(");") \
+                    or len(re.findall(rf"&{name}\b", call)) != 1 or f"p_{param}" in call:
+                continue
+            found[first - 1:index + 1] = [found[index], re.sub(rf"&{name}\b", f"p_{param}", call)] + found[first:index]
+        return found
 
     def name_controls(self, body):
         """'body' with the control variables named: each its own name, apart from every other name the

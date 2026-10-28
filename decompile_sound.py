@@ -342,9 +342,10 @@ def write_c(program, out_dir, variables_path=None):
         notes = (live_after[entry], fields[entry])
         if emitter.by_pointer(entry):
             joined[entry] = []
-            for tail_calls in (False, True):
+            for tail_calls, meet in ((False, False), (True, False), (False, True), (True, True)):
                 way = twin(function, notes)
                 structure.join_exits(way, notes, tail_calls)
+                way.meet_at_exit = meet    # (the short ways to the one way back meet the others there)
                 structure.split_loop_entries(way, notes)
                 joined[entry].append(way)
         structure.split_loop_entries(function, notes)
