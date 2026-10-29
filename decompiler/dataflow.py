@@ -3,7 +3,7 @@ Name:        dataflow.py
 Description: what each function reads, writes and hands back in registers and flags, across the program
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    23-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Variables are the parts of the V60 registers (("r", n, part): part 0 is bits 0-7, part 1 bits 8-15,
@@ -94,11 +94,12 @@ def shifted_right(mask, count, bits, arithmetic):
     return needed
 
 
-def demanded(node, mask, out, temps):
+def demanded(node, mask, out, temps, reach=None):
     """Adds to 'out' the variables 'node' needs to produce the bits in 'mask'; temporaries go to 'temps'
     (name -> bits wanted of them). A temporary the expression names is wanted even when none of its bits
     are (and.h #FF of a value whose bits 8-15 are all that is read later): the statement that reads it
-    stays, so the one that sets it has to stay too."""
+    stays, so the one that sets it has to stay too. 'reach' is what ranges.py found of the statement's
+    shifts: the bits each can set, which are all an "and" with it reads of its other side."""
     if not mask:
         for leaf in ir.walk(node):
             if isinstance(leaf, ir.Temp):
@@ -118,35 +119,35 @@ def demanded(node, mask, out, temps):
         temps[node.name] = temps.get(node.name, 0) | mask
         return
     if isinstance(node, ir.Load):
-        demanded(node.address, FULL, out, temps)
+        demanded(node.address, FULL, out, temps, reach)
         return
     if not isinstance(node, ir.Op):
         return
     name, args = node.name, node.args
     if name == "trunc" or name == "zext":
-        demanded(args[0], mask & width(min(node.bits, args[0].bits)), out, temps)
+        demanded(args[0], mask & width(min(node.bits, args[0].bits)), out, temps, reach)
     elif name == "sext":
         source = args[1].value
         needed = mask & width(source)
         if mask & ~width(source):
             needed |= 1 << (source - 1)
-        demanded(args[0], needed, out, temps)
+        demanded(args[0], needed, out, temps, reach)
     elif name == "and":
         left, right = args
-        demanded(left, mask & right.value if isinstance(right, ir.Const) else mask, out, temps)
-        demanded(right, mask & left.value if isinstance(left, ir.Const) else mask, out, temps)
+        demanded(left, mask & reaching(right, reach), out, temps, reach)
+        demanded(right, mask & reaching(left, reach), out, temps, reach)
     elif name in ("or", "xor", "not"):
         for arg in args:
-            demanded(arg, mask, out, temps)
+            demanded(arg, mask, out, temps, reach)
     elif name in ("add", "sub", "mul", "neg"):
         for arg in args:
-            demanded(arg, below(mask) & width(arg.bits), out, temps)
+            demanded(arg, below(mask) & width(arg.bits), out, temps, reach)
     elif name == "shl" and isinstance(args[1], ir.Const):
-        demanded(args[0], (mask >> args[1].value) & width(args[0].bits), out, temps)
+        demanded(args[0], (mask >> args[1].value) & width(args[0].bits), out, temps, reach)
     elif name == "shr" and isinstance(args[1], ir.Const):
-        demanded(args[0], (mask << args[1].value) & width(args[0].bits), out, temps)
+        demanded(args[0], (mask << args[1].value) & width(args[0].bits), out, temps, reach)
     elif name == "sar" and isinstance(args[1], ir.Const):
-        demanded(args[0], shifted_right(mask, args[1].value, args[0].bits, True), out, temps)
+        demanded(args[0], shifted_right(mask, args[1].value, args[0].bits, True), out, temps, reach)
     elif name in ("helper:shl", "helper:sha") and isinstance(args[1], ir.Const) and args[0].bits == node.bits:
         # SHL / SHA by a constant: the count is a signed byte, negative to the right
         count = args[1].value & 0xFF
@@ -156,14 +157,24 @@ def demanded(node, mask, out, temps):
             needed = (mask >> count) & width(args[0].bits)
         else:
             needed = shifted_right(mask, -count, args[0].bits, name == "helper:sha")
-        demanded(args[0], needed, out, temps)
+        demanded(args[0], needed, out, temps, reach)
     elif name == "select":
-        demanded(args[0], FULL, out, temps)
-        demanded(args[1], mask, out, temps)
-        demanded(args[2], mask, out, temps)
+        demanded(args[0], FULL, out, temps, reach)
+        demanded(args[1], mask, out, temps, reach)
+        demanded(args[2], mask, out, temps, reach)
     else:
         for arg in args:
-            demanded(arg, width(arg.bits), out, temps)
+            demanded(arg, width(arg.bits), out, temps, reach)
+
+
+def reaching(node, reach):
+    """The bits 'node' may have set: a constant's own, or those ranges.py found a shift of a constant can
+    set where the statement stands ('reach'); all of them otherwise."""
+    if isinstance(node, ir.Const):
+        return node.value
+    if reach and node in reach:
+        return reach[node]
+    return FULL
 
 
 def expression_reads(expression):
@@ -347,6 +358,8 @@ class Program:
         # the registers the whole program shares: global variables in C (signatures.py)
         self.context = frozenset(variable for index in context for variable in register_parts(index, FULL))
         self.summaries = {entry: Summary() for entry in functions}
+        # the bits the shifts of a constant can set, by statement (ranges.py; none until it has run)
+        self.reaches = {}
         self.slot_targets = self.code_pointer_slots()
         # inputs that start at 0 in C (signatures.py): not read from the caller, so not live at its calls
         self.zeroed = {}
@@ -456,26 +469,27 @@ class Program:
         Returns (variables it may write, variables it always writes)."""
         if end:
             return self.transfer_end(statement, live, temps)
+        reach = self.reaches.get(id(statement))
         if isinstance(statement, ir.SetTemp):
             wanted = temps.pop(statement.temp.name, 0)
-            demanded(statement.value, wanted, live, temps)
+            demanded(statement.value, wanted, live, temps, reach)
             return set(), set()
         if isinstance(statement, ir.SetReg):
             index = statement.index
             if not cpu.kept(index):
-                demanded(statement.value, FULL, live, temps)
+                demanded(statement.value, FULL, live, temps, reach)
                 return set(), set()
             parts, value, _ = partial_write(statement)
             written = {("r", index, part) for part in parts}
             needed = parts_mask(live & written, index)
             live -= written
-            demanded(value, needed, live, temps)
+            demanded(value, needed, live, temps, reach)
             return written, written
         if isinstance(statement, ir.SetFlag):
             variable = ("f", statement.name)
             if variable in live:
                 live.discard(variable)
-                demanded(statement.value, 1, live, temps)
+                demanded(statement.value, 1, live, temps, reach)
             return {variable}, {variable}
         if isinstance(statement, ir.SetStack):
             written = stack_parts(statement.offset, width(statement.bits))
@@ -485,11 +499,11 @@ class Program:
                     needed |= bits
             live -= written
             if needed:
-                demanded(statement.value, needed & width(statement.bits), live, temps)
+                demanded(statement.value, needed & width(statement.bits), live, temps, reach)
             return written, written
         if isinstance(statement, ir.Store):
-            demanded(statement.address, FULL, live, temps)
-            demanded(statement.value, width(statement.bits), live, temps)
+            demanded(statement.address, FULL, live, temps, reach)
+            demanded(statement.value, width(statement.bits), live, temps, reach)
             return set(), set()
         if isinstance(statement, ir.Call):
             reads = self.call_reads(statement, live)
@@ -497,18 +511,19 @@ class Program:
             live -= always
             live |= reads
             if statement.address is not None:
-                demanded(statement.address, FULL, live, temps)
+                demanded(statement.address, FULL, live, temps, reach)
             return writes, always
         if isinstance(statement, ir.Effect):
             reads, writes, always = self.effect(statement)
             live -= always
             live |= reads
             for arg in statement.args:
-                demanded(arg, width(arg.bits), live, temps)
+                demanded(arg, width(arg.bits), live, temps, reach)
             return writes, always
         raise TypeError(f"not a statement: {statement!r}")
 
     def transfer_end(self, end, live, temps):
+        reach = self.reaches.get(id(end))
         if isinstance(end, ir.TailCall):
             reads = self.target_reads([end.target], live)
             _, writes, always = self.combine([end.target])
@@ -516,7 +531,7 @@ class Program:
             live |= reads
             return writes, always
         for expression in ir.statement_expressions(end):
-            demanded(expression, FULL, live, temps)
+            demanded(expression, FULL, live, temps, reach)
         return set(), set()
 
     def effect(self, statement):

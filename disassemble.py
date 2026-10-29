@@ -3,7 +3,7 @@ Name:        disassemble.py
 Description: recursive-descent disassembly of the V70 program into a listing and a coverage report
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (default ROM: rom/)
@@ -131,7 +131,7 @@ def parse_layout(attributes, where):
 
 
 NAME_KINDS = ("var", "io", "table", "struct", "field", "register", "scoped", "param", "result", "local", "port",
-              "file", "anchor", "comment", "elements", "constant", "task", "unread")    # names for the decompiled C (load_names; file lines:
+              "file", "anchor", "comment", "elements", "constant", "task", "unread", "exit")    # names for the decompiled C (load_names; file lines:
                                               # decompile.source_files)
 
 
@@ -272,6 +272,9 @@ def load_names(path, registers=None):
         unread   FUNCTION RN             the function reads RN before it sets it only on a path the game
                                          never takes (the comment says why): RN is no input of it, and
                                          starts at 0 there, as an input no caller sets does
+        exit     FUNCTION ADDRESS        the function (a "func" line in the middle of code) goes back to the
+                                         code that runs it where it jumps to ADDRESS: that jump is its
+                                         return, and a jump into it is a call and then a jump to ADDRESS
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
@@ -323,6 +326,10 @@ def load_names(path, registers=None):
                 raise SystemExit(f"{where}: expected 'unread FUNCTION RN'")
             names.unread.add((parts[1], register_number(parts[2])))
             continue
+        if parts[0] == "exit":
+            if len(parts) != 3 or not parts[1].isidentifier() or not re.fullmatch(r"[0-9A-Fa-f]+", parts[2]):
+                raise SystemExit(f"{where}: expected 'exit FUNCTION ADDRESS'")
+            continue    # (decompile.load_program's: exit_lines)
         if parts[0] == "comment":
             words = line.split(None, 2)
             if len(words) != 3 or not words[1].isidentifier():

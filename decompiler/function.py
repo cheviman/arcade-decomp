@@ -3,7 +3,7 @@ Name:        function.py
 Description: the game's functions as control-flow graphs of IR blocks, built from the analysed program
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    20-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Takes the functions tools/recompile.py splits the program into and lifts every instruction to IR
@@ -80,6 +80,8 @@ class Builder:
         self.analysis = program.analysis
         self.mem = program.mem
         self.entries = program.entries
+        # functions that go back where they jump to their exit (decompile.load_program, exit lines)
+        self.exits = getattr(program, "exits", {})
         # the frame loop: where the board runs its events and the CPU its interrupts (cpu.h)
         named = {symbol.name: address for address, symbol in program.symbols.items()}
         self.frame_wait_loop = named["frame_wait_loop"]
@@ -179,7 +181,14 @@ class Builder:
         return leaders & set(body)
 
     def transfer(self, entry, target):
-        """How execution gets to 'target': a jump in this function, or into another one."""
+        """How execution gets to 'target': a jump in this function, or into another one; the way back
+        of a function with an exit."""
+        if self.exits.get(entry) == target:
+            return ir.Return()
+        if entry in self.exits and target in self.program.bodies[entry]:
+            return ir.Goto(target)    # (code of another function's way in that a function with an exit runs)
+        if target in self.exits and target != entry:
+            return ir.Goto(target)    # (into a function with an exit: close_transfers makes it a call)
         if target != entry and target in self.entries:
             return ir.TailCall(target)
         inner = getattr(self.program, "inner_entries", {}).get(target)
@@ -193,6 +202,22 @@ class Builder:
         def resolve(target, origin):
             if target in function.blocks:
                 return target
+            if self.exits.get(function.entry) == target:
+                label = ("back", target)
+                if label not in function.blocks:
+                    function.blocks[label] = Block(label, end=ir.Return())
+                    function.blocks[label].end.origin = origin
+                return label
+            if target in self.exits and target != function.entry:
+                # a function with an exit: a call, then on where it goes back to
+                label = ("call", target)
+                if label not in function.blocks:
+                    call = ir.Call(target=target, return_address=self.exits[target])
+                    call.origin = origin
+                    end = ir.Goto(resolve(self.exits[target], origin))
+                    end.origin = origin
+                    function.blocks[label] = Block(label, statements=[call], end=end)
+                return label
             if target in self.entries:
                 label = ("tail", target)
                 if label not in function.blocks:

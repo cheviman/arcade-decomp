@@ -28,9 +28,10 @@ Nothing here is a game's: no ROM, no names, no data.
   traces, following what the address registers can hold into the tables of handlers it jumps through. A
   game uses it with `ANALYSIS = "m68000.analysis"` and `DISASSEMBLER = "m68000.disassembler"` in its
   profile, which `check_scenarios.py` reads (the V70's `disassemble` and `v60.disassembler` by default).
-- `decompiler/`: the decompiler, from the IR to C with no CPU left in it: data flow, signatures, the
-  structuring of loops and branches (no goto), variables, the types of pointers (structures, families of
-  objects, records of the program ROM, fixed instances), the program's memory by name, and the C writer.
+- `decompiler/`: the decompiler, from the IR to C with no CPU left in it: data flow, the values registers can
+  hold where the code reads them, signatures, the structuring of loops and branches (no goto), variables, the
+  types of pointers (structures, families of objects, records of the program ROM, fixed instances), the
+  program's memory by name, and the C writer.
 - `disassemble.py`: the static analysis of the main program from `symbols.txt` (no traces), and its listing.
 - `decompile.py`, `decompile_sound.py`: the game's C, `src/` and `src/sound/`, from its ROM set, `symbols.txt`
   and `sound_symbols.txt`.

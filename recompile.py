@@ -3,7 +3,7 @@ Name:        recompile.py
 Description: translates the game's V70 program into C, one C function per function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    20-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/recompile.py [rom folder or .zip] --trace build/scenarios/*/executed.txt
@@ -211,6 +211,23 @@ class Program:
         if pushed is None or key(pushed) not in self.analysis.instructions:
             return None
         return key(pushed)
+
+    def walk_until(self, entry, exits):
+        """The body of a function that goes back where it jumps to one of 'exits' (symbols.txt's exit
+        lines): all the code it runs up to there, the code of other functions' ways in too (second_task's
+        frames run into the start of the second task's)."""
+        body = {}
+        stack = [entry]
+        while stack:
+            address = stack.pop()
+            if address in body or address in exits:
+                continue
+            instruction = self.analysis.instructions.get(address)
+            if instruction is None:
+                raise SystemExit(f"No decoded instruction at {address:06X} (function {entry:06X})")
+            body[address] = instruction
+            stack += self.successors(instruction)
+        return body
 
     def walk(self, entry):
         body = {}

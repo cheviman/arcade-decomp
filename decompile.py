@@ -3,7 +3,7 @@ Name:        decompile.py
 Description: decompiles the game's V70 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--checks] [--out DIR] [--symbols FILE]
@@ -57,6 +57,7 @@ from decompiler import pointers  # noqa: E402
 from decompiler import function as functions  # noqa: E402
 from decompiler.gotos import GotoError  # noqa: E402
 from decompiler import preserved  # noqa: E402
+from decompiler import ranges  # noqa: E402
 from decompiler import signatures  # noqa: E402
 from decompiler import structure  # noqa: E402
 from decompiler import stack  # noqa: E402
@@ -89,8 +90,29 @@ def load_program(source):
         program = recompile.Program(image, symbols, set(), inside | unreached)
     program.live_entries = live
     program.unreached = unreached
+    # a function with an exit (symbols.txt's exit lines) goes back where it jumps there: its body is all the
+    # code it runs up to there (decompiler/function.py writes that jump as its return, and a jump into it as
+    # a call and then that jump)
+    entries = {name: entry for entry, name in program.names.items()}
+    program.exits = {}
+    for name, address in exit_lines(SYMBOLS).items():
+        if name not in entries:
+            raise SystemExit(f"symbols.txt: exit {name}, which is no function")
+        program.exits[entries[name]] = address
     merge_entries(program)
+    for entry, address in program.exits.items():
+        program.bodies[entry] = program.walk_until(entry, {address})
     return program
+
+
+def exit_lines(path):
+    """{function name: the address it goes back to its caller at}, from symbols.txt's exit lines."""
+    found = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split("#", 1)[0].split()
+        if len(parts) == 3 and parts[0] == "exit":
+            found[parts[1]] = game_profile.rom.canonical_address(int(parts[2], 16))
+    return found
 
 
 # the operands that name an address: absolute, or relative to the instruction (not a register's displacement)
@@ -116,14 +138,21 @@ def merge_entries(program):
     """A function that, after some code of its own, jumps into the middle of code another function has
     too (the player's update runs into the state code the player's animation has) is that code and a
     jump into the other one, which gets a second way in (ir.EntryPoint): the shared code is written once.
-    tools/recompile.py keeps a copy in each, as the C it writes cannot jump into another function."""
+    tools/recompile.py keeps a copy in each, as the C it writes cannot jump into another function. However
+    little they share, one that jumps into a function with an exit (program.exits) where that exit is the
+    other's code and not its own is a way into the other (boot runs into second_task's restart, which runs
+    second_task_frames and then second_task's test mode)."""
     program.inner_entries = {}     # address -> the function it is a second way into
     program.second_entries = {}    # function -> its other ways in
+    exits = getattr(program, "exits", {})
     for x in sorted(program.bodies):
         body = program.bodies[x]
+        called = {successor for instruction in body.values() for successor in program.successors(instruction)
+                  if successor in exits and successor != x}
         for y in sorted(program.bodies):
             other = program.bodies[y]
-            if y == x or x in other or len(body.keys() & other.keys()) < SHARED_ENTRY_MINIMUM:
+            needed = any(exits[target] in other and exits[target] not in body for target in called)
+            if y == x or x in other or len(body.keys() & other.keys()) < SHARED_ENTRY_MINIMUM and not needed:
                 continue
             own = {address: instruction for address, instruction in body.items() if address not in other}
             into = {successor for instruction in own.values() for successor in program.successors(instruction)
@@ -358,6 +387,13 @@ def analyse_after_stack(program, built):
         flow.reset()
         flow.solve()
     flow.conditions_recovered = changed
+    # the bits a test by a register's number can reach, from the values that number holds (ranges.py)
+    opened = set(code_table(program, flow)) | set(signatures.OPEN) | set(program.second_entries) | {RESET_ADDRESS}
+    flow.reaches = ranges.reaches(built, flow, opened, signatures.CONTEXT,
+                                  lambda address, bits: rom_value(program, address, bits))
+    if flow.reaches:
+        flow.reset()
+        flow.solve()
     return flow
 
 
@@ -730,13 +766,15 @@ def fewer_controls(texts, writers, write_way, notes_of, read=None):
     entered at two places from a larger piece of it (split_loop_entries with SPLIT_COPY), small blocks
     several jump to, one each (split_shared_blocks: the heads of loops whose body starts with another loop,
     or all of them), and, given 'read' (rom_value), jumps into a state's case right after storing its number
-    made the switch run again (redispatch_states). The way with the fewest control variables, then the
-    fewest lines, is kept, when it has fewer than the usual one and is no more than SPLIT_GROWTH lines
-    longer. 'write_way' (entry, function) is the writer of a way, 'notes_of' (entry) the function's notes.
+    made the switch run again (redispatch_states); a test the way to it already made goes straight on
+    (thread_known_tests, where the reads it makes are notes of plain memory, not a device's). The way with
+    the fewest control variables, then the fewest lines, is kept, when it has fewer than the usual one and
+    is no more than SPLIT_GROWTH lines longer. 'write_way' (entry, function) is the writer of a way,
+    'notes_of' (entry) the function's notes (what is live after each statement, and pointers.py's fields).
     Returns the entries kept another way."""
     changed = set()
-    ways = [(limit, shared, again) for again in (False, True) for shared in (None, "heads", "all")
-            for limit in (None, SPLIT_COPY) if again or shared or limit]
+    ways = [(limit, shared, again, threads) for threads in (False, True) for again in (False, True)
+            for shared in (None, "heads", "all") for limit in (None, SPLIT_COPY) if threads or again or shared or limit]
     for entry in list(texts):
         _, controls, lines = write_backs(texts[entry])
         if not controls:
@@ -745,10 +783,14 @@ def fewer_controls(texts, writers, write_way, notes_of, read=None):
         base, usual = writers[entry].function, texts[entry]
         registers = set(re.findall(r"\br\d+\b", usual))
         best = (controls, lines)
-        for limit, shared, again in ways:
+        fields = notes[1]
+        for limit, shared, again, threads in ways:
             if again and read is None:
                 continue
             way = twin(base, notes)
+            if threads and not structure.thread_known_tests(
+                    way, notes, lambda load: (fields.get(id(load)) or ("io",))[0] != "io"):
+                continue    # (no test the way to it already made)
             if shared:
                 structure.split_shared_blocks(way, notes, heads_only=shared == "heads")
             if again:
