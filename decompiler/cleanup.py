@@ -4,7 +4,7 @@ Description: removes the statements whose results nothing reads (flags no branch
              before use), once every function's signature is known
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Liveness runs backwards over each function with the data flow's own rules (demanded bits, what calls
@@ -18,11 +18,13 @@ random number generator does things.
 What a call passes by value is worked out as the original does it even where the callee's use of it does
 not matter to this caller (point_to_screen works out a screen x the caller drops, from the projected x
 the caller loads into R0 for it): the C writes the argument, so it has to be what the code passes, not
-whatever the register held before. Where that takes a register this function's own callers do not hand
-it, the C reads the 0 its variable starts with, as for every input no caller sets. A register the callee
-reads only to hand it back as it was (draw_object's R0, which it returns untouched when the object is
-not drawn) is what the code passes only where this caller reads it after the call: elsewhere nothing
-the callee does depends on it.
+whatever the register held before. That is the parts the callee reads: one it never reads is whatever the
+variable holds (the callers of multiply_bytes, which clears the low byte of its value first thing, put a
+level in the high byte and nothing in the low one). Where that takes a register this function's own
+callers do not hand it, the C reads the 0 its variable starts with, as for every input no caller sets.
+A register the callee reads only to hand it back as it was (draw_object's R0, which it returns untouched
+when the object is not drawn) is what the code passes only where this caller reads it after the call:
+elsewhere nothing the callee does depends on it.
 """
 from v60 import ir
 
@@ -176,15 +178,16 @@ def passed_by_value(flow, function, arguments):
             registers = arguments.get(target)
             if summary is None or not registers:
                 continue
-            # the whole of what the C passes: every part up to the highest one the callee reads (its parameter
-            # is that wide), not only the parts it reads (add_to_touchable_list reads only R0's high half);
-            # of a register it reads only to hand it back, only where the caller reads it afterwards
+            # the parts the callee reads: the C passes the variable whole (the parameter is as wide as the
+            # highest part the callee reads), but what a part it never reads holds matters to nothing
+            # (multiply_bytes clears the low byte of its value first thing); of a register it reads only to
+            # hand it back, only where the caller reads it afterwards
             parts, handed_back = set(), {}
             for index in registers:
                 read = [variable[2] for variable in summary.reads if variable[0] == "r" and variable[1] == index]
                 if not read:
                     continue
-                passed = {("r", index, part) for part in range(max(read) + 1)}
+                passed = {("r", index, part) for part in read}
                 if only_handed_back(summary, index):
                     handed_back[index] = passed
                 else:

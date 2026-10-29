@@ -4,7 +4,7 @@ Description: makes the statements of a function read as expressions: temporaries
              uses them, constants fold, and register writes that keep bits nobody reads write the value
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 The lifter binds every value an instruction reads or computes to a temporary, in the order MAME's core
@@ -54,6 +54,16 @@ def simplify_node(node):
         result = node = new
 
 
+def fits(node, bits):
+    """True when 'node' is known to be below 2 ** bits."""
+    if isinstance(node, ir.Const):
+        return node.value >> bits == 0
+    if isinstance(node, ir.Op) and node.name in ("zext", "trunc", "fits"):
+        inner = node.args[0] if node.name == "zext" else node
+        return getattr(inner, "bits", 32) <= bits
+    return getattr(node, "bits", 32) <= bits
+
+
 def narrowed_operand(node, bits):
     """'node' at 'bits' when it is a value of that width sign- or zero-extended (or a constant), else None."""
     if isinstance(node, ir.Const):
@@ -87,6 +97,15 @@ def simplify_one(node):
                 return ir.Const((value & mask) >> count, bits)
             signed = value - (1 << bits) if (value >> (bits - 1)) & 1 else value
             return ir.Const((signed >> count) & mask, bits)
+    if name == "shr" and constants[1] is not None and isinstance(args[0], ir.Op) and args[0].name == "or" \
+            and isinstance(args[0].args[0], ir.Op) and args[0].args[0].name == "and" \
+            and isinstance(args[0].args[0].args[1], ir.Const):
+        # ((bc & ~0xFF) | c) >> 8: the part just written shifts out, and what is left is the rest kept
+        kept, rest = args[0].args
+        count = constants[1]
+        keep = kept.args[1].value
+        if count < bits and keep >> count == mask_of(bits) >> count and fits(rest, count):
+            return ir.op("shr", (kept.args[0], args[1]), bits)
     if name in ("neg", "not") and constants[0] is not None:
         value = -constants[0] if name == "neg" else ~constants[0]
         return ir.Const(value & mask_of(bits), bits)
@@ -555,9 +574,83 @@ def writes_register(statement, flow, index):
     return ("r", index) in written
 
 
+def value_bits(node, earlier, depth=0):
+    """(how many low bits are known zero, how many bits the value fits in) of an expression, following the
+    registers through 'earlier' (register -> (its value where it was last written in the block, and the
+    'earlier' of that write)): the screen's index, a byte, turned round by 19 bits has its low 19 bits zero."""
+    bits = getattr(node, "bits", 32)
+    low, width = 0, bits
+    if isinstance(node, ir.Const):
+        low = bits if node.value == 0 else (node.value & -node.value).bit_length() - 1
+        width = node.value.bit_length()
+    elif isinstance(node, ir.Reg) and node.index in earlier and depth < 8:
+        value, before = earlier[node.index]
+        low, width = value_bits(value, before, depth + 1)
+    elif isinstance(node, ir.Load):
+        width = node.bits
+    elif isinstance(node, ir.Op):
+        name, args = node.name, node.args
+        found = [value_bits(arg, earlier, depth) for arg in args]
+        if name in ("zext", "fits"):
+            low, width = found[0][0], min(found[0][1], getattr(args[0], "bits", 32))
+        elif name == "trunc":
+            low, width = min(found[0][0], bits), min(found[0][1], bits)
+        elif name == "shl" and isinstance(args[1], ir.Const):
+            low, width = found[0][0] + args[1].value, found[0][1] + args[1].value
+        elif name == "shr" and isinstance(args[1], ir.Const):
+            low, width = max(0, found[0][0] - args[1].value), max(0, found[0][1] - args[1].value)
+        elif name == "and":
+            low, width = max(found[0][0], found[1][0]), min(found[0][1], found[1][1])
+        elif name in ("or", "xor"):
+            low, width = min(found[0][0], found[1][0]), max(found[0][1], found[1][1])
+        elif name == "add":
+            low, width = min(found[0][0], found[1][0]), max(found[0][1], found[1][1]) + 1
+        elif name == "mul" and isinstance(args[1], ir.Const):
+            low, width = found[0][0] + found[1][0], found[0][1] + found[1][1]
+    width = min(width, bits)
+    return (bits if width == 0 else min(low, bits)), width
+
+
+def reads_kept(statement, register, keep):
+    """True if 'statement' reads bits of the register a partial write that keeps 'keep' kept, as a value."""
+    found, temps = set(), {}
+    for expression in ir.statement_expressions(statement):
+        bits = statement.bits if isinstance(statement, ir.Store) and expression is statement.value else 32
+        dataflow.demanded(expression, dataflow.width(bits), found, temps)
+    return any(variable[:2] == ("r", register) and keep & bits for variable in found
+               for part, bits in dataflow.PARTS if variable[2] == part)
+
+
+def registers_before(statements, position):
+    """For value_bits: each register's last write among statements[:position], with what was written
+    before that one."""
+    earlier = {}
+    for statement in statements[:position]:
+        if isinstance(statement, ir.SetReg):
+            before = earlier
+            earlier = dict(before)
+            earlier[statement.index] = (statement.value, before)
+        elif isinstance(statement, (ir.Call, ir.Effect)):
+            earlier = {}    # (a call may write any of them)
+    return earlier
+
+
+def written_bits(keep):
+    """How many low bits a partial write that keeps 'keep' writes."""
+    return (keep & -keep).bit_length() - 1 if keep else 32
+
+
 def inline_register_block(block, flow, after, context):
     """One pass: a register set and then read once, and dead after that read, goes into the reading
-    statement. Returns True if something changed."""
+    statement. Not a value into the rest a partial write of a new value keeps, unless the part that write
+    replaces is zero in that value (value_bits: a byte shifted up past it, the screen's index turned round), or
+    the rest is (fork_branch_sprite's width, a halfword, under the width bits: r14 = the bits):
+    read_switches_and_analog shifts the A/D converter's bits in a step at a time (reading <<= 1, then its low
+    byte the next read), road_row_pair_draw turns its pair round, then writes its low half; nor a part of the
+    register written with a new value into what reads the rest it keeps too as a value, not an address
+    (test_mode_bookkeeping_draw_histogram's cell: its attribute kept, its character the letter; the A/D
+    converter's next shift): each is the original's own step, a part of one value changed in place. Returns
+    True if something changed."""
     statements = block.statements
     everything = statements + [block.end]
     for index, statement in enumerate(statements):
@@ -606,6 +699,22 @@ def inline_register_block(block, flow, after, context):
                 break
         if not movable:
             continue
+
+        if isinstance(user, ir.SetReg) and user.index == register:
+            _, written, keep = dataflow.partial_write(user)
+            low, width = value_bits(value, registers_before(statements, index))
+            if keep and ir.Reg(register) not in set(ir.walk(written)) and not isinstance(value, ir.Reg) \
+                    and low < written_bits(keep) < width:
+                continue    # (the rest a partial write of a new value keeps, where neither the part it writes nor
+                            # that rest was 0; a copy of another register is a place in its page: LINKED)
+        _, rest, keep = dataflow.partial_write(statement)
+        if keep and ir.Reg(register) not in set(ir.walk(rest)) \
+                and (isinstance(user, ir.Store) or isinstance(user, ir.SetReg) and user.index == register) \
+                and not in_address(user, register) and reads_kept(user, register, keep):
+            low, width = value_bits(ir.Reg(register), registers_before(statements, index))
+            if low < written_bits(keep) < width:
+                continue    # (a new value in place of a part that was not 0, stored or worked on with the rest,
+                            # which is not 0 either: a step of its own)
 
         def change(node, register=register, value=value):
             return value if isinstance(node, ir.Reg) and node.index == register else None

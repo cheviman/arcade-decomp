@@ -4,7 +4,7 @@ Description: splits each register of a function into the variables it really hol
              definitions and uses), each with the width its uses need
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Hand-written assembly reuses a register for one thing after another. A definition (an assignment, a call
@@ -12,7 +12,11 @@ that hands the register back, the function's start) and the uses it reaches make
 common use are one variable, and so are the values an assignment works out from the register itself
 (r19 += 2 as it walks a list, the low byte counted up), as long as it does not only look something up
 with it (r0 = table[r0] is a new value) or keep the rest of it (mov.b #9, R0 puts a new value, a sound
-number, in the low byte of whatever R0 held). A call that hands a register back through a pointer takes the caller's
+number, in the low byte of whatever R0 held), unless that rest is read afterwards: then the write changes a
+part of the one value the register holds (random_number's halves, the A/D converter's bits shifted in, the
+Z80's BC with its count in B), and the C says so (x = (x & ~0xFFu) | y); not when the code reads memory
+through either of them: a pointer moved to another place of its page is a pointer of its own (the input
+test's ports, r12 = IN_PAGE(port_a, 0xAu)). A call that hands a register back through a pointer takes the caller's
 variable in and out, so what reaches the call and what it hands back are one web, unless what the
 register held does not matter to the call: the callee always writes the whole register and never reads
 what it held (queue_sprite_at_depth's bucket head), or it writes every part of it the caller reads
@@ -63,6 +67,14 @@ def outside_loads(expression):
             stack.extend(node.args)
 
 
+def address_reads(statement):
+    """The ids of the register reads in the address of a memory access 'statement' makes."""
+    addresses = [statement.address] if isinstance(statement, ir.Store) else []
+    for expression in ir.statement_expressions(statement):
+        addresses += [node.address for node in ir.walk(expression) if isinstance(node, ir.Load)]
+    return {id(node) for address in addresses for node in ir.walk(address) if isinstance(node, ir.Reg)}
+
+
 class Union:
     def __init__(self):
         self.parent = {}
@@ -109,6 +121,8 @@ class Variables:
         self.implicit = {}    # (id(statement), register) -> definitions reaching it
         self.defined = {}     # (id(statement), register) -> its definition
         self.through_pointer = set()    # definitions a call or effect makes, through a pointer to the variable
+        self.addressed = set()          # definitions read in the address of a memory access
+        self.kept_joins = []            # (definitions of the part a partial write keeps, the write's definition)
         self.hint = hint                # (this, web root, its items) -> a name for it, or None
         self.entry_names = entry_names or {}    # register -> name of the parameter or result it holds
         self.chosen = chosen or {}      # (address of a definition or "entry", "rN") -> symbols.txt's name
@@ -194,12 +208,15 @@ class Variables:
 
     def step(self, statement, state, record):
         if record:
+            addresses = address_reads(statement)
             for expression in ir.statement_expressions(statement):
                 for node in ir.walk(expression):
                     if isinstance(node, ir.Reg) and self.scratch(node.index):
                         reaching = state.get(node.index, frozenset())
                         self.uses[id(node)] = reaching
                         self.link(reaching)
+                        if id(node) in addresses:
+                            self.addressed |= reaching
             for index in self.implicit_uses(statement):
                 reaching = state.get(index, frozenset())
                 self.implicit[(id(statement), index)] = reaching
@@ -213,11 +230,18 @@ class Variables:
                 if isinstance(statement, ir.SetReg):
                     # worked out from the register itself: the same variable, changed (in a partial write,
                     # the part it writes has to come from the register too)
-                    _, written, _ = dataflow.partial_write(statement)
+                    _, written, keep = dataflow.partial_write(statement)
                     for node in outside_loads(written):
                         if isinstance(node, ir.Reg) and node.index == index:
                             for previous in self.uses.get(id(node), ()):
                                 self.webs.join(previous, definition)
+                    if keep and self.after is not None and any(
+                            ("r", index, part) in self.after.get(id(statement), ())
+                            for part, bits in dataflow.PARTS if keep & bits):
+                        # (the part it keeps is read afterwards: the same value, a part of it changed; joined
+                        # once every web is made, unless one of them is a pointer)
+                        kept = statement.value.args[0].args[0]
+                        self.kept_joins.append((self.uses.get(id(kept), frozenset()), definition))
                 returned = self.returned_value(statement) if not isinstance(statement, ir.SetReg) else {}
                 if index in returned:
                     self.returned_bits[definition] = returned[index]
@@ -272,6 +296,11 @@ class Variables:
             for statement in block.statements:
                 self.step(statement, state, True)
             self.step(block.end, state, True)
+        pointers = {self.webs.find(definition) for definition in self.addressed}
+        for previous, definition in self.kept_joins:
+            if not {self.webs.find(item) for item in previous} & pointers and self.webs.find(definition) not in pointers:
+                for item in previous:
+                    self.webs.join(item, definition)
         for index in registers:
             self.webs.find(("entry", index))
         self.read = self.read_definitions()
