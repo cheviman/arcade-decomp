@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -1187,7 +1187,45 @@ class FunctionWriter:
         own = self.own_element(address, bits)
         if own is not None:
             return own
-        return self.emitter.memory.access(address, bits, self.exact)
+        return self.emitter.memory.access(address, bits, self.exact, indexed=self.counted_index(address),
+                                          signed_text=self.signed_text)
+
+    def signed_text(self, node):
+        """C for a signed value as the number it is (an index from a table's middle: 64 + steering)."""
+        return self.printer.wrap(self.printer.any(node), cprint.UNARY)
+
+    def counted_index(self, address):
+        """True for "constant + register" where the register holds a count, not an address: every value that
+        reaches it there is a byte or a halfword (memory.small), or the register itself counted on by a
+        constant (car_select_entries_run's players_left, from player_count down to 1: car_numbers[players_left
+        - 1u])."""
+        if not (isinstance(address, ir.Op) and address.name == "add" and len(address.args) == 2):
+            return False
+        constant, register = address.args
+        if isinstance(register, ir.Const):
+            constant, register = register, constant
+        return isinstance(constant, ir.Const) and isinstance(register, ir.Reg) and self.counted(register, set())
+
+    def counted(self, read, seen):
+        """counted_index() for one read of a register, 'seen' the definitions already looked at."""
+        definitions = self.vars.uses.get(id(read))
+        if not definitions:
+            return False
+        for definition in definitions:
+            if definition in seen:
+                continue
+            seen.add(definition)
+            statement = self.vars.statement_of(definition[1]) if definition[0] == "def" else None
+            if not isinstance(statement, ir.SetReg):
+                return False    # (what the function starts with, or what a call leaves)
+            value = statement.value
+            if memory.small(value):
+                continue
+            stepped = value.args[0] if isinstance(value, ir.Op) and value.name in ("add", "sub") \
+                and isinstance(value.args[1], ir.Const) else None
+            if not (isinstance(stepped, ir.Reg) and stepped.index == read.index and self.counted(stepped, seen)):
+                return False
+        return True
 
     def own_element(self, address, bits):
         """(C, signed, True) for an element of a table in work RAM the function's family names its own way
