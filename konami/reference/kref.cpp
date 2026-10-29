@@ -11,7 +11,8 @@
  *    Not part of the game. Usage:
  *      kref [--frames N] [--hashes hashes.txt] [--trace executed.txt] [--calls called.txt]
  *           [--text FRAME ...] [--dump FRAME ... --dump-dir DIR] [--video-hashes hashes.txt]
- *           [--video-dump FRAME ... --video-dir DIR] [--service] [--rom FOLDER]
+ *           [--video-dump FRAME ... --video-dir DIR] [--sound-hashes hashes.txt] [--sound-wav sound.wav]
+ *           [--sound-trace executed.txt] [--script controls.txt] [--service] [--rom FOLDER]
  *
  *    It runs the original program, so it reads the player's ROM set when it starts, as MAME does: the set
  *    in --rom's folder or .zip (rom/ by default), into the board's memory (game/data.h,
@@ -19,7 +20,11 @@
  *
  *    Time keeps MAME's pace: the 68000 runs its cycles a line at a time (512 of them, 64 us), and a frame
  *    ends when VBLANK begins, at line 240, where the board takes its events (the sprite DMA, IRQ5) and the
- *    frame's state hash is taken. The sound board is not run yet: the program sees its latch as it leaves it.
+ *    frame's state hash is taken. Without the sound options the sound board stands still: the 68000 reads
+ *    nothing from it.
+ *
+ *    --script applies a control script (runtime/include/tmnt/script.h) when each VBLANK starts, and runs
+ *    the frames its "end" says unless --frames is given.
  *
  *    --hashes writes "FRAME HASH" per frame (tmnt_state_hash); --trace and --calls the addresses executed
  *    and the ones reached by jsr or bsr, one per line; --text prints the fixed layer's tiles of those frames
@@ -29,16 +34,24 @@
  *    --video-hashes and --video-dump draw the frames with MAME's K052109 and K051960 (video/kvideo.cpp): the
  *    hash of every frame's pixels, and frames as BMP (DIR/frame_N.bmp), 320x224 from line 16. The video
  *    takes the board's memories when VBLANK ends (line 16, the scroll) and when it starts (the frame).
+ *
+ *    --sound-hashes, --sound-wav and --sound-trace run the sound board (sound/ksound.cpp: MAME's Z80, K007232
+ *    and uPD7759, ymfm's YM2151, the title music): for each frame the hash of the samples the sources made
+ *    and of the Z80's RAM; the sound mixed, as a WAV; the Z80 addresses executed. The Z80 catches up with
+ *    the 68000 before the 68000 writes its latch or raises its IRQ, as MAME synchronizes them.
  */
 #include "emu.h"
 #include "m68000.h"
 
 #include "game/data.h"
 #include "game/extract.h"
+#include "ksound.h"
 #include "kvideo.h"
 #include "tmnt/machine.h"
+#include "tmnt/script.h"
 
 #include <cinttypes>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -132,14 +145,53 @@ void write_addresses(const std::string &path, const std::vector<uint8_t> &bits, 
 		}
 }
 
+// The 68000's slice while it runs: where it started and how long it is
+uint64_t g_slice_start = 0;
+int g_slice_budget = 0;
+bool g_in_slice = false;
+
 // The 68000 runs until the board's clock reaches 'cycle', a line at a time at most
 void run_until(reference_cpu &cpu, uint64_t cycle)
 {
 	while (tmnt_board.cycles < cycle)
 	{
 		const uint64_t slice = std::min<uint64_t>(cycle - tmnt_board.cycles, TMNT_LINE_CYCLES);
+		g_slice_start = tmnt_board.cycles;
+		g_slice_budget = int(slice);
+		g_in_slice = true;
 		tmnt_board.cycles += uint64_t(cpu.run(int(slice)));
+		g_in_slice = false;
 	}
+}
+
+// The sound board catches up with the 68000's present, as MAME synchronizes the latch and the Z80's IRQ
+void sound_sync()
+{
+	const uint64_t now = g_in_slice ? g_slice_start + uint64_t(g_slice_budget - g_cpu->cycles_left()) : tmnt_board.cycles;
+	ks_run_until(now);
+}
+
+void write_wav(const std::string &path, const std::vector<int16_t> &samples, uint32_t rate)
+{
+	std::vector<uint8_t> file(44 + samples.size() * 2, 0);
+	auto put32 = [&](size_t at, uint32_t value) { for (int byte = 0; byte < 4; byte++) file[at + byte] = uint8_t(value >> (8 * byte)); };
+	auto put16 = [&](size_t at, uint16_t value) { file[at] = uint8_t(value); file[at + 1] = uint8_t(value >> 8); };
+	std::memcpy(&file[0], "RIFF", 4);
+	put32(4, uint32_t(file.size() - 8));
+	std::memcpy(&file[8], "WAVEfmt ", 8);
+	put32(16, 16);
+	put16(20, 1);
+	put16(22, 1);
+	put32(24, rate);
+	put32(28, rate * 2);
+	put16(32, 2);
+	put16(34, 16);
+	std::memcpy(&file[36], "data", 4);
+	put32(40, uint32_t(samples.size() * 2));
+	for (size_t index = 0; index < samples.size(); index++)
+		put16(44 + index * 2, uint16_t(samples[index]));
+	std::ofstream out(path, std::ios::binary);
+	out.write(reinterpret_cast<const char *>(file.data()), std::streamsize(file.size()));
 }
 
 // The last frame the reference video drew, as a 24-bit BMP
@@ -214,11 +266,14 @@ int main(int argc, char **argv)
 {
 	const char *usage = "Usage: kref [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--text FRAME ...]"
 		" [--dump FRAME ... --dump-dir DIR] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
-		" [--service] [--rom FOLDER]\n";
+		" [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE] [--script FILE] [--service] [--rom FOLDER]\n";
 	std::string rom_folder = "rom";
 	std::string hashes_path, trace_path, calls_path, dump_folder = ".", video_hashes_path, video_folder = ".";
+	std::string sound_hashes_path, sound_wav_path, sound_trace_path;
 	std::set<uint64_t> text_frames, dump_frames, video_dump_frames;
 	uint64_t frames = 600;
+	bool frames_given = false;
+	std::string script_path;
 	bool service = false;
 
 	for (int index = 1; index < argc; index++)
@@ -226,7 +281,12 @@ int main(int argc, char **argv)
 		const std::string argument = argv[index];
 		const bool has_value = index + 1 < argc;
 		if (argument == "--frames" && has_value)
+		{
 			frames = std::strtoull(argv[++index], nullptr, 10);
+			frames_given = true;
+		}
+		else if (argument == "--script" && has_value)
+			script_path = argv[++index];
 		else if (argument == "--hashes" && has_value)
 			hashes_path = argv[++index];
 		else if (argument == "--trace" && has_value)
@@ -248,6 +308,12 @@ int main(int argc, char **argv)
 				video_dump_frames.insert(std::strtoull(argv[++index], nullptr, 10));
 		else if (argument == "--video-dir" && has_value)
 			video_folder = argv[++index];
+		else if (argument == "--sound-hashes" && has_value)
+			sound_hashes_path = argv[++index];
+		else if (argument == "--sound-wav" && has_value)
+			sound_wav_path = argv[++index];
+		else if (argument == "--sound-trace" && has_value)
+			sound_trace_path = argv[++index];
 		else if (argument == "--service")
 			service = true;
 		else if (argument == "--rom" && has_value)
@@ -267,6 +333,20 @@ int main(int argc, char **argv)
 	tmnt_reset();
 	if (service)
 		tmnt_board.dsw[2] &= uint8_t(~TMNT_DSW3_SERVICE);
+	tmnt_script *script = nullptr;
+	if (!script_path.empty())
+	{
+		char error[256];
+		script = tmnt_script_load(script_path.c_str(), error, sizeof(error));
+		if (!script)
+		{
+			std::cerr << error << '\n';
+			return 1;
+		}
+		if (!frames_given && tmnt_script_frames(script))
+			frames = tmnt_script_frames(script);
+		tmnt_script_apply(script, 0);
+	}
 
 	reference_cpu cpu;
 	g_cpu = &cpu;
@@ -291,6 +371,16 @@ int main(int argc, char **argv)
 	const bool video = video_hashes.is_open() || !video_dump_frames.empty();
 	if (video)
 		kv_attach();
+	std::ofstream sound_hashes;
+	if (!sound_hashes_path.empty())
+		sound_hashes.open(sound_hashes_path);
+	std::vector<int16_t> sound_mix;
+	const bool sound = sound_hashes.is_open() || !sound_wav_path.empty() || !sound_trace_path.empty();
+	if (sound)
+	{
+		ks_attach();
+		tmnt_board.sound_sync = sound_sync;
+	}
 
 	int status = 0;
 	uint64_t frame = 0;
@@ -306,7 +396,25 @@ int main(int argc, char **argv)
 			if (video)
 				kv_vblank_start(video_hashes.is_open() || video_dump_frames.count(frame) != 0);
 			tmnt_vblank_start();
+			tmnt_script_apply(script, tmnt_board.frame);
 			sync_irq();
+			if (sound)
+			{
+				ks_end_frame(tmnt_board.cycles);
+				if (sound_hashes.is_open())
+				{
+					char line[64];
+					std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", frame,
+						ks_frame_samples_hash(), ks_state_hash());
+					sound_hashes << line;
+				}
+				if (!sound_wav_path.empty())
+				{
+					size_t count = 0;
+					const int16_t *mix = ks_frame_mix(&count);
+					sound_mix.insert(sound_mix.end(), mix, mix + count);
+				}
+			}
 			if (g_irq_level)
 				g_irq_frames++;
 			if (hashes.is_open())
@@ -352,5 +460,22 @@ int main(int argc, char **argv)
 		write_addresses(trace_path, g_executed, "68000 addresses executed by kref");
 	if (!calls_path.empty())
 		write_addresses(calls_path, g_called, "68000 addresses reached by jsr or bsr");
+	if (sound)
+		std::cout << "Z80 cycles:        " << ks_z80_cycles() << '\n';
+	if (!sound_wav_path.empty())
+		write_wav(sound_wav_path, sound_mix, ks_mix_rate());
+	if (!sound_trace_path.empty())
+	{
+		std::ofstream out(sound_trace_path);
+		out << "# Z80 addresses executed by kref, one per line\n";
+		for (uint32_t address = 0; address < 0x10000; address++)
+			if (ks_executed()[address >> 3] & (1u << (address & 7)))
+			{
+				char line[16];
+				std::snprintf(line, sizeof(line), "%04X\n", address);
+				out << line;
+			}
+	}
+	tmnt_script_free(script);
 	return status;
 }

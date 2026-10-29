@@ -4,7 +4,7 @@ Description: runs every control script on the reference and on the translated ga
              frame, and checks that the static analysis alone finds all the code the reference ran
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    26-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-only] [--translated] [--video]
@@ -29,9 +29,9 @@ Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-o
   --bin DIR       the executables to run (build/bin by default): another build of the game
   --out DIR       where the runs go (build/scenarios by default)
 
-For every script: build/bin/s32ref writes build/scenarios/NAME/{executed,called,hashes}.txt, the
-game (build/bin/GAME_game_headless, from tools/decompile.py) writes game_hashes.txt, and the two hash
-lists are compared. Then the static analysis (tools/disassemble.py, symbols.txt, no traces) is run once,
+For every script: the reference (build/bin/s32ref, or the profile's REFERENCE) writes
+build/scenarios/NAME/{executed,called,hashes}.txt, the game (build/bin/GAME_game_headless, from
+tools/decompile.py) writes game_hashes.txt, and the two hash lists are compared. Then the static analysis (tools/disassemble.py, symbols.txt, no traces) is run once,
 and every address the reference executed in any scenario has to be among the instructions it found:
 the ones that are not are listed by the place they are entered from, which is where symbols.txt or the
 analysis falls short.
@@ -44,11 +44,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import game_profile  # noqa: E402  (the game's: its root, its ROM set)
-import disassemble  # noqa: E402
 
 ROOT = game_profile.ROOT
 rom = game_profile.rom
-from v60 import disassembler as dis  # noqa: E402
+# the game's reference (s32ref, kref...), and whether its CPU has the static analysis yet (a game whose CPU
+# frontend is still to come runs its scenarios on the reference alone)
+REFERENCE = getattr(game_profile, "REFERENCE", "s32ref")
+STATIC_ANALYSIS = getattr(game_profile, "STATIC_ANALYSIS", True)
+if STATIC_ANALYSIS:
+    import disassemble  # noqa: E402
+    from v60 import disassembler as dis  # noqa: E402
 
 CONTROLS = ROOT / "tests" / "controls"
 RESULTS = ROOT / "build" / "scenarios"
@@ -67,13 +72,13 @@ def run_reference(script, out, video, sound=False, timing=True):
     if sound:
         extra += (["--sound-timing", str(SOUND_TIMING)] if timing else []) + ["--sound-hashes", str(out / "sound_hashes.txt"),
                                                                              "--sound-trace", str(out / "sound_executed.txt")]
-    result = subprocess.run([str(executable("s32ref")), "--script", str(script),
+    result = subprocess.run([str(executable(REFERENCE)), "--script", str(script),
                              "--trace", str(out / "executed.txt"), "--calls", str(out / "called.txt"),
                              "--hashes", str(out / "hashes.txt")] + extra,
                             capture_output=True, text=True)
     stopped = [line for line in result.stderr.splitlines() if line.startswith(f"{game_profile.CPU} stopped")]
     if not stopped and result.returncode != 0:
-        # the run did not start: s32ref says why on its first lines
+        # the run did not start: the reference says why on its first lines
         stopped = [" ".join(line for line in result.stderr.splitlines() if not line.startswith("[s32]"))[:200]]
     return stopped[0] if stopped else None
 
@@ -161,6 +166,9 @@ def reference_only(names, jobs, video, sound):
             failures += stopped is not None
             print(f"{name:<28} {frames:7} {len(executed):9} {new:7}  {stopped or 'ran to its end'}", flush=True)
     print(f"\nall the scenarios: {len(seen)} addresses executed")
+    if not STATIC_ANALYSIS:
+        print(f"static analysis: none yet for the {game_profile.CPU}")
+        return 1 if failures else 0
     executed, missing, entries = static_check(names)
     image = rom.build_program(rom.load_set(ROOT / "rom"))
     analysis = disassemble.Analysis(image, disassemble.load_symbols(ROOT / "symbols.txt"))

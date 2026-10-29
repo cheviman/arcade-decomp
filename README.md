@@ -54,15 +54,17 @@ Nothing here is a game's: no ROM, no names, no data.
 - `konami/reference/`: the reference of a game on Konami's 68000 boards: `kref` runs the original program
   on MAME's 68000 core against the game's board model (its runtime's `tmnt/machine.h`) and writes each
   frame's state hash, the addresses it executed and the ones it called, the fixed layer as text and the
-  board's memories, and with MAME's video (`video/kvideo.cpp`) each frame's picture hash and frames as
-  BMP; `oracle_m68k`, MAME's 68000 disassembler, for the 68000 frontend to come. `reference.cmake` builds
+  board's memories, with MAME's video (`video/kvideo.cpp`) each frame's picture hash and frames as BMP,
+  and with its sound board (`sound/ksound.cpp`: MAME's Z80, K007232 and uPD7759, ymfm's YM2151, the title
+  music) each frame's samples and sound RAM hashes, the sound as a WAV and the Z80 addresses executed;
+  `oracle_m68k`, MAME's 68000 disassembler, for the 68000 frontend to come. `reference.cmake` builds
   them: the game's CMake includes it after its board runtime (`K_GAME_RUNTIME`). MAME 0.289's sources are
   in `mame/` (the 68000 core, whose handlers `m68000gen.py` writes from `m68000.lst` at build time, the
   direct ones only; util's bitmap and palette and emu's drawgfx and tilemap; the `tmnt.cpp` driver and its
   video chips, the K052109 and the K051960; the K007232, the uPD7759 and the YM2151) and ymfm's OPM in
-  `ymfm/`; the sound board is not in `kref` yet. `stub/emu.h` stands in for MAME's framework around the
-  68000, and `video/emu.h` around the video, which `video/kvideo.cpp` compiles unchanged inside a namespace
-  of its own.
+  `ymfm/`; the Z80 core is `system32/reference/mame/z80`'s. `stub/emu.h` stands in for MAME's framework
+  around the 68000, `video/emu.h` around the video and `sound/emu.h` around the sound board, which
+  `video/kvideo.cpp` and `sound/ksound.cpp` compile unchanged inside namespaces of their own.
 
 ## A game's profile
 
@@ -72,7 +74,9 @@ and gives the core
 - `ROOT`, the game's repository; `rom`, its ROM set's module (`load_set`, `build_program`, `build_sound`,
   `PROGRAM_AREAS`, `canonical_address`, `ProgramMemory`);
 - `GAME`, `ROM_SET_TITLE`, `CPU`, `GUARD`: what the generated files say of the game; `BINARY`, the prefix of
-  its executables (`sonic_game_headless`, `orunners_headless`);
+  its executables (`sonic_game_headless`, `orunners_headless`); `REFERENCE`, its reference's executable
+  (`s32ref` by default, `kref`), and `STATIC_ANALYSIS`, false while its CPU has no frontend here yet (its
+  scenarios then run on the reference alone);
 - the decompiler's settings, which it writes into the core's modules: the structures the game keeps
   (`pointers.STRUCTS`), what the registers the whole program shares hold (`signatures.CONTEXT`,
   `pointers.CONTEXT_KINDS`), the base of its variables, its object handler's slots, the fixed structures and

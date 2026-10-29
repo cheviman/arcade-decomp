@@ -61,6 +61,29 @@ if(MSVC)
 	target_compile_options(kvideo_reference PRIVATE /bigobj /wd4244 /wd4267 /wd4100 /wd4146 /wd4127 /wd4018)
 endif()
 
+# The sound board: MAME's Z80 (system32/reference's copy of the core), K007232 and uPD7759, ymfm's YM2151.
+# The Z80 core's steps are written from z80.lst at build time, as MAME does
+set(K_Z80 ${K_REFERENCE}/../../system32/reference/mame/z80)
+set(K_Z80_STEPS ${CMAKE_BINARY_DIR}/generated/cpu/z80/z80.hxx)
+add_custom_command(OUTPUT ${K_Z80_STEPS}
+	COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated/cpu/z80
+	COMMAND Python3::Interpreter ${K_Z80}/z80make.py z80 ${K_Z80}/z80.lst ${K_Z80_STEPS}
+	DEPENDS ${K_Z80}/z80make.py ${K_Z80}/z80.lst
+	VERBATIM)
+add_library(ksound_reference STATIC
+	${K_REFERENCE}/sound/ksound.cpp
+	${K_REFERENCE}/ymfm/ymfm_opm.cpp
+	${K_Z80_STEPS}
+)
+target_include_directories(ksound_reference
+	PUBLIC ${K_REFERENCE}/sound
+	PRIVATE ${K_RUNTIME_INCLUDE} ${K_REFERENCE}/ymfm ${K_Z80} ${K_REFERENCE}/mame/sound
+		${CMAKE_BINARY_DIR}/generated)
+target_compile_features(ksound_reference PUBLIC cxx_std_20)
+if(MSVC)
+	target_compile_options(ksound_reference PRIVATE /bigobj /wd4244 /wd4267 /wd4100 /wd4146 /wd4127 /wd4018)
+endif()
+
 add_executable(kref ${K_REFERENCE}/kref.cpp)
 target_include_directories(kref PRIVATE ${K_RUNTIME_INCLUDE})
-target_link_libraries(kref PRIVATE m68000_reference kvideo_reference ${K_GAME_RUNTIME})
+target_link_libraries(kref PRIVATE m68000_reference kvideo_reference ksound_reference ${K_GAME_RUNTIME})
