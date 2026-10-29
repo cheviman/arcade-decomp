@@ -1114,6 +1114,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         raise SystemExit("symbols.txt names numbers the C does not use: " + ", ".join(unused))
     numbers = [f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
                                                                           in emitter.constants.items()})]
+    named.drop_unread(texts.values())
     (out_dir / "ram.h").write_text(
         file_header("ram.h", "the game's variables, tables, board registers and structures")
         + f"#ifndef {game_profile.GUARD}_RAM_H\n#define {game_profile.GUARD}_RAM_H\n\n"

@@ -206,7 +206,7 @@ class Names(NamedTuple):
 
 
     tasks: set          # functions a task starts at: the runtime runs them by address (task lines)
-    counts: dict        # work RAM address -> how many elements the variable there has (var NAME[COUNT])
+    counts: dict        # address -> how many elements the variable or table there has (NAME[COUNT])
     unread: set         # (function name, register number): a register the function reads before it sets it
                         # only on a path the game never takes (unread lines): it starts at 0 there
     board_structs: set  # the structures (and arrays of values) in a memory of the board the code reads and
@@ -221,7 +221,9 @@ def load_names(path, registers=None):
         ADDRESS  var    NAME  TYPE [STRUCT]  a variable in work RAM (TYPE: u8 s8 u16 s16 u32 s32); NAME[COUNT]:
                                          an array of COUNT of them, which the C reads as NAME[n]
         ADDRESS  io     NAME  TYPE       a hardware register
-        ADDRESS  table  NAME  TYPE [STRUCT]  data in the program ROM the code reads by index, TYPE per element
+        ADDRESS  table  NAME  TYPE [STRUCT]  data in the program ROM the code reads by index, TYPE per element;
+                                         NAME[COUNT]: COUNT of them, which the C reads from any element
+                                         (steer_frames_by_steering[64 + steering], from its middle)
         ADDRESS  table  NAME  STRUCT     a table of the program ROM's records (a structure or an array
                                          "rom", or elements), read by index: name[i].field
         struct   NAME   SIZE             a structure in work RAM (SIZE in hexadecimal)
@@ -449,11 +451,12 @@ def load_names(path, registers=None):
             raise SystemExit(f"{where}: expected 'ADDRESS {parts[1]} NAME TYPE' with TYPE in {VALUE_TYPES}")
         address = int(parts[0], 16)
         target = {"var": names.variables, "io": names.hardware, "table": names.tables}[parts[1]]
-        if parts[1] == "var" and "[" in parts[2]:
-            # an array: NAME[COUNT], its elements one after another
+        if parts[1] in ("var", "table") and "[" in parts[2]:
+            # an array: NAME[COUNT], its elements one after another (a table's count lets the C read it from
+            # an element past its first: steer_frames_by_steering by the steering, from its middle)
             name, _, count = parts[2].partition("[")
             if not count.endswith("]") or not count[:-1].isdigit() or not name.isidentifier():
-                raise SystemExit(f"{where}: expected 'ADDRESS var NAME[COUNT] TYPE'")
+                raise SystemExit(f"{where}: expected 'ADDRESS {parts[1]} NAME[COUNT] TYPE'")
             parts[2] = name
             names.counts[address] = int(count[:-1])
         if parts[1] == "var":

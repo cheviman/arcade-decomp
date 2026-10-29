@@ -3,7 +3,7 @@ Name:        cprint.py
 Description: prints IR expressions as plain C, with casts and parentheses only where the value needs them
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 An IR value has a width; C has its integer types and promotions. Every printed value says whether it
@@ -106,6 +106,23 @@ def fits8(node):
     if isinstance(node, ir.Op) and node.name in ("zext", "fits", "trunc"):
         return getattr(node.args[0], "bits", 32) <= 8 or (node.name in ("fits", "trunc") and node.bits <= 8)
     return getattr(node, "bits", 32) <= 8
+
+
+def page_offset(node, base):
+    """The offset when 'node' is the low half of a sum on 'base': (uint16_t)(base + offset), or the sum in 16
+    bits of base's low half and the offset (add.h); else None."""
+    while isinstance(node, ir.Op) and node.name in ("zext", "fits"):
+        node = node.args[0]
+    if not (isinstance(node, ir.Op) and node.bits == 16):
+        return None
+    if node.name == "trunc":
+        total = node.args[0]
+        return total.args[1] if isinstance(total, ir.Op) and total.name == "add" and total.args[0] == base else None
+    if node.name == "add":
+        low, offset = node.args
+        if isinstance(low, ir.Op) and low.name == "trunc" and low.args[0] == base:
+            return offset
+    return None
 
 
 def fits16(node):
@@ -415,6 +432,12 @@ class Printer:
         exact = (bits == 32 and ctype == "u32") or (bits == 64 and ctype == "u64")
         return Value(text, prec, exact, ctype)
 
+    def pointer_base(self, node):
+        """True for a pointer, or a pointer plus a constant (screen + 0x2000u)."""
+        if isinstance(node, ir.Op) and node.name == "add" and isinstance(node.args[1], ir.Const):
+            node = node.args[0]
+        return isinstance(node, ir.Reg) and self.names.pointer(node)
+
     def bitwise(self, node):
         name, (left_node, right_node), bits = node.name, node.args, node.bits
         if name == "or" and bits == 32 and isinstance(left_node, ir.Op) and left_node.name == "and" \
@@ -433,6 +456,15 @@ class Printer:
             # a list): LINKED(base, link) in game/support.h
             base = self.any(left_node.args[0])
             return Value(f"LINKED({base.text}, {self.any(right_node).text})", PRIMARY, True, "u32")
+        if name == "or" and bits == 32 and isinstance(left_node, ir.Op) and left_node.name == "and" \
+                and left_node.args[1] == ir.Const(0xFFFF0000, 32) and self.pointer_base(left_node.args[0]):
+            offset = page_offset(right_node, left_node.args[0])
+            if offset is not None:
+                # a place so many bytes on from a pointer, in the pointer's 64 KB page: the original adds in
+                # 16 bits, which wrap there (the ring of road segments at screen + 0x2000u): PAGE_ADD(base,
+                # offset) in game/support.h
+                base = self.any(left_node.args[0])
+                return Value(f"PAGE_ADD({base.text}, {self.any(offset).text})", PRIMARY, True, "u32")
         if name == "or" and bits == 32 and isinstance(left_node, ir.Op) and left_node.name == "and" \
                 and left_node.args[1] == ir.Const(0xFFFFFF00, 32) and self.names.pointer(left_node.args[0]) \
                 and fits8(right_node) and left_node.args[0] not in ir.walk(right_node):
