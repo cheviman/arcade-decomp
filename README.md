@@ -9,7 +9,8 @@ ROM, which this is made for (a PC or console game, with an operating system and 
 
 The root holds what any arcade game uses; a family of boards gets a folder of its own: `system32/` holds
 Sega's System 32 and Multi 32 (the reference that runs the original on MAME's cores; the board in C will
-follow), and the CPUs and boards of the next families come the same way (Konami's 68000 and 053248 boards).
+follow), `konami/` Konami's 68000 boards (MAME's `tmnt.cpp` family: TMNT, Cue Brick, M.I.A. and their
+successors), and the CPUs and boards of the next families come the same way (Konami's 053248 boards).
 
 Each game keeps this repository in its `tools/core/` (a git submodule: the game's repository holds which
 commit of the core it uses, not the core), and its own `tools/game_profile.py` tells the core about it.
@@ -50,6 +51,18 @@ Nothing here is a game's: no ROM, no names, no data.
   game's CMake includes it, after its board runtime (`s32runtime`) and with its data library
   (`S32_GAME_DATA`). MAME's and ymfm's sources are in `mame/` and `ymfm/`. Today they are Multi 32's
   (OutRunners': two screens, the MultiPCM).
+- `konami/reference/`: the reference of a game on Konami's 68000 boards: `kref` runs the original program
+  on MAME's 68000 core against the game's board model (its runtime's `tmnt/machine.h`) and writes each
+  frame's state hash, the addresses it executed and the ones it called, the fixed layer as text and the
+  board's memories, and with MAME's video (`video/kvideo.cpp`) each frame's picture hash and frames as
+  BMP; `oracle_m68k`, MAME's 68000 disassembler, for the 68000 frontend to come. `reference.cmake` builds
+  them: the game's CMake includes it after its board runtime (`K_GAME_RUNTIME`). MAME 0.289's sources are
+  in `mame/` (the 68000 core, whose handlers `m68000gen.py` writes from `m68000.lst` at build time, the
+  direct ones only; util's bitmap and palette and emu's drawgfx and tilemap; the `tmnt.cpp` driver and its
+  video chips, the K052109 and the K051960; the K007232, the uPD7759 and the YM2151) and ymfm's OPM in
+  `ymfm/`; the sound board is not in `kref` yet. `stub/emu.h` stands in for MAME's framework around the
+  68000, and `video/emu.h` around the video, which `video/kvideo.cpp` compiles unchanged inside a namespace
+  of its own.
 
 ## A game's profile
 
@@ -91,6 +104,7 @@ and a commit of `tools/core`. A clone of a game takes its core with `git clone -
 
 ## Legal
 
-BSD 3-Clause License (see `LICENSE`). `system32/reference/mame/` and `system32/reference/ymfm/` are MAME's
-and ymfm's code, BSD 3-Clause too, under their copyright holders' terms (`mame/LICENSE`, `ymfm/LICENSE`):
-they go into the reference tools only, never into a game.
+BSD 3-Clause License (see `LICENSE`). `system32/reference/mame/`, `system32/reference/ymfm/`,
+`konami/reference/mame/` and `konami/reference/ymfm/` are MAME's and ymfm's code, BSD 3-Clause too, under
+their copyright holders' terms (`mame/LICENSE`, `ymfm/LICENSE`): they go into the reference tools only, never
+into a game.
