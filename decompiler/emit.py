@@ -3091,7 +3091,7 @@ class Emitter:
 
     def definition(self, entry):
         """The prototype a function's definition opens with: one something else puts its own in place of
-        is MACRO(name) (replaced: BOARD_ORIGINAL, game/support.h)."""
+        is MACRO(name) (replaced: BOARD_ORIGINAL, CONSOLE_ORIGINAL; game/support.h)."""
         prototype = self.prototype(entry)
         name = self.names[entry]
         if name not in self.replaced:

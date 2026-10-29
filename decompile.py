@@ -474,7 +474,8 @@ def write_sources(out_dir, files, texts, include, header=None, keep=()):
 def replaced_functions(lists):
     """{function name: the macro its definition is written with} from the lists of the game's functions
     something else puts its own in place of, [(path, macro)]: a name a line, '#' starts a comment. The
-    board's (runtime/replaced.txt) is BOARD_ORIGINAL (game/support.h)."""
+    board's (runtime/replaced.txt) is BOARD_ORIGINAL (game/support.h); a port's console build's
+    (console/replaced.txt, where a port has one) is CONSOLE_ORIGINAL."""
     found = {}
     for path, macro in lists:
         if path.exists():
@@ -967,7 +968,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}
     emitter.comments = dict(known.comments)
     emitter.constants = dict(known.constants)
-    emitter.replaced = replaced_functions([(ROOT / "runtime" / "replaced.txt", "BOARD_ORIGINAL")])
+    emitter.replaced = replaced_functions([(ROOT / "runtime" / "replaced.txt", "BOARD_ORIGINAL"),
+                                           (ROOT / "console" / "replaced.txt", "CONSOLE_ORIGINAL")])
     entries_by_name = {name: entry for entry, name in names.items()}
     unknown = sorted(function for function, _ in known.params if function not in entries_by_name)
     if unknown:
