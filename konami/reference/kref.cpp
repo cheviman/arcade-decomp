@@ -10,7 +10,7 @@
  *
  *    Not part of the game. Usage:
  *      kref [--frames N] [--hashes hashes.txt] [--trace executed.txt] [--calls called.txt]
- *           [--text FRAME ...] [--dump FRAME ... --dump-dir DIR] [--video-hashes hashes.txt]
+ *           [--jumps jumps.txt] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR] [--video-hashes hashes.txt]
  *           [--video-dump FRAME ... --video-dir DIR] [--sound-hashes hashes.txt] [--sound-wav sound.wav]
  *           [--sound-trace executed.txt] [--script controls.txt] [--service] [--rom FOLDER]
  *
@@ -27,7 +27,8 @@
  *    the frames its "end" says unless --frames is given.
  *
  *    --hashes writes "FRAME HASH" per frame (tmnt_state_hash); --trace and --calls the addresses executed
- *    and the ones reached by jsr or bsr, one per line; --text prints the fixed layer's tiles of those frames
+ *    and the ones reached by jsr or bsr, one per line; --jumps where each jmp or jsr through a register went
+ *    ("FROM TO", the ones the static analysis has to work out); --text prints the fixed layer's tiles of those frames
  *    as text (the program's own character codes, '@' a space); --dump writes the board's memories at the end
  *    of those frames, a file each; --service turns the test mode's DIP switch on.
  *
@@ -123,12 +124,27 @@ bool is_call(uint32_t pc)
 	return (opcode & 0xFFC0) == 0x4E80 || (opcode & 0xFF00) == 0x6100;    // jsr, bsr
 }
 
+// A jmp or jsr through a register or a register's memory: (An), (d16,An), (d8,An,Xn), (d8,PC,Xn)
+bool is_computed_jump(uint32_t pc)
+{
+	if (pc + 1 >= GAME_PROGRAM_SIZE)
+		return false;
+	const uint16_t opcode = uint16_t(game_program[pc] << 8 | game_program[pc + 1]);
+	const int mode = (opcode >> 3) & 7;
+	return ((opcode & 0xFFC0) == 0x4E80 || (opcode & 0xFFC0) == 0x4EC0)
+		&& (mode == 2 || mode == 5 || mode == 6 || (opcode & 0x3F) == 0x3B);
+}
+
+std::set<std::pair<uint32_t, uint32_t>> g_jumps;    // --jumps: where each computed jump went
+
 void on_instruction(offs_t pc)
 {
 	g_instructions++;
 	mark(g_executed, pc);
 	if (g_previous_pc != 0xFFFFFFFF && is_call(g_previous_pc))
 		mark(g_called, pc);
+	if (g_previous_pc != 0xFFFFFFFF && is_computed_jump(g_previous_pc))
+		g_jumps.emplace(g_previous_pc, pc & 0xFFFFFF);
 	g_previous_pc = pc;
 }
 
@@ -264,12 +280,13 @@ void print_text(uint64_t frame)
 
 int main(int argc, char **argv)
 {
-	const char *usage = "Usage: kref [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--text FRAME ...]"
+	const char *usage = "Usage: kref [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--jumps FILE]"
+		" [--text FRAME ...]"
 		" [--dump FRAME ... --dump-dir DIR] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
 		" [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE] [--script FILE] [--service] [--rom FOLDER]\n";
 	std::string rom_folder = "rom";
 	std::string hashes_path, trace_path, calls_path, dump_folder = ".", video_hashes_path, video_folder = ".";
-	std::string sound_hashes_path, sound_wav_path, sound_trace_path;
+	std::string sound_hashes_path, sound_wav_path, sound_trace_path, jumps_path;
 	std::set<uint64_t> text_frames, dump_frames, video_dump_frames;
 	uint64_t frames = 600;
 	bool frames_given = false;
@@ -293,6 +310,8 @@ int main(int argc, char **argv)
 			trace_path = argv[++index];
 		else if (argument == "--calls" && has_value)
 			calls_path = argv[++index];
+		else if (argument == "--jumps" && has_value)
+			jumps_path = argv[++index];
 		else if (argument == "--text" && has_value)
 			while (index + 1 < argc && argv[index + 1][0] != '-')
 				text_frames.insert(std::strtoull(argv[++index], nullptr, 10));
@@ -460,6 +479,17 @@ int main(int argc, char **argv)
 		write_addresses(trace_path, g_executed, "68000 addresses executed by kref");
 	if (!calls_path.empty())
 		write_addresses(calls_path, g_called, "68000 addresses reached by jsr or bsr");
+	if (!jumps_path.empty())
+	{
+		std::ofstream out(jumps_path);
+		out << "# where each 68000 jmp or jsr through a register went, by kref: FROM TO\n";
+		for (const auto &jump : g_jumps)
+		{
+			char line[24];
+			std::snprintf(line, sizeof(line), "%06X %06X\n", jump.first, jump.second);
+			out << line;
+		}
+	}
 	if (sound)
 		std::cout << "Z80 cycles:        " << ks_z80_cycles() << '\n';
 	if (!sound_wav_path.empty())

@@ -37,6 +37,7 @@ the ones that are not are listed by the place they are entered from, which is wh
 analysis falls short.
 """
 import os
+import importlib
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -47,13 +48,14 @@ import game_profile  # noqa: E402  (the game's: its root, its ROM set)
 
 ROOT = game_profile.ROOT
 rom = game_profile.rom
-# the game's reference (s32ref, kref...), and whether its CPU has the static analysis yet (a game whose CPU
-# frontend is still to come runs its scenarios on the reference alone)
+# the game's reference (s32ref, kref...); whether its CPU has the static analysis yet (a game whose CPU
+# frontend is still to come runs its scenarios on the reference alone), and the modules of its CPU's
+# analysis and disassembler (the V70's by default)
 REFERENCE = getattr(game_profile, "REFERENCE", "s32ref")
 STATIC_ANALYSIS = getattr(game_profile, "STATIC_ANALYSIS", True)
 if STATIC_ANALYSIS:
-    import disassemble  # noqa: E402
-    from v60 import disassembler as dis  # noqa: E402
+    disassemble = importlib.import_module(getattr(game_profile, "ANALYSIS", "disassemble"))
+    dis = importlib.import_module(getattr(game_profile, "DISASSEMBLER", "v60.disassembler"))
 
 CONTROLS = ROOT / "tests" / "controls"
 RESULTS = ROOT / "build" / "scenarios"

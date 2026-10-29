@@ -23,7 +23,11 @@ Nothing here is a game's: no ROM, no names, no data.
 - `z80/`: the Z80's decoder, analysis, lift, timing model and C writer, for the sound boards' programs.
 - `m68000/`: the Motorola 68000's decoder and disassembler, ported from MAME's (Musashi's) and checked
   against it at every even offset of a program and of an image of every opcode
-  (`konami/reference/compare_m68k_with_mame.py`), with each instruction's operands and control flow.
+  (`konami/reference/compare_m68k_with_mame.py`), with each instruction's operands and control flow; and
+  its static analysis (`m68000/analysis.py`): the program's code from its vectors and `symbols.txt`, without
+  traces, following what the address registers can hold into the tables of handlers it jumps through. A
+  game uses it with `ANALYSIS = "m68000.analysis"` and `DISASSEMBLER = "m68000.disassembler"` in its
+  profile, which `check_scenarios.py` reads (the V70's `disassemble` and `v60.disassembler` by default).
 - `decompiler/`: the decompiler, from the IR to C with no CPU left in it: data flow, signatures, the
   structuring of loops and branches (no goto), variables, the types of pointers (structures, families of
   objects, records of the program ROM, fixed instances), the program's memory by name, and the C writer.
@@ -56,7 +60,8 @@ Nothing here is a game's: no ROM, no names, no data.
   (OutRunners': two screens, the MultiPCM).
 - `konami/reference/`: the reference of a game on Konami's 68000 boards: `kref` runs the original program
   on MAME's 68000 core against the game's board model (its runtime's `tmnt/machine.h`) and writes each
-  frame's state hash, the addresses it executed and the ones it called, the fixed layer as text and the
+  frame's state hash, the addresses it executed and the ones it called, where each jump through a register
+  went (`--jumps`, to find what the static analysis misses), the fixed layer as text and the
   board's memories, with MAME's video (`video/kvideo.cpp`) each frame's picture hash and frames as BMP,
   and with its sound board (`sound/ksound.cpp`: MAME's Z80, K007232 and uPD7759, ymfm's YM2151, the title
   music) each frame's samples and sound RAM hashes, the sound as a WAV and the Z80 addresses executed;
