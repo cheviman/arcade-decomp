@@ -27,6 +27,11 @@ from . import cpu
 from . import cleanup
 from . import dataflow
 
+# (instruction address, register) of the values symbols.txt says point at a structure ("local" lines with a
+# type): such a register stays a variable where its one use is the address of a memory access, so that the
+# access reads as the structure's field (decompile.py)
+KEEP_SITES = set()
+
 
 # ---- simplifying one expression ----
 
@@ -582,6 +587,8 @@ def inline_register_block(block, flow, after, context):
         if use is None:
             continue
         user = everything[use]
+        if (getattr(statement, "origin", None), register) in KEEP_SITES and in_address(user, register):
+            continue    # (a pointer symbols.txt types, which the access is made through)
         # dead after its use: the use writes it again, or nothing reads it later
         if use < len(statements) and not writes_register(user, flow, register):
             live = after.get(id(user))
@@ -606,6 +613,15 @@ def inline_register_block(block, flow, after, context):
         del statements[index]
         return True
     return False
+
+
+def in_address(statement, register):
+    """True if 'statement' reads the register in the address of a memory access."""
+    addresses = [statement.address] if isinstance(statement, ir.Store) else []
+    for expression in ir.statement_expressions(statement):
+        addresses += [node.address for node in ir.walk(expression) if isinstance(node, ir.Load)]
+    return any(isinstance(node, ir.Reg) and node.index == register
+               for address in addresses for node in ir.walk(address))
 
 
 def block_out_live(block, after):
@@ -804,4 +820,68 @@ def propagate_constants(function, call_results, context):
             ir.map_statement(block.end, simplify_node)
             if repr(block.end) != before:
                 changed += 1
+    return changed
+
+
+def constants_after(statement, known, call_results, context):
+    """'known' (register -> the constant it holds) after 'statement', as propagate_constants follows it."""
+    if isinstance(statement, ir.SetReg):
+        if isinstance(statement.value, ir.Const):
+            known[statement.index] = statement.value
+        else:
+            known.pop(statement.index, None)
+    elif isinstance(statement, ir.Call):
+        for index in set(call_results.get(id(statement), ())) | set(context):
+            known.pop(index, None)
+    elif isinstance(statement, ir.Effect):
+        # (what an effect writes is not spelled out: none of the registers is known after it)
+        known.clear()
+
+
+def fold_kept_constants(function, call_results, context):
+    """A part of a register a partial write keeps, where the register holds the same constant on every way
+    into the block (set before the branch the block is one side of): that constant (unpack's back offset,
+    -1, kept above the halfword it reads: 0xFFFF0000u | the halfword). Returns how many writes changed."""
+    blocks = function.blocks
+    predecessors = {}
+    for label, block in blocks.items():
+        for successor in block.successors():
+            predecessors.setdefault(successor, []).append(label)
+    order, seen, stack = [], {function.entry}, [(function.entry, iter(blocks[function.entry].successors()))]
+    while stack:
+        label, children = stack[-1]
+        child = next(children, None)
+        if child is None:
+            order.append(label)
+            stack.pop()
+        elif child not in seen and child in blocks:
+            seen.add(child)
+            stack.append((child, iter(blocks[child].successors())))
+    order.reverse()
+    out = {}
+    changed = 0
+    for label in order:
+        sources = predecessors.get(label, [])
+        # (a way in not followed yet, a loop's way back, says nothing is known)
+        if label == function.entry or not sources or any(source not in out for source in sources):
+            known = {}
+        else:
+            known = dict(out[sources[0]])
+            for source in sources[1:]:
+                known = {index: value for index, value in known.items() if out[source].get(index) == value}
+        for statement in blocks[label].statements:
+            value = statement.value if isinstance(statement, ir.SetReg) else None
+            if isinstance(value, ir.Op) and value.name == "or":
+                for kept in value.args:
+                    if isinstance(kept, ir.Op) and kept.name == "and" and isinstance(kept.args[0], ir.Reg) \
+                            and kept.args[0].index in known and isinstance(kept.args[1], ir.Const):
+                        constant = known[kept.args[0].index]
+
+                        def change(node, kept=kept, constant=constant):
+                            return ir.Op("and", (constant, kept.args[1]), kept.bits) if node is kept else None
+                        statement.value = ir.rebuild(ir.rebuild(value, change), simplify_node)
+                        changed += 1
+                        break
+            constants_after(statement, known, call_results, context)
+        out[label] = known
     return changed

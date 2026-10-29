@@ -62,7 +62,7 @@ PSW_INTERRUPTS = 1 << 18    # the processor status bit that lets interrupts in
 GLOBAL_WORDS = set("""auto break case char const continue default do double else enum extern float for goto if
 inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void
 volatile while bool true false main psw ram rom entry_point return_address carry zero negative overflow
-LINKED OBJECT PLAYER RAM8 RAM16 RAM32 ROM8 ROM16 ROM32 AS8 AS16 AS32 AT8 AT16 AT32 s32_board game_code
+LINKED IN_PAGE OBJECT PLAYER RAM8 RAM16 RAM32 ROM8 ROM16 ROM32 AS8 AS16 AS32 AT8 AT16 AT32 s32_board game_code
 interrupts_on interrupts_off divide_s8 divide_s16 divide_s32 divide_u8 divide_u16 divide_u32 remainder_s8
 remainder_s16 remainder_s32 remainder_u8 remainder_u16 remainder_u32 shift_by shift_signed_by rotate_by
 rotate_with_carry_by byte_swap32 mem_read8 mem_read16 mem_read32 mem_write8 mem_write16 mem_write32
@@ -577,6 +577,10 @@ class FunctionWriter:
                                         self.returned_value)
         self.widths = self.vars.declarations()
         self.pointer_names = self.typed_bases()
+        # (and the parameters symbols.txt says point at a structure, though the function only puts an address
+        # together from them: start_sequence's player, a field of which is IN_PAGE(player, 0x1Bu))
+        self.pointer_names |= {self.vars.entry_name(index) for index in emitter.param_pointers.get(function.entry, ())
+                               if self.vars.entry_live(index)}
         self.handled = self.handler_families()
         emitter.param_widths[function.entry] = {
             value[1]: self.widths.get(self.vars.entry_name(value[1]) or "", 32)
@@ -2744,6 +2748,7 @@ class Emitter:
         self.read32 = read32    # reads the program ROM (switch tables)
         self.register_names = {}    # context register -> its name (symbols.txt)
         self.param_widths = {}      # entry -> {register: width of the parameter} (FunctionWriter)
+        self.param_pointers = {}    # entry -> the registers symbols.txt says it takes pointers to a structure in
         self.result_bits = {}       # entry -> bits of the register it returns, where narrower (cleanup.RESULT_BITS)
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
         self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS

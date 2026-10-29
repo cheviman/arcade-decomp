@@ -101,6 +101,7 @@ class Mark:
 EXIT = "exit"
 LOOP_EXIT = "loop exit"
 CASE_EXIT = "case exit"
+CASE_NEXT = "next case"    # (the case right after, which the case being written falls through into: case_ipdom)
 
 
 def successors(block):
@@ -636,11 +637,20 @@ def redispatch_states(function, notes, read, apply=True):
     idom = Graph(function).idom
     for label, block in list(function.blocks.items()):
         end = block.end
-        if not isinstance(end, ir.Switch) or not end.cases or isinstance(end.address, ir.EntryPoint) \
-                or any(not isinstance(statement, (ir.SetTemp, ir.SetReg, ir.SetFlag)) for statement in block.statements):
+        if not isinstance(end, ir.Switch) or not end.cases or isinstance(end.address, ir.EntryPoint):
             continue
+        # what runs again: the reads after the last thing the block does that is not a read (a store, a call)
+        first = len(block.statements)
+        while first > 0 and isinstance(block.statements[first - 1], (ir.SetTemp, ir.SetReg, ir.SetFlag)):
+            first -= 1
+        reads = block.statements[first:]
+        bound = {statement.temp for statement in reads if isinstance(statement, ir.SetTemp)}
+        if any(isinstance(node, ir.Temp) and node not in bound for statement in reads
+               for node in walk_expression(statement.value)) \
+                or any(isinstance(node, ir.Temp) and node not in bound for node in walk_expression(end.address)):
+            continue    # (a value the block worked out before)
         values = {}
-        for statement in block.statements:
+        for statement in reads:
             values[statement_key(statement)] = inline(statement.value, values)
         address = inline(end.address, values)
 
@@ -682,8 +692,39 @@ def redispatch_states(function, notes, read, apply=True):
                     continue
                 found += 1
                 if apply:
-                    retarget(source_block.end, target, label)
+                    retarget(source_block.end, target, dispatch_block(function, label, first, live))
     return found
+
+
+def dispatch_block(function, label, first, live):
+    """The label of the block that only works out where the switch at the end of block 'label' goes (its
+    statements from 'first' on): the block itself, or a new one split off it the first time."""
+    block = function.blocks[label]
+    if first == 0:
+        return label
+    new = ("dispatch", label)
+    if new not in function.blocks:
+        dispatch = copy.copy(block)
+        dispatch.label = new
+        dispatch.statements = block.statements[first:]
+        dispatch.end = block.end
+        if ("end", id(block)) in live:
+            live[("end", id(dispatch))] = live[("end", id(block))]
+            live[("end", id(block))] = live.get(id(block.statements[first - 1]), live[("end", id(block))])
+        block.statements = block.statements[:first]
+        block.end = ir.Goto(new)
+        function.blocks[new] = dispatch
+    return new
+
+
+def walk_expression(expression):
+    """The nodes of an expression."""
+    yield expression
+    if isinstance(expression, ir.Load):
+        yield from walk_expression(expression.address)
+    elif isinstance(expression, ir.Op):
+        for arg in expression.args:
+            yield from walk_expression(arg)
 
 
 def statement_key(statement):
@@ -748,15 +789,19 @@ def evaluate(expression, load):
 
 def stored_value(block, state, bits):
     """The constant 'block' stores last at the address 'state' ('bits' wide), when after that store it
-    writes no memory and calls nothing, and the registers the address is made of keep their values; else
+    calls nothing and writes no memory but other fields of the same record (the state's object's step:
+    the same base, places apart), and the registers the address is made of keep their values; else
     None."""
     values, touched, found = {}, set(), None
     for statement in block.statements:
         if isinstance(statement, ir.Store):
-            if inline(statement.address, values) == state and statement.bits == bits:
+            place = inline(statement.address, values)
+            shift = covers(place, statement.bits, state, bits)
+            if shift is not None:
+                # (the state is the store or a part of it: its bytes, low first)
                 value = inline(statement.value, values)
-                found = value.value if isinstance(value, ir.Const) else None
-            elif found is not None:
+                found = (value.value >> (8 * shift)) & ((1 << bits) - 1) if isinstance(value, ir.Const) else None
+            elif found is not None and not apart(place, statement.bits, state, bits):
                 return None    # (memory written after it: it may be the state)
         elif isinstance(statement, (ir.SetTemp, ir.SetReg, ir.SetFlag)):
             if isinstance(statement, ir.SetReg):
@@ -767,6 +812,31 @@ def stored_value(block, state, bits):
         else:
             values, touched = {}, set()    # (a call: the registers hold what it left)
     return None if found is None or registers_in(state) & touched else found
+
+
+def covers(place, bits, state, state_bits):
+    """The byte of an access at 'place' ('bits' wide) where the state ('state_bits' at 'state') starts, when
+    the access holds all of it; else None."""
+    def parts(address):
+        if isinstance(address, ir.Op) and address.name == "add" and isinstance(address.args[1], ir.Const):
+            return address.args[0], address.args[1].value
+        return address, 0
+    base, offset = parts(place)
+    state_base, state_offset = parts(state)
+    if base != state_base or not offset <= state_offset <= offset + bits // 8 - state_bits // 8:
+        return None
+    return state_offset - offset
+
+
+def apart(place, bits, other, other_bits):
+    """True when two accesses are at constant places from the same base that do not overlap."""
+    def parts(address):
+        if isinstance(address, ir.Op) and address.name == "add" and isinstance(address.args[1], ir.Const):
+            return address.args[0], address.args[1].value
+        return address, 0
+    base, offset = parts(place)
+    other_base, other_offset = parts(other)
+    return base == other_base and (offset + bits // 8 <= other_offset or other_offset + other_bits // 8 <= offset)
 
 
 def registers_in(expression):
@@ -1075,6 +1145,9 @@ class Structurer:
             return None
         if sum(len(self.blocks[label].statements) + 1 for label in reach) > TAIL_COPY:
             return None
+        if getattr(self.function, "meet_at_exit", False) \
+                and any(isinstance(self.blocks[label].end, ir.Return) for label in reach):
+            return None    # (the ways to the one way back meet there: none of them is written again)
         copy = Structurer.__new__(Structurer)
         copy.function, copy.blocks, copy.graph = self.function, self.blocks, self.graph
         copy.emitted, copy.labels, copy.pending = set(), set(), []
@@ -1306,6 +1379,9 @@ class Structurer:
             # inside a case: its ways out (break, the start of another case, a small exit) do not meet the
             # others
             follow = self.case_ipdom().get(label)
+            if follow == CASE_NEXT:
+                # (the ways meet where the case falls through into the next one: a goto there, at its end)
+                return self.case_nexts.get((self.current_case, self.case_follow, self.case_starts))
             if follow in (CASE_EXIT, None, label) or follow in self.emitted and follow != stop:
                 return None
             return follow
@@ -1371,6 +1447,9 @@ class Structurer:
         order = self.case_order
         later = [case for case in order[order.index(start) + 1:] if case in targets] if start in order else []
         main = later[0] if later else next((case for case in self.case_order if case in targets), None)
+        # (the case right after it in the switch: the ways into it meet there, and C falls through into it)
+        following = order[order.index(start) + 1] if start in order and order.index(start) + 1 < len(order) else None
+        self.__dict__.setdefault("case_nexts", {})[key] = main if main == following else None
 
         def ends(target):
             # (a way out written where it is: break, a small exit, continue, a jump into another case)
@@ -1395,11 +1474,13 @@ class Structurer:
 
         def kept(label):
             targets = [target for target in successors(self.blocks[label]) if not written_in_place(target)]
-            if any(target in going_on for target in targets):
+            if any(target in going_on or target == main for target in targets):
                 # (a way that only ends, beside one that goes on into another case)
-                targets = [target for target in targets if target in going_on]
-            return [CASE_EXIT if out(target) else target for target in targets] or [CASE_EXIT]
+                targets = [target for target in targets if target in going_on or target == main]
+            return [CASE_NEXT if target == main and main == following else CASE_EXIT if out(target) else target
+                    for target in targets] or [CASE_EXIT]
         after = {label: kept(label) for label in region}
+        after[CASE_NEXT] = [CASE_EXIT]
         reaching = Graph.reach_back(after, CASE_EXIT)
         for label in region:
             if label not in reaching:

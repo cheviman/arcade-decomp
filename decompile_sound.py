@@ -259,7 +259,8 @@ def write_c(program, out_dir, variables_path=None):
         after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
         expressions.tidy(function, flow, after, whole)
         results_of_calls = call_results(function, found, flow)
-        if expressions.propagate_constants(function, results_of_calls, signatures.CONTEXT):
+        if expressions.propagate_constants(function, results_of_calls, signatures.CONTEXT) \
+                | expressions.fold_kept_constants(function, results_of_calls, signatures.CONTEXT):
             after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
             expressions.tidy(function, flow, after, whole)
         if expressions.inline_registers(function, flow, after, whole):
@@ -316,6 +317,7 @@ def write_c(program, out_dir, variables_path=None):
     always = {entry: set(summary.always) for entry, summary in flow.summaries.items()}
     emitter = emit.SoundEmitter(built, found, names, named, always, pointers.Layouts(accesses, known), known.ports)
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
+    emitter.param_pointers = {entry: set(kinds) for entry, kinds in hints.items()}
     emitter.flow = flow
     emitter.data_labels = {address: name for address, name in data_names.items() if address not in named.tables}
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}

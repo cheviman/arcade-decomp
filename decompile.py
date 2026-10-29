@@ -795,12 +795,15 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         built, found, flow, set(signatures.OPEN) | set(program.second_entries) | {RESET_ADDRESS})
     live_after = {}
     live_at_start = {}
+    expressions.KEEP_SITES = {(spot, int(value[1:])) for (_, spot, value) in disassemble.load_names(SYMBOLS).local_structs
+                              if spot != "entry" and value.startswith("r")}
     for entry, function in built.items():
         expressions.drop_repacks(function, flow)
         after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
         expressions.tidy(function, flow, after, whole)
         results_of_calls = call_results(function, found, flow)
-        if expressions.propagate_constants(function, results_of_calls, signatures.CONTEXT):
+        if expressions.propagate_constants(function, results_of_calls, signatures.CONTEXT) \
+                | expressions.fold_kept_constants(function, results_of_calls, signatures.CONTEXT):
             after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
             expressions.tidy(function, flow, after, whole)
         if expressions.inline_registers(function, flow, after, whole):
@@ -908,6 +911,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     emitter.register_names = dict(known.registers)
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
     emitter.second_entries = dict(program.second_entries)
+    emitter.param_pointers = {entry: set(kinds) for entry, kinds in hints.items()}
     emitter.referenced = referenced_addresses(program)
     table = code_table(program, flow)
     emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in table

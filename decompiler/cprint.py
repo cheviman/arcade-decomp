@@ -96,6 +96,18 @@ def bitwise_merge(node):
     return None
 
 
+def fits8(node):
+    """True if 'node' holds no more than 8 bits: a byte read, a value cut or widened from 8 bits or fewer, a
+    small number."""
+    if isinstance(node, ir.Const):
+        return node.value <= 0xFF
+    if isinstance(node, ir.Load):
+        return node.bits <= 8
+    if isinstance(node, ir.Op) and node.name in ("zext", "fits", "trunc"):
+        return getattr(node.args[0], "bits", 32) <= 8 or (node.name in ("fits", "trunc") and node.bits <= 8)
+    return getattr(node, "bits", 32) <= 8
+
+
 def fits16(node):
     """True if 'node' holds no more than 16 bits: a halfword read, a value cut or widened from 16 bits or
     fewer, a mask of them, a small number."""
@@ -421,6 +433,14 @@ class Printer:
             # a list): LINKED(base, link) in game/support.h
             base = self.any(left_node.args[0])
             return Value(f"LINKED({base.text}, {self.any(right_node).text})", PRIMARY, True, "u32")
+        if name == "or" and bits == 32 and isinstance(left_node, ir.Op) and left_node.name == "and" \
+                and left_node.args[1] == ir.Const(0xFFFFFF00, 32) and self.names.pointer(left_node.args[0]) \
+                and fits8(right_node) and left_node.args[0] not in ir.walk(right_node):
+            # (not where the low byte is worked out from the same value: that is the value's own byte)
+            # a pointer moved to another place of its 256-byte page (another port of the I/O chip it points
+            # at): IN_PAGE(base, low) in game/support.h
+            base = self.any(left_node.args[0])
+            return Value(f"IN_PAGE({base.text}, {self.any(right_node).text})", PRIMARY, True, "u32")
         merged = bitwise_merge(node)
         if merged is not None:
             # (x & ~0xFFu) | (uint8_t)(x | y) is x | (y & 0xFFu): what the original does to the low byte

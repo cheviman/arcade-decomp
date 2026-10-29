@@ -52,7 +52,8 @@ Forward over each function's blocks, a register keeps the kind of what it was se
   - the first of a run of players (PLAYERS) plus a multiple of their size: a player (none in OutRunners);
   - a word read from a variable that holds a pointer (GLOBAL_KINDS: the ends of the object list);
   - the variables' base (VARIABLES) plus a word read from a table of offsets
-    symbols.txt says lead to a structure.
+    symbols.txt says lead to a structure;
+  - a slot of the function's own stack the pointer was kept in meanwhile (car_select_run's setup_bits).
 Across functions: what a function finds in its registers when it starts is what its callers have there
 (through calls of any kind), and what a call leaves in the registers it hands back is what the callee
 has there when it returns. A caller that does not know says nothing; two that know different things make
@@ -526,6 +527,8 @@ def kind_of(node, state, zeros):
         return state.get(node.index)
     if isinstance(node, ir.Temp):
         return state.get(("temp", node.name))    # (an address an instruction works out and uses twice; the Z80's EX DE,HL)
+    if isinstance(node, ir.Stack):
+        return state.get(("stack", node.offset))    # (a pointer the function keeps on its stack meanwhile)
     if isinstance(node, ir.Const):
         value = node.value & ADDRESS_MASK
         found = BASE_KINDS.get(value) or player_constant(value)
@@ -586,8 +589,10 @@ def kind_of(node, state, zeros):
             kinds = [("rom", 0) if isinstance(arg, ir.Const) and rom_records_kind(kind) else kind
                      for kind, arg in zip(kinds, args)]
         for region in ("rom", "io"):
-            # (a device's place moved by an offset: still that device, the bus's)
+            # (a device's place moved by an offset: still that device, the bus's; a constant added to a
+            # device's place is a displacement, whatever address it looks like: the link board's 1002[R12])
             if kinds.count((region, 0)) == 1 and all(kind in ((region, 0), OFFSET) or (kind is None and offset_sized(arg, state))
+                                                      or region == "io" and isinstance(arg, ir.Const)
                                                       for kind, arg in zip(kinds, args)):
                 return region, 0
     if name in ("add", "sub") and isinstance(args[1], ir.Const):
@@ -634,6 +639,13 @@ def kind_of(node, state, zeros):
             return []
         if any(any(start <= value < end for start, end in DEVICE_AREAS) for value in constants(node)):
             return "io", 0
+        # (or a pointer into a device with its low byte replaced: the input test's other port of the chip)
+        for part in args:
+            if isinstance(part, ir.Op) and part.name == "and" and isinstance(part.args[1], ir.Const) \
+                    and part.args[1].value & 0xFFFF00 == 0xFFFF00:
+                kept = kind_of(part.args[0], state, zeros)
+                if kept is not None and kept[0] == "io":
+                    return "io", 0
     if name == "or" and PAGE_LINKS:
         kept, low = args
         page = isinstance(kept, ir.Const) and (kept.value & 0xFFFF) == 0 and in_work_ram(kept.value)
@@ -752,9 +764,11 @@ def access(address, state, zeros=None):
         found = page_parts(address, state, {})
         if found is not None:
             return found[0], found[1], found[2], 0, None
-    if isinstance(address, (ir.Reg, ir.Temp)):
-        # (a temporary: an address an instruction works out and uses twice, "add.h #20, [8C[R20]]")
-        kind = state.get(address.index) if isinstance(address, ir.Reg) else state.get(("temp", address.name))
+    if isinstance(address, (ir.Reg, ir.Temp, ir.Stack)):
+        # (a temporary: an address an instruction works out and uses twice, "add.h #20, [8C[R20]]"; a stack
+        # slot: a pointer the function kept there)
+        kind = state.get(address.index) if isinstance(address, ir.Reg) else state.get(("temp", address.name)) \
+            if isinstance(address, ir.Temp) else state.get(("stack", address.offset))
         if kind is None or kind[0] not in STRUCTS:
             return None
         return in_field_array(kind[0], kind[1], address, kind[1], family_of(kind))
@@ -1265,6 +1279,13 @@ class Program:
                 state.pop(statement.index, None)
             else:
                 state[statement.index] = kind
+        elif isinstance(statement, ir.SetStack):
+            # a pointer kept on the function's own stack keeps its kind there (car_select_run's setup_bits)
+            kind = kind_of(statement.value, state, zeros) if statement.bits == POINTER_BITS else None
+            if kind is None:
+                state.pop(("stack", statement.offset), None)
+            else:
+                state[("stack", statement.offset)] = kind
         elif isinstance(statement, ir.Call):
             targets = self.flow.call_targets(statement)
             if record is None:
