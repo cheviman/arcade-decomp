@@ -188,6 +188,16 @@ def checked_default(pad, target):
     return [pad + "default:", pad + f"\t{cpu.current.invalid_jump}({target});"]
 
 
+def ends_in_switch(body):
+    """True if the last statement of a function's 'body' (its lines, one tab in) is a switch with no default:
+    every case of it returns, or the function would go on past it."""
+    heads = [index for index, line in enumerate(body)
+             if line.startswith("\t") and not line.startswith("\t\t") and line not in ("\t{", "\t}")
+             and not line.startswith(("\tcase ", "\tdefault:"))]
+    return bool(heads) and body[heads[-1]].startswith("\tswitch (") and body[-1] == "\t}" \
+        and "\tdefault:" not in body[heads[-1]:]
+
+
 def largest_value(node):
     """The largest value 'node' can have, from its own bits: a number, a read as wide as it is, a mask, a
     shift, a cut, a sum; None when nothing bounds it below its width."""
@@ -2707,6 +2717,10 @@ class FunctionWriter:
         body = self.forward_results(list(self.written))
         if body and body[-1] == "\treturn;":
             body.pop()    # running off the end returns as well
+        if not self.emitter.definition(self.entry).startswith("void ") and ends_in_switch(body):
+            # (a function that returns a value and ends in a switch whose every case returns: only an index
+            # past the table, which the original never gives, would go on, and the C says it does not)
+            body.append("\tunreachable();")
         said = self.emitter.comments.get(self.emitter.names.get(self.entry, self.function.name))
         text = (comment_lines(said) if said else []) + [self.emitter.definition(self.entry), "{"]
         # the names the code mentions, fields (after "->" or ".") aside: an unused variable z is not

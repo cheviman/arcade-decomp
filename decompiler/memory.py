@@ -30,6 +30,7 @@ a mirror reads its tables through that mirror. A table is named, and read, at it
 The map above is the V60's. Another program sets its own in the module's names below (MAP and the rest;
 tools/decompile_sound.py: the Z80's shared RAM, ROM, sample bank and RF5C68).
 """
+import re
 from collections import Counter
 
 from v60 import ir
@@ -238,6 +239,7 @@ class Item:
         self.signed = signed
         self.indexed = False
         self.count = None     # an array's number of elements (symbols.txt: var NAME[COUNT])
+        self.unnamed = False  # a name the decompiler made up for an address symbols.txt names nothing at
 
 
 class Memory:
@@ -343,6 +345,20 @@ class Memory:
                 continue
             bits = max(counts, key=lambda width: (counts[width], -width))
             items[address] = Item(address, name_of(address), bits)
+            items[address].unnamed = True
+
+    def drop_unread(self, texts):
+        """Forgets the variables and tables with a made-up name (unk_208001, rom_000001) that none of the C
+        'texts' reads: their accesses turned out to be something else, a field a pointer reaches (the screen's
+        block at 208000) or a table and an index into it, and nothing is left for the name to declare, nor
+        for the runtime to load."""
+        words = set()
+        for text in texts:
+            words.update(re.findall(r"\w+", text))
+        for items in (self.variables, self.tables):
+            for address in [address for address, item in items.items()
+                            if item.unnamed and item.name not in words and f"{item.name}_ADDRESS" not in words]:
+                del items[address]
 
     @staticmethod
     def element(items, address):
