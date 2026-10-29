@@ -2,9 +2,9 @@
 # copyright-holders:Sebastian Toyos
 """
 Name:        __init__.py
-Description: tools for the Zilog Z80, the sound CPU of Sega System 32
+Description: tools for the Zilog Z80, the sound CPU of Sega System 32 and of Konami's 68000 boards
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    13-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 """

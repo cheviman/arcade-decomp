@@ -39,6 +39,10 @@ RESULT_PARTS = {}
 
 # address >> 20 of the areas where a read has no side effect
 PLAIN_MEMORY = {0x0, 0x1, 0x2, 0x3, 0x4, 0x6, 0x7, 0xF}
+# in place of PLAIN_MEMORY, a function of an address that says reading it does something (a board's
+# registers): a read there stays even where nothing uses its value (decompile_sound.py sets it from the
+# profile's SOUND_KEEP_HARDWARE_READS: reading TMNT's K007232 at B005 starts its channel A)
+EFFECT_READS = None
 
 
 def variables_of(values):
@@ -57,7 +61,20 @@ def has_effect(value):
     for node in ir.walk(value):
         if isinstance(node, ir.Load):
             address = node.address
-            if isinstance(address, ir.Const) and ((address.value & 0xFFFFFF) >> 20) not in PLAIN_MEMORY:
+            if not isinstance(address, ir.Const) and EFFECT_READS is not None:
+                # (a place worked out from a constant there: "0x140400 + d1", the K051960's RAM read by index)
+                base = address.args[0] if isinstance(address, ir.Op) and address.name == "add" else None
+                base = base if isinstance(base, ir.Const) else \
+                    address.args[1] if isinstance(address, ir.Op) and address.name == "add" else None
+                if isinstance(base, ir.Const) and EFFECT_READS(base.value):
+                    return True
+                continue
+            if not isinstance(address, ir.Const):
+                continue
+            if EFFECT_READS is not None:
+                if EFFECT_READS(address.value):
+                    return True
+            elif ((address.value & 0xFFFFFF) >> 20) not in PLAIN_MEMORY:
                 return True
     return False
 
@@ -84,6 +101,8 @@ class Liveness:
         if isinstance(statement, ir.SetReg):
             if not cpu.kept(statement.index):
                 return True
+            if EFFECT_READS is not None and has_effect(statement.value):
+                return True    # (a read of a register that does something, its value unused)
             parts, _, _ = dataflow.partial_write(statement)
             return any(("r", statement.index, part) in live for part in parts)
         if isinstance(statement, ir.SetFlag):

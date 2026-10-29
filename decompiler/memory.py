@@ -58,6 +58,10 @@ ROM_NAMES_FROM = 0x1000                      # constants below are numbers, neve
 # that the runtime sets from the game's table registry (table.c: game_tables), read by name (NAME[i]),
 # never through ROM_FUNCTION and the table's address
 LOADED_TABLES = False
+# how an element of an array of work RAM (or of the board's plain memories) is written: None for NAME[index], or a
+# function (name, index text, bits) -> C (the 68000's: the work RAM the board keeps the other way round, whose
+# arrays are macros of the element's place, NAME(index): m68000/emit.py)
+RAM_ELEMENT = None
 NOTES = {
     "variables": ["/* the game's variables in work RAM; SCREEN_1 and SCREEN_2 are the blocks of the two screens,",
                   "   which the code reaches through screen (R25 of the task that runs each) */"],
@@ -333,7 +337,22 @@ class Memory:
             if address in items or self.inside(items, address) is not None or self.element(items, address):
                 continue
             bits = max(counts, key=lambda width: (counts[width], -width))
+            following = items.get(address + bits // 8)
+            if COUNTED_FROM_ONE and following is not None and following.bits == bits and items is self.tables:
+                following.indexed = True
+                continue    # (the table after it, read from an index that starts at 1: access() names it)
             items[address] = Item(address, name_of(address), bits)
+
+    def table_after(self, address):
+        """(table, how many bytes before it 'address' is) for an address of the program ROM no more than
+        NAMES_BEFORE_TABLES bytes before a table, in no table itself; or None."""
+        if not NAMES_BEFORE_TABLES or address in self.tables or self.inside(self.tables, address) is not None                 or self.element(self.tables, address) is not None:
+            return None
+        for distance in range(1, NAMES_BEFORE_TABLES + 1):
+            item = self.tables.get(address + distance)
+            if item is not None:
+                return item, distance
+        return None
 
     @staticmethod
     def element(items, address):
@@ -355,10 +374,17 @@ class Memory:
 
     # ---- what the printer asks ----
 
+    def indexed_text(self, items, item, index):
+        """C for the element 'index' (its C) of the array 'item' of 'items': NAME[index], or what RAM_ELEMENT
+        makes of an array of work RAM or of the board's plain memories"""
+        if RAM_ELEMENT is not None and items is not self.tables:
+            return RAM_ELEMENT(item.name, index, item.bits)
+        return f"{item.name}[{index}]"
+
     def scalar(self, items, address, bits):
         item = items.get(address)
         if item is not None:
-            name = f"{item.name}[0]" if item.indexed else item.name
+            name = self.indexed_text(items, item, "0") if item.indexed else item.name
             overlay = self.overlays.get((address, bits)) if items is self.variables else None
             if item.bits != bits and overlay is not None:
                 return overlay.name
@@ -369,7 +395,7 @@ class Memory:
         found = self.element(items, address)
         if found is not None:
             array, number, byte = found
-            name = f"{array.name}[{number}]"
+            name = self.indexed_text(items, array, str(number))
             return name if byte == 0 and bits == array.bits else cprint.part(bits, name, byte, array.bits)
         return None
 
@@ -431,18 +457,19 @@ class Memory:
             if found is None and following is not None and following.bits == bits and index is not None:
                 # one element before an array, where the code counts from 1 (car_numbers[players_left - 1])
                 before = ir.op("sub", (index, ir.Const(1, index.bits)), index.bits)
-                return f"{following.name}[{index_text(before)}]", following.signed, lvalue
+                return self.indexed_text(items, following, index_text(before)), following.signed, lvalue
             if found is None:
                 return None
             # an index from an element of an array past its first (the scrolls of the second tile layer)
             array, number, byte = found
             if byte == 0 and index is not None and array.bits == bits:
-                return f"{array.name}[{number} + {index_text(index)}]", array.signed, lvalue
+                return self.indexed_text(items, array, f"{number} + {index_text(index)}"), array.signed, lvalue
             narrow = element_index(rest, array.bits) if byte == 0 and array.bits < bits and lvalue else None
             if narrow is not None:
                 # several elements at once, as the original's one wider access (AS32(video_registers[32 +
                 # index * 2u]): two halfword registers cleared together)
-                return cprint.part(bits, f"{array.name}[{number} + {index_text(narrow)}]", 0, array.bits), False, lvalue
+                return cprint.part(bits, self.indexed_text(items, array, f"{number} + {index_text(narrow)}"), 0,
+                                   array.bits), False, lvalue
             if LOADED_TABLES and not lvalue:
                 return f"TABLE{bits}({array.name}, 0x{base - array.address:X}u + {index_text(rest)})", False, False
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
@@ -452,7 +479,7 @@ class Memory:
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
             return f"{macro}(GAME_VARIABLES + {index_text(rest)})", False, lvalue
         if index is not None and item.bits == bits:
-            return f"{item.name}[{index_text(index)}]", item.signed, lvalue
+            return self.indexed_text(items, item, index_text(index)), item.signed, lvalue
         if LOADED_TABLES and not lvalue:
             # a loaded table read at another width than its elements': by its name and the offset in bytes
             return f"TABLE{bits}({item.name}, {index_text(rest)})", False, False
@@ -521,7 +548,11 @@ class Memory:
             else:
                 lines.append(f"#define {item.name} (*(const {kind} *){item.name}_data)")
             return lines
-        if item.indexed:
+        if item.indexed and RAM_ELEMENT is not None and macro != ROM_MACRO:
+            suffix = "S" if item.signed else ""
+            step = f" * {item.bits // 8}u" if item.bits > 8 else ""
+            lines.append(f"#define {item.name}(index) {macro}{item.bits}{suffix}({item.name}_ADDRESS + (index){step})")
+        elif item.indexed:
             lines.append(f"#define {item.name} (({constness}{kind} *){function}({item.name}_ADDRESS))")
         else:
             suffix = "S" if item.signed else ""
@@ -560,6 +591,14 @@ def index_limit(rest):
 
 
 BYTE_INDEXES = False    # whether index_limit() looks at the index (the V60's program never needed it)
+# whether a table the code reads from one element before its start (its index starts at 1: "ld hl,$0CF8" for
+# note_lengths at 0CF9) is that table, NAME[i - 1], rather than an unnamed one of its own (TMNT's sound program;
+# z80/emit.py sets it from the profile's SOUND_COUNTED_FROM_ONE)
+COUNTED_FROM_ONE = False
+# how many bytes before a table of the program ROM an address the code works from still names it, as
+# NAME_ADDRESS - k: the base of a table the code indexes from 1 or more ("ld hl,$0C8A" for pcm_note_pitches at
+# 0C96, whose index is at least 12); 0, never (TMNT's sound program: the profile's SOUND_NAMES_BEFORE_TABLES)
+NAMES_BEFORE_TABLES = 0
 
 
 def accesses_of(functions):

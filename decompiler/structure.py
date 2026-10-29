@@ -3,7 +3,7 @@ Name:        structure.py
 Description: turns a function's blocks and jumps into if / else, loops, switch, break and continue
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    16-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 The control flow graph is read with dominators. A block a back edge jumps to heads a loop: its body is
@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from v60 import ir
 
+from . import cpu
 from . import floats
 
 SMALL_EXIT = 4    # statements of an ending block that is copied rather than jumped to
@@ -798,9 +799,10 @@ def stored_value(block, state, bits):
             place = inline(statement.address, values)
             shift = covers(place, statement.bits, state, bits)
             if shift is not None:
-                # (the state is the store or a part of it: its bytes, low first)
+                # (the state is the store or a part of it: its bytes, in the CPU's order)
                 value = inline(statement.value, values)
-                found = (value.value >> (8 * shift)) & ((1 << bits) - 1) if isinstance(value, ir.Const) else None
+                down = cpu.byte_shift(shift, statement.bits // 8, bits // 8)
+                found = (value.value >> down) & ((1 << bits) - 1) if isinstance(value, ir.Const) else None
             elif found is not None and not apart(place, statement.bits, state, bits):
                 return None    # (memory written after it: it may be the state)
         elif isinstance(statement, (ir.SetTemp, ir.SetReg, ir.SetFlag)):

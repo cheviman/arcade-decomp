@@ -1150,6 +1150,11 @@ def write_variables(path, writers, names, texts):
 
 
 def main():
+    other = getattr(game_profile, "DECOMPILER", None)
+    if other:
+        # (a game on another CPU decompiles with its CPU's driver: m68000/decompile.py for the 68000)
+        import importlib
+        return importlib.import_module(other).main(sys.argv[1:])
     arguments = sys.argv[1:]
     checking = "--check" in arguments
     tracing = "--trace" in arguments

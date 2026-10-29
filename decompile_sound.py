@@ -3,7 +3,7 @@ Name:        decompile_sound.py
 Description: decompiles the Z80 sound program into readable C, one C function per original function
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile_sound.py [--check] [--checks] [--out DIR] [--timing FILE]
@@ -28,6 +28,10 @@ functions' files (sound_symbols.txt's file lines lay them out; sound_NN.c withou
 Code the program never runs (routines nothing calls) is decompiled too, from its "func" lines: as on the
 V60's side (decompile.py), a function nothing calls takes every register it reads as a parameter, and
 hands back what sound_symbols.txt's "result" lines say.
+
+The functions the game's sound board puts its own in place of (runtime/sound_replaced.txt, a name a line, as
+runtime/replaced.txt is for the main program: TMNT's ROM test) are written as BOARD_ORIGINAL(name), and declared
+both ways in sound.h.
 """
 import re
 import sys
@@ -48,6 +52,7 @@ from decompile import twin  # noqa: E402
 from decompile import source_files  # noqa: E402
 from decompile import write_sources  # noqa: E402
 from decompile import write_variables  # noqa: E402
+from decompile import replaced_functions  # noqa: E402
 from decompiler import cleanup  # noqa: E402
 from decompiler.gotos import GotoError  # noqa: E402
 from decompiler import cprint  # noqa: E402
@@ -73,7 +78,9 @@ SYMBOLS = ROOT / "sound_symbols.txt"
 ROM_SET = ROOT / "rom"
 REPORTS = ROOT / "build" / "sound"    # the listing and the index naming works from
 INTERRUPT_HANDLER = 0x0038
-CREATED = "13-10-2026"    # when the C was first written; the files say when it was last written too
+# when the C was first written (the profile's SOUND_CREATED; System 32's by default); the files say when it was
+# last written too
+CREATED = getattr(game_profile, "SOUND_CREATED", "13-10-2026")
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 REGISTERS = {name: index for index, name in cpu.Z80.register_names.items()}    # param and local lines
 
@@ -85,8 +92,13 @@ def load_program():
 
 
 def configure():
-    """The Z80 profile, and the sound program's own: no registers it keeps for the whole program."""
+    """The Z80 profile, and the sound program's own: no registers it keeps for the whole program. With the
+    profile's SOUND_KEEP_HARDWARE_READS, a read of the board's registers (SOUND_HARDWARE) stays even where its
+    value goes unused: reading one may do something (TMNT's K007232 starts a channel when its key is read)."""
     cpu.use(cpu.Z80)
+    if getattr(game_profile, "SOUND_KEEP_HARDWARE_READS", False):
+        areas = [(start, end) for start, end, _ in game_profile.SOUND_HARDWARE]
+        cleanup.EFFECT_READS = lambda address: any(start <= (address & 0xFFFF) < end for start, end in areas)
     conditions.DIRECT_FLAGS = True
     signatures.CONTEXT = ()
     signatures.SCRATCH_CONTEXT = {}
@@ -322,6 +334,7 @@ def write_c(program, out_dir, variables_path=None):
     emitter.data_labels = {address: name for address, name in data_names.items() if address not in named.tables}
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}
     emitter.comments = dict(known.comments)
+    emitter.replaced = replaced_functions([(ROOT / "runtime" / "sound_replaced.txt", "BOARD_ORIGINAL")])
     entries_by_name = {name: entry for entry, name in names.items()}
     unknown = sorted({function for function, _ in known.params if function not in entries_by_name}
                      | {function for function, spot, _ in known.locals if function not in entries_by_name})
@@ -397,12 +410,15 @@ def write_c(program, out_dir, variables_path=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     entries = sorted(built)
     files = sound_files(entries)
-    prototypes = grouped_prototypes(files, emitter.prototype)
+    # (a function the board replaces is declared twice: as the program calls it and as its original)
+    prototypes = grouped_prototypes(files, lambda entry: emitter.prototype(entry) + (
+        ";\n" + emitter.definition(entry) if names[entry] in emitter.replaced else ""))
+    ports = emitter.port_declarations()
     (out_dir / "sound.h").write_text(
         file_header("sound.h", "the sound program's ports, variables, tables, structures and functions")
         + f"#ifndef {game_profile.GUARD}_SOUND_H\n#define {game_profile.GUARD}_SOUND_H\n\n"
         + "#include \"sound/support.h\"\n\n"
-        + "/* the board's I/O ports the program uses */\n" + "\n".join(emitter.port_declarations()) + "\n\n"
+        + ("/* the board's I/O ports the program uses */\n" + "\n".join(ports) + "\n\n" if ports else "")
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM sound_symbols.txt labels */\n"
         + "\n".join(f"#define {name}_ADDRESS 0x{address:04X}u" for address, name in sorted(emitter.data_labels.items()))
         + "\n\n/* the sound program's structures in the shared RAM */\n"

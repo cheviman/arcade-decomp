@@ -3,14 +3,15 @@ Name:        cpu.py
 Description: what the decompiler's passes need to know about the processor whose code they work on
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    20-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 The passes were written for the V60 and work on any code lifted to the same IR: a processor is its
 registers (which are kept as variables, which one is the stack pointer, how wide an address is), its
-flags, how big a return address is on its stack, the effects where interrupts may run, and the register
-a function's yes-or-no answer usually comes back in. use() makes a profile the current one and lets the
-modules that keep tables of it build them again; V60 is the one in use until then.
+flags, how big a return address is on its stack, the effects where interrupts may run, the register
+a function's yes-or-no answer usually comes back in, and the order of the bytes of a value in memory
+(byte_shift). use() makes a profile the current one and lets the modules that keep tables of it build them
+again; V60 is the one in use until then.
 """
 from dataclasses import dataclass
 
@@ -31,6 +32,8 @@ class Profile:
     variable_names: dict        # the base name of a register's variables, where it is not rN
     invalid_jump: str           # what a jump through a table calls for an entry the table does not have
     float_registers: tuple = () # registers that hold floating-point values (floats.py): a float or a double
+    byte_order: str = "little"  # of a value in memory: "little", its lowest byte first, or "big"
+    bus_bits: int = None        # the address lines the CPU drives, where fewer than address_bits (the 68000's 24)
 
 
 V60 = Profile(
@@ -73,12 +76,43 @@ Z80 = Profile(
     invalid_jump="sound_invalid_jump",
 )
 
+# m68000/lift.py: D0-D7 are 0-7, A0-A6 8-14 and A7, the stack pointer, 15; 16 is the stack pointer of the
+# other mode (the user's in supervisor mode, the supervisor's in user mode) and 17 the system byte of the
+# status register (trace, supervisor, interrupt mask). Big endian; a call pushes its 32-bit return address
+M68000 = Profile(
+    name="m68000",
+    registers=tuple(range(15)) + (16, 17),
+    sp=15,
+    address_bits=32,
+    flags=("z", "s", "ov", "cy", "x"),
+    return_address_bytes=4,
+    interrupt_effects=("frame_wait", "take_interrupts"),
+    result_register=None,
+    register_bits={index: 32 for index in tuple(range(15)) + (16, 17)},
+    register_names={**{index: f"d{index}" for index in range(8)}, **{8 + index: f"a{index}" for index in range(7)},
+                    15: "sp", 16: "other_sp", 17: "sr_system"},
+    flag_names={"z": "zero", "s": "negative", "ov": "overflow", "cy": "carry", "x": "extend"},
+    variable_names={**{index: f"d{index}" for index in range(8)}, **{8 + index: f"a{index}" for index in range(7)},
+                    16: "other_sp", 17: "sr_system"},
+    invalid_jump="invalid_jump",
+    byte_order="big",
+    bus_bits=24,
+)
+
 current = V60
 
 
 def variable_name(index):
     """The base name of the variables a register's values become, where nothing better names them."""
     return current.variable_names.get(index, f"r{index}")
+
+
+def byte_shift(position, size, count=1):
+    """How many bits up a value of 'size' bytes in memory holds its bytes position to position + count - 1:
+    little endian the first byte is the lowest, big endian the highest."""
+    if current.byte_order == "big":
+        return 8 * (size - position - count)
+    return 8 * position
 
 
 def kept(index):

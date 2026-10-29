@@ -5,7 +5,7 @@ Name:        emit.py
 Description: writes the sound program's functions as C, through the decompiler's writer
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    25-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 The decompiler's FunctionWriter does the work (decompiler/emit.py); this gives it the Z80's memory and
@@ -13,7 +13,8 @@ effects. MEMORY_MAP is the Z80's for decompiler/memory.py and decompiler/pointer
 with the main CPU (E000-FFFF) holds the variables and the structures sound_symbols.txt names, read and
 written as lvalues over those bytes (SOUND_RAM8, VOICE(p)->field); the program ROM (0000-9FFF) the tables;
 the banked page of the sound ROM (A000-BFFF) and the sound chip (C000-DFFF) are the board's, reached through
-its bus by name (game_profile.SOUND_HARDWARE). A computed address no structure explains goes over the bus, z80_read8/16() and z80_write8/16()
+its bus by name (game_profile.SOUND_HARDWARE). Another board gives its own map in the profile: SOUND_RAM_AREA and
+SOUND_ROM_AREA (TMNT: the Z80's own RAM at 8000-87FF, its program at 0000-7FFF, the chips at 9000-F000). A computed address no structure explains goes over the bus, z80_read8/16() and z80_write8/16()
 (runtime/include/sound/support.h). The timing model's Effects (z80_block, z80_cycles), DI and EI, OUT and
 the block moves print as calls of that header, the ports by the names sound_symbols.txt gives them.
 """
@@ -34,8 +35,10 @@ def use_memory_map(names, arrays):
     import game_profile
     from decompiler import memory
     from decompiler import pointers
-    global BLOCK_FETCHES
+    global BLOCK_FETCHES, SHARED_RAM, PROGRAM_ROM
     BLOCK_FETCHES = getattr(game_profile, "SOUND_BLOCK_FETCHES", True)
+    SHARED_RAM = getattr(game_profile, "SOUND_RAM_AREA", SHARED_RAM)
+    PROGRAM_ROM = getattr(game_profile, "SOUND_ROM_AREA", PROGRAM_ROM)
     memory.WORK_RAM = SHARED_RAM
     memory.ROM_AREAS = (PROGRAM_ROM,)
     memory.ADDRESS_MASK = 0xFFFF
@@ -43,6 +46,8 @@ def use_memory_map(names, arrays):
     memory.RAM_MACRO, memory.ROM_MACRO = "SOUND_RAM", "SOUND_ROM"
     memory.RAM_FUNCTION, memory.ROM_FUNCTION = "sound_ram_at", "sound_rom_at"
     memory.LOADED_TABLES = getattr(game_profile, "SOUND_LOADED_TABLES", False)
+    memory.COUNTED_FROM_ONE = getattr(game_profile, "SOUND_COUNTED_FROM_ONE", False)
+    memory.NAMES_BEFORE_TABLES = getattr(game_profile, "SOUND_NAMES_BEFORE_TABLES", 0)
     memory.PAGED = False
     memory.PLAYER_FIELDS = None
     memory.CANONICAL = lambda address: address

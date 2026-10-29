@@ -38,9 +38,15 @@ def part(bits, name, offset, whole):
     """C of an access of 'bits' at byte 'offset' of 'name', a field or variable of 'whole' bits that has no
     name for that part of it: AS8(x) for the first byte, AT8(x, 1) for the second. An access that reaches
     past the end of it (the 32 bits from a halfword on, two fields copied at once) is written the same way,
-    but only the ones inside it read as a part of its value (part_read)."""
+    but only the ones inside it read as a part of its value (part_read). The macros take the place of the part in
+    the host's memory, which is little endian: for a big-endian CPU (cpu.byte_order), whose memory the runtime
+    keeps the other way round (m68000/emit.py), the part 'offset' bytes into the CPU's value is that many bytes
+    from the host's end of it."""
+    inside = offset * 8 + bits <= whole and bits < whole
+    if cpu.current.byte_order == "big":
+        offset = whole // 8 - bits // 8 - offset
     text = f"AS{bits}({name})" if offset == 0 else f"AT{bits}({name}, {offset})"
-    if offset * 8 + bits <= whole and bits < whole:
+    if inside:
         INSIDE.add(text)
     return text
 

@@ -5,7 +5,7 @@ Name:        function.py
 Description: the sound program's functions as control-flow graphs of IR blocks, with the time they take
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    21-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Takes the functions tools/z80/analysis.py splits the program into, lifts every instruction to IR
@@ -17,7 +17,10 @@ fetches up to it); a
 condition that sends a JR, DJNZ, CALL or RET the long way adds its extra cycles on that way
 (Effect("z80_cycles")). A block ends after every call, so a callee starts when its caller's time says.
 DI and EI become Effects; EI as the last instruction of a block delays interrupts by that block start,
-as the Z80 delays them by one instruction.
+as the Z80 delays them by one instruction. With the profile's SOUND_INTERRUPT_WINDOWS a block also starts where
+an EI first lets an interrupt in (the instruction after the one that follows it), so that a program that opens
+interrupts for a few instructions takes them there. A jump through a record's slot (SOUND_FOLLOW_VALUES) is a
+switch on the handlers the program stores there, each called as a tail call.
 
 The main loop's top (the "loop" line of sound_symbols.txt) is where the program waits for the board:
 every way into it returns to the board, which calls it again while the board's time is ahead.
@@ -49,14 +52,30 @@ def leaders(program):
     """Where blocks start, the same for every function and for the reference's timing (s32ref reads them):
     entries, every target, and the instruction after anything that branches, jumps, returns or calls."""
     found = set(program.entries)
-    for address, instruction in program.analysis.instructions.items():
+    instructions = program.analysis.instructions
+    windows = interrupt_windows()
+    for address, instruction in instructions.items():
         following = (address + instruction.length) & 0xFFFF
         for target in program.successors(instruction):
             if target != following:
                 found.add(target)
         if instruction.flow in (dis.FLOW_BRANCH, dis.FLOW_JUMP, dis.FLOW_RETURN, dis.FLOW_CALL):
             found.add(following)
-    return found & set(program.analysis.instructions)
+        if windows and instruction.mnemonic == "ei" and following in instructions:
+            # the first place the Z80 takes an interrupt an EI lets in: after the instruction that follows it
+            found.add((following + instructions[following].length) & 0xFFFF)
+    return found & set(instructions)
+
+
+def interrupt_windows():
+    """The profile's SOUND_INTERRUPT_WINDOWS: whether a block starts where an EI first lets an interrupt in, for a
+    program that opens interrupts for a few instructions only (TMNT's main loop: EI, four NOPs, DI); the timing
+    model takes interrupts where blocks start. System 32's programs keep them open: no such blocks."""
+    try:
+        import game_profile
+    except ImportError:
+        return False
+    return getattr(game_profile, "SOUND_INTERRUPT_WINDOWS", False)
 
 
 class Builder:
@@ -238,6 +257,11 @@ class Builder:
             return
         if mnemonic == "jp":
             table = self.program.analysis.jump_tables.get(address)
+            if not table:
+                # a jump through a record's slot (SOUND_FOLLOW_VALUES): to one of the handlers the program
+                # stores there, each a function of its own the jump calls (a tail call)
+                table = sorted({handler for slot in self.program.analysis.slot_jumps.get(address, ())
+                                for handler in self.program.analysis.slots.get(slot, ())})
             if not table:
                 raise lift.Unsupported(f"{address:04X}: {instruction.text} with no table")
             register = lift.PAIRS[instruction.operands[0].reg]

@@ -141,6 +141,14 @@ FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that
 
 
 BASES = {}                     # name -> address of the program's data, for "STRUCT@NAME" (decompile.py)
+# A big-endian program whose runtime keeps its memories the other way round (the 68000's: m68000/emit.py), so
+# that a value of any width at any address is a plain value of the little-endian host's: a structure's bytes
+# run backwards in the host's memory too. Its fields are declared from its end (Layouts.declarations), the
+# macro that gives a pointer to one takes its size (STRUCT(address) is ram((address), sizeof(struct ...)), the
+# place of its last byte), and a record past the one a pointer is in is reached by moving the pointer
+# (STRUCT(p + 0xAu)->field, emit.py), never by an index, which would run the other way. Arrays of values
+# (ELEMENTS), fields that are arrays and tables of records are not laid out that way (Layouts says so)
+REVERSED = False
 
 
 def link_kind(link, offset=0):
@@ -1616,6 +1624,13 @@ class Layouts:
             return lines
         return lay(members, start, end, pad)
 
+    def pointer_macro(self, struct):
+        """The macro's body that gives a pointer to one of 'struct' from its address ('address'): the cast and
+        the function; with REVERSED, the function takes the structure's size too (where its last byte is)."""
+        if REVERSED and struct not in ELEMENTS:
+            return f"({self.pointer_type(struct)}((address), sizeof(struct {struct})))"
+        return f"({self.pointer_type(struct)}(address))"
+
     def pointer_type(self, struct):
         """The cast and function that give a pointer to one of 'struct' from its address: "(const struct
         floor_block *)rom", "(const uint16_t *)rom" for an array of plain values, "(struct object *)ram"."""
@@ -1634,10 +1649,66 @@ class Layouts:
     def member_type(self, struct, offset, bits):
         return f"int{bits}_t" if self.signed[struct][offset] else f"uint{bits}_t"
 
+    def host_view(self, size, fields, names, signed, overlays):
+        """The fields ({offset: bits}, their names and signedness by offset, the overlays {(offset, bits): (name,
+        signed)}) of a structure that runs backwards in the host's memory (REVERSED), by where they are there: a
+        field 'offset' bytes into the program's structure and 'bits' wide starts size - offset - bits / 8 bytes
+        into the host's. Two that start at one place there (a 32-bit field and the halfword at its end, its low
+        half) are a field and an overlay of it; one inside another is a part of it. (fields, names, signed,
+        overlays) by the host's offsets."""
+        found = {}
+        for offset, bits in fields.items():
+            found.setdefault(size - offset - bits // 8, []).append((bits, names[offset], signed[offset]))
+        for (offset, bits), (name, is_signed) in overlays.items():
+            found.setdefault(size - offset - bits // 8, []).append((bits, name, is_signed))
+        host_fields, host_names, host_signed, host_overlays = {}, {}, {}, {}
+        for place, names_there in found.items():
+            names_there.sort(key=lambda item: -item[0])
+            bits, name, is_signed = names_there[0]
+            host_fields[place], host_names[place], host_signed[place] = bits, name, is_signed
+            for other_bits, other_name, other_signed in names_there[1:]:
+                if other_bits == bits:
+                    raise ValueError(f"'{other_name}' and '{name}' are the same bytes")
+                host_overlays[(place, other_bits)] = (other_name, other_signed)
+        return host_fields, host_names, host_signed, host_overlays
+
+    def reversed_lines(self, struct, size):
+        """The C members of 'struct' laid out backwards (REVERSED): the fields from its end; with families
+        (scoped fields), their views first, as a union, then the fields every one of them has."""
+        if any(key[0] == struct for key in FIELD_ARRAYS) or any(key[0] == struct for key in SCOPED_ARRAYS):
+            raise ValueError(f"{struct}: a field that is an array, in a structure laid out backwards")
+        host = self.host_view(size, self.fields.get(struct, {}), self.names[struct], self.signed[struct],
+                              self.overlays.get(struct, {}))
+        region = self.region(struct)
+        if region is None:
+            return self.member_lines(struct, self.members(struct, host[0]), 0, size, "\t", *host[1:], {})
+        boundary = size - region    # (the views' bytes are the host's first ones)
+        own = {place: bits for place, bits in host[0].items() if place < boundary}
+        common = {place: bits for place, bits in host[0].items() if place >= boundary}
+        if any(place < boundary < place + bits // 8 for place, bits in host[0].items()):
+            raise ValueError(f"{struct}: a field runs into the families' views at {region:X}")
+        lines = ["\tunion", "\t{", "\t\tstruct", "\t\t{"]
+        lines += self.member_lines(struct, self.members(struct, own), 0, boundary, "\t\t\t", *host[1:], {})
+        lines.append("\t\t};")
+        for family in self.families(struct):
+            scoped = self.scoped[struct][family]
+            view = self.host_view(size, {offset: bits for offset, (_, bits, _) in scoped.items()},
+                                  {offset: found[0] for offset, found in scoped.items()},
+                                  {offset: found[2] for offset, found in scoped.items()},
+                                  self.scoped_overlays.get(struct, {}).get(family, {}))
+            lines += ["\t\tstruct", "\t\t{"]
+            lines += self.member_lines(struct, self.members(struct, view[0]), 0, 0, "\t\t\t", *view[1:], {})
+            lines.append(f"\t\t}} {self.views[struct][family]};")
+        lines.append("\t};")
+        lines += self.member_lines(struct, self.members(struct, common), boundary, size, "\t", *host[1:], {})
+        return lines
+
     def declarations(self):
         lines = ["#pragma pack(push, 1)"]
         for struct, size in STRUCTS.items():
             if struct in ELEMENTS:
+                if REVERSED:
+                    raise ValueError(f"{struct}: an array of values, in a program whose structures run backwards")
                 continue    # (an array of plain values: no structure)
             fields = self.fields.get(struct, {})
             if struct not in self.names:
@@ -1646,7 +1717,9 @@ class Layouts:
             lines.append("{")
             members = self.members(struct)
             region = self.region(struct)
-            if region is None:
+            if REVERSED:
+                lines += self.reversed_lines(struct, size)
+            elif region is None:
                 lines += self.member_lines(struct, members, 0, size, "\t")
             else:
                 if any(offset < region < offset + bits // 8 for offset, bits, _ in members):
@@ -1685,7 +1758,9 @@ class Layouts:
                          f"\"struct {struct} has the size of {what}\");")
         lines.append("")
         for struct in STRUCTS:
-            lines.append(f"#define {struct.upper()}(address) ({self.pointer_type(struct)}(address))")
+            lines.append(f"#define {struct.upper()}(address) {self.pointer_macro(struct)}")
+        if RECORD_TABLES and REVERSED:
+            raise ValueError("tables of records, in a program whose structures run backwards")
         if RECORD_TABLES:
             lines += ["", "/* the program ROM's tables of records, by name: name[i].field */"]
             digits = 4 if ADDRESS_MASK <= 0xFFFF else 6

@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -137,6 +137,32 @@ def stride_of(offset):
     return None
 
 
+def widened_stride(offset):
+    """(index, stride) for an offset worked out at a narrower width and widened (the 68000's "(A0,D0.w)" of a
+    byte shifted left by 2 in a word: zext(shl(zext(byte), 2))), when the narrow product cannot overflow: the
+    index widened the same way, or None (WIDENED_INDEXES)."""
+    if not (WIDENED_INDEXES and isinstance(offset, ir.Op) and offset.name in ("zext", "sext", "fits")):
+        return None
+    inner = offset.args[0] if offset.name != "fits" else offset.args[0]
+    found = stride_of(inner) if isinstance(inner, ir.Op) else None
+    if found is None:
+        return None
+    index, stride = found
+    source = index
+    signed = offset.name == "sext"
+    while isinstance(source, ir.Op) and source.name in (("sext",) if signed else ("zext", "fits")):
+        source = source.args[0]
+    narrow = getattr(source, "bits", 32)
+    if narrow > 8 or stride > 8 or (signed and source is index):
+        return None    # (a byte times at most 8 fits the 16 bits it was worked out in)
+    widen = ir.sext if signed else ir.zext
+    return widen(source, offset.bits), stride
+
+
+# whether switch_index takes an index worked out narrower and widened (widened_stride): the 68000's (m68000/decompile.py)
+WIDENED_INDEXES = False
+
+
 def switch_index(value, keys, read32):
     """For a jump through a table: (the index the table is read with, {case address: [index numbers]}),
     or None. Two kinds of table: code at base + index * stride (a run of branches), and code addresses
@@ -160,7 +186,18 @@ def switch_index(value, keys, read32):
         if isinstance(address, ir.Op) and address.name == "add":
             left, right = address.args
             base, offset = (left, right) if isinstance(left, ir.Const) else (right, left)
-            found = stride_of(offset) if isinstance(base, ir.Const) else None
+            found = (stride_of(offset) or widened_stride(offset)) if isinstance(base, ir.Const) else None
+            if found is None and WIDENED_INDEXES and isinstance(base, ir.Const) and not isinstance(offset, ir.Const):
+                # (an offset in bytes the code works out on its own: the switch is on it, its cases the offsets of
+                # the table's entries)
+                numbers = {key: [] for key in keys}
+                for number in range(1024):
+                    target = read32((base.value & 0xFFFFFF) + number * 4) & 0xFFFFFF
+                    if target not in numbers:
+                        break
+                    numbers[target].append(number * 4)
+                if all(numbers.values()):
+                    return offset, numbers
             if found is not None and found[1] == 4:
                 index, _ = found
                 numbers = {key: [] for key in keys}
@@ -637,7 +674,7 @@ class FunctionWriter:
         for block in self.function.blocks.values():
             for statement in block.statements:
                 hit = self.fields.get(id(statement))
-                if not isinstance(statement, ir.Store) or hit is None or hit[:2] != ("object", dataflow.HANDLER_SLOTS[0]) \
+                if not isinstance(statement, ir.Store) or hit is None or hit[:2] != ("object", dataflow.handler_slot()) \
                         or not isinstance(hit[2], ir.Reg) or hit[3] or not isinstance(statement.value, ir.Const):
                     continue
                 target = self.emitter.names.get(statement.value.value & 0xFFFFFF)
@@ -1240,7 +1277,7 @@ class FunctionWriter:
         if isinstance(value, ir.Const):
             lines = []
             for start, bits, text in pieces:
-                part = (value.value >> (start * 8)) & ((1 << bits) - 1)
+                part = (value.value >> cpu.byte_shift(start, statement.bits // 8, bits // 8)) & ((1 << bits) - 1)
                 signed = self.signed_pieces.get(text, False)
                 lines.append(f"{text} = {cprint.signed_literal(part, bits) if signed else cprint.literal(part, bits)};")
             return lines
@@ -1362,12 +1399,15 @@ class FunctionWriter:
         terms = []
         for position, count, text, width, signed, within in pieces:
             value = f"({cprint.UNSIGNED[width]}){text}" if signed else text
-            if within:
-                value = f"({value} >> {within * 8}u)"
-            if count * 8 < width - within * 8:
+            # (where the bytes sit in the field, and where they go in the access: the CPU's byte order)
+            down = cpu.byte_shift(within, width // 8, count)
+            up = cpu.byte_shift(position, bits // 8, count)
+            if down:
+                value = f"({value} >> {down}u)"
+            if count * 8 < width - down:
                 value = f"({value} & 0x{(1 << count * 8) - 1:X}u)"
-            if position:
-                value = f"((uint32_t){value} << {position * 8}u)"
+            if up:
+                value = f"((uint32_t){value} << {up}u)"
             terms.append(value)
         return "(" + " | ".join(terms) + ")"
 
@@ -1398,22 +1438,25 @@ class FunctionWriter:
         for position, count, target, width, signed, within in pieces:
             mask = (1 << count * 8) - 1
             whole = not within and count * 8 == width
-            keep = ~(mask << within * 8) & ((1 << width) - 1)
+            # (where the bytes go in the field, and where they come from in the value: the CPU's byte order)
+            down = cpu.byte_shift(within, width // 8, count)
+            up = cpu.byte_shift(position, statement.bits // 8, count)
+            keep = ~(mask << down) & ((1 << width) - 1)
             if text is None:
-                part = (value.value >> (position * 8)) & mask
+                part = (value.value >> up) & mask
                 if whole:
                     literal = cprint.signed_literal(part, width) if signed else cprint.literal(part, width)
                     lines.append(f"{target} = {literal};")
                 elif part == 0:
                     lines.append(f"{target} &= 0x{keep:X}u;")
                 else:
-                    lines.append(f"{target} = ({target} & 0x{keep:X}u) | 0x{part << within * 8:X}u;")
+                    lines.append(f"{target} = ({target} & 0x{keep:X}u) | 0x{part << down:X}u;")
                 continue
-            part = text if not position else f"({text} >> {position * 8}u)"
+            part = text if not up else f"({text} >> {up}u)"
             if whole:
                 lines.append(f"{target} = ({cprint.UNSIGNED[width]}){part};")
                 continue
-            shifted = f"({part} & 0x{mask:X}u)" if not within else f"(({part} & 0x{mask:X}u) << {within * 8}u)"
+            shifted = f"({part} & 0x{mask:X}u)" if not down else f"(({part} & 0x{mask:X}u) << {down}u)"
             lines.append(f"{target} = ({target} & 0x{keep:X}u) | {shifted};")
         return lines
 
@@ -1425,15 +1468,16 @@ class FunctionWriter:
         if scoped and address in scoped:
             item = scoped[address]
             return (f"{item.name}[0]" if item.indexed else item.name), item.bits, item.signed
+        memory_ = self.emitter.memory
         item = variables.get(address)
         if item is not None:
-            return (f"{item.name}[0]" if item.indexed else item.name), item.bits, item.signed
+            return (memory_.indexed_text(variables, item, "0") if item.indexed else item.name), item.bits, item.signed
         for start in range(address - 1, address - 0x40, -1):
             item = variables.get(start)
             if item is None:
                 continue
             if item.indexed and (address - start) % (item.bits // 8) == 0:
-                return f"{item.name}[{(address - start) // (item.bits // 8)}]", item.bits, item.signed
+                return memory_.indexed_text(variables, item, str((address - start) // (item.bits // 8))), item.bits,                     item.signed
             return None
         return None
 
@@ -1612,6 +1656,22 @@ class FunctionWriter:
         if table is not None:
             # a table of records by its name: hud_gauge_positions_3p[player].y
             pointer = table[0]
+        elif index is not None and pointers.REVERSED and struct not in pointers.ELEMENTS:
+            # records one after another run the other way in the host's memory (pointers.REVERSED): the one
+            # 'index' records on is reached by moving the pointer, ANIMATION_FRAME(frame - 0xAu)->attack_box
+            size = pointers.STRUCTS[struct]
+            start = self.printer.any(base).text
+            if isinstance(index, ir.Const):
+                moved = pointers.signed((index.value & 0xFFFFFFFF) * size - base_offset)
+                pointer = f"{struct.upper()}({start})" if not moved else \
+                    f"{struct.upper()}({start} {'+' if moved > 0 else '-'} 0x{abs(moved):X}u)"
+            else:
+                number = self.record_number(index)
+                if not re.fullmatch(r"[\w()]+", number):
+                    number = f"({number})"
+                moved = f" - 0x{base_offset:X}u" if base_offset else ""
+                pointer = f"{struct.upper()}({start} + {number} * 0x{size:X}u{moved})"
+            index = None
         else:
             start = self.printer.any(base).text
             pointer = f"{struct.upper()}({start})" if not base_offset else \
@@ -2103,7 +2163,7 @@ class FunctionWriter:
         variable that holds every byte it changes or tests (a byte of the constant other than 'fill'),
         and the constant for it (its other bytes 'fill'): (C, constant, bits), or None."""
         size = bits // 8
-        touched = [index for index in range(size) if (constant >> (index * 8)) & 0xFF != fill]
+        touched = [index for index in range(size) if (constant >> cpu.byte_shift(index, size)) & 0xFF != fill]
         if not touched:
             return None
         found = self.exact_holder(address, bits, key, touched[0], touched[-1] + 1)
@@ -2113,8 +2173,8 @@ class FunctionWriter:
         value = 0
         for index in range(width // 8):
             byte = index - before
-            part = (constant >> (byte * 8)) & 0xFF if 0 <= byte < size else fill
-            value |= part << (index * 8)
+            part = (constant >> cpu.byte_shift(byte, size)) & 0xFF if 0 <= byte < size else fill
+            value |= part << cpu.byte_shift(index, width // 8)
         return text, value, width
 
     def exact_holder(self, address, bits, key, low, high):
@@ -2227,7 +2287,7 @@ class FunctionWriter:
                         elif isinstance(node, ir.Const) and not node.value & 0xFFFF:
                             hit = self.fields.get(id(statement))
                             if isinstance(statement, ir.Store) and statement.value is node \
-                                    and hit is not None and hit[:2] == ("object", dataflow.HANDLER_SLOTS[0]):
+                                    and hit is not None and hit[:2] == ("object", dataflow.handler_slot()):
                                 continue
                             if isinstance(statement, ir.SetReg) and statement.value is node \
                                     and node.value in BOARD_MEMORIES \
@@ -2947,6 +3007,15 @@ class Emitter:
                 return (f"{table[0]}_ADDRESS", cprint.PRIMARY) if not table[2] else \
                     (f"{table[0]}_ADDRESS + 0x{table[2]:X}u", cprint.ADD)
             label = self.data_labels.get(canonical)
+            after = self.memory.table_after(canonical) if label is None else None
+            if after is not None:
+                # the base of a table the code indexes from past its start (memory.NAMES_BEFORE_TABLES)
+                return f"{after[0].name}_ADDRESS - 0x{after[1]:X}u", cprint.ADD
+            if label is None and memory.NAMES_BEFORE_TABLES and after is None                     and self.memory.inside(self.memory.tables, canonical) is None:
+                # ... or of the data a label names (a table of records: pcm_drums_ADDRESS - 0x6u)
+                for distance in range(1, memory.NAMES_BEFORE_TABLES + 1):
+                    if canonical + distance in self.data_labels:
+                        return f"{self.data_labels[canonical + distance]}_ADDRESS - 0x{distance:X}u", cprint.ADD
             return (f"{label}_ADDRESS", cprint.PRIMARY) if label is not None else None
         register = self.memory.register(address)
         if register is not None:

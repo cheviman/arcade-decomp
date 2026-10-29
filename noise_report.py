@@ -43,6 +43,9 @@ import game_profile  # noqa: E402  (the game's: its root)
 ROOT = game_profile.ROOT
 # function -> why it works on memory by its address (the faithful measure takes its mem_access as the original's)
 MEMORY_ROUTINES = getattr(game_profile, "MEMORY_ROUTINES", {})
+# the names of the main CPU's registers, which its C names its values after until a line names them (rN by
+# default, the V60's; the profile's NOISE_REGISTERS for another CPU: the 68000's d0-d7 and a0-a6)
+CPU_REGISTER = getattr(game_profile, "NOISE_REGISTERS", r"r\d+")
 BASELINE = ROOT / "tools" / "noise_baseline.txt"
 UNNAMED_ADDRESSES = ROOT / "build" / "decompile" / "unnamed_addresses.txt"
 
@@ -56,7 +59,7 @@ COPY_BACK = re.compile(r"^\t+\*p_(\w+) = (?:\w+|\(\*p_\1 & 0x[0-9A-F]+u\) \| (?:
 KINDS = {
     "goto": ("goto statements", re.compile(r"\bgoto\b")),
     "control_variables": ("functions with bool control variables", None),
-    "sub_functions": ("functions named after their address (sub_XXXXXX, the sound program's sound_XXXX)", None),
+    "sub_functions": ("functions named after their address (sub_XXXXXX, func_XXXXXX; the sound program's sound_XXXX)", None),
     "unk_names": ("memory named after its address (unk_XXXXXX)", re.compile(r"(?<!->)(?<!\.)\bunk_[0-9A-F]{4,6}\b")),
     "rom_names": ("tables of the program ROM named after their address (rom_XXXXXX)",
                   re.compile(r"(?<!->)(?<!\.)\brom_[0-9A-F]{6}\b")),
@@ -65,6 +68,13 @@ KINDS = {
     "register_names": ("parameters and locals named after a register (r1, p_r4, r0_2; the Z80's a, hl)", None),
     "temp_names": ("values the decompiler works out once, named by a number (t1)", None),
     "stack_names": ("stack slots named after their offset (stack_4)", None),
+    "flag_variables": ("locals that hold a flag of the CPU (zero, negative, overflow, carry, extend)", None),
+    "flag_helpers": ("flags worked out as the CPU sets them (m68k_carry_add16...)",
+                     re.compile(r"\b(?:m68k|m68000|v60|z80)_(?:carry|overflow)_(?:add|sub)\d+\(")),
+    "lost_stack": ("code no path reaches that keeps a stack the C does not have (lost_stack)",
+                   re.compile(r"\blost_stack\(")),
+    "code_switches": ("switches on the address of the code a table holds, not on the index the table is read with "
+                      "(jump_target)", re.compile(r"\bjump_target = ")),
 
 
     "context_registers": ("uses of the registers the C keeps as globals, still named after them (src/game.h)", None),
@@ -118,11 +128,12 @@ def count(paths):
                 counts["functions"] += 1
                 if not lines[index - 1].endswith("*/"):
                     counts["uncommented"] += 1
-                if re.fullmatch(r"sub_[0-9A-F]{6}|sound_[0-9A-F]{4}", found.group(1)):
+                if re.fullmatch(r"(?:sub|func)_[0-9A-F]{6}|sound_[0-9A-F]{4}", found.group(1)):
                     counts["sub_functions"] += 1
                 if found.group(1) == "BOARD_ORIGINAL":
                     counts["board_replaced"] += 1
-                counts["register_names"] += len(re.findall(r"(?<!\w)(?:p_)?r\d+(?:_\d+)?(?=[,)]|$)", found.group(2)))
+                counts["register_names"] += len(re.findall(rf"(?<!\w)(?:p_)?{CPU_REGISTER}(?:_\d+)?(?=[,)]|$)",
+                                                           found.group(2)))
                 if z80:
                     counts["register_names"] += len(re.findall(rf"(?<!\w)(?:p_)?{Z80_REGISTER}(?=[,)]|$)",
                                                                found.group(2)))
@@ -136,7 +147,9 @@ def count(paths):
                 if pattern is not None:
                     counts[kind] += len(pattern.findall(line))
             if re.match(r"^\t(?:uint\d+_t|int\d+_t) ", line):
-                counts["register_names"] += len(re.findall(r"\br\d+(?:_\d+)? = ", line))
+                counts["register_names"] += len(re.findall(rf"\b{CPU_REGISTER}(?:_\d+)? = ", line))
+                counts["flag_variables"] += len(re.findall(r"\b(?:zero|negative|overflow|carry|extend)(?:_\d+)? = ",
+                                                           line))
                 if z80:
                     counts["register_names"] += len(re.findall(rf"\b{Z80_REGISTER} = ", line))
                 counts["temp_names"] += len(re.findall(r"\bt\d+ = ", line))
@@ -208,7 +221,7 @@ def clean_measure(paths, extra, registers=None, faithful=False):
             if found and index + 1 < len(text) and text[index + 1] == "{":
                 inside = True
                 checked = routine_patterns if faithful and found.group(1) in MEMORY_ROUTINES else patterns
-                dirty = bool(re.findall(r"(?<!\w)(?:p_)?r\d+(?:_\d+)?(?=[,)]|$)", found.group(2))) or \
+                dirty = bool(re.findall(rf"(?<!\w)(?:p_)?{CPU_REGISTER}(?:_\d+)?(?=[,)]|$)", found.group(2))) or \
                     (z80 and bool(re.findall(rf"(?<!\w)(?:p_)?{Z80_REGISTER}(?=[,)]|$)", found.group(2))))
                 continue
             if not inside:

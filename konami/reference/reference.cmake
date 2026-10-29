@@ -1,7 +1,7 @@
 # Name:        reference.cmake
 # Description: builds the reference tools of a game on Konami's 68000 boards (MAME's tmnt.cpp family) on
 #              MAME's cores: kref (the original program on MAME's 68000 core against the game's board model)
-#              and the 68000 disassembler's oracle
+#              and the oracles of the 68000 disassembler and of its lift
 # Version:     0.1.0
 # Created:     29-10-2026
 # Modified:    29-10-2026
@@ -11,6 +11,7 @@
 # runtime and its data library and found Python3::Interpreter, and set:
 #   K_GAME_RUNTIME       the board runtime's library (the board model and the ROM set's reader: tmnt_runtime)
 #   K_RUNTIME_INCLUDE    the board runtime's headers (default: the game's runtime/include)
+#   K_GAME_SOUND         (optional) the game's own sound board's library, for kref --sound-board-check
 # MAME's sources are MAME 0.289's (mame/, BSD-3-Clause, mame/LICENSE); ymfm's are in ymfm/ (ymfm/LICENSE).
 
 set(K_REFERENCE ${CMAKE_CURRENT_LIST_DIR})
@@ -51,6 +52,22 @@ endif()
 add_executable(oracle_m68k ${K_REFERENCE}/oracle_m68k.cpp)
 target_link_libraries(oracle_m68k PRIVATE m68000_reference)
 
+# MAME's 68000 core running one instruction at a time from given states, the one the 68000's lift
+# (m68000/lift.py) is compared with (compare_lift_with_mame.py)
+add_executable(oracle_m68k_step ${K_REFERENCE}/oracle_m68k_step.cpp)
+target_link_libraries(oracle_m68k_step PRIVATE m68000_reference)
+
+# The C the translator writes for the program's instructions, on the game runtime's m68000/ops.h, run from the
+# same states (compare_lift_with_mame.py --c writes build/lift_check/cases.c from the user's ROM)
+file(GLOB K_LIFT_CASES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/build/lift_check/cases.c)
+if(K_LIFT_CASES)
+	add_executable(lift_check_m68k ${K_REFERENCE}/lift_check_m68k.c ${K_LIFT_CASES})
+	target_include_directories(lift_check_m68k PRIVATE ${K_RUNTIME_INCLUDE})
+	if(MSVC)
+		target_compile_options(lift_check_m68k PRIVATE /bigobj)
+	endif()
+endif()
+
 # MAME's K052109 and K051960 drawing the board model's frames: the frames the game's video has to match
 add_library(kvideo_reference STATIC ${K_REFERENCE}/video/kvideo.cpp)
 target_include_directories(kvideo_reference
@@ -87,3 +104,9 @@ endif()
 add_executable(kref ${K_REFERENCE}/kref.cpp)
 target_include_directories(kref PRIVATE ${K_RUNTIME_INCLUDE})
 target_link_libraries(kref PRIVATE m68000_reference kvideo_reference ksound_reference ${K_GAME_RUNTIME})
+# the game's own sound board, when it has one (K_GAME_SOUND: the decompiled sound program on the board's own
+# chips), which kref --sound-board-check runs beside MAME's
+if(K_GAME_SOUND)
+	target_link_libraries(kref PRIVATE ${K_GAME_SOUND})
+	target_compile_definitions(kref PRIVATE K_GAME_SOUND_BOARD=1)
+endif()

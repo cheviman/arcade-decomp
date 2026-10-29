@@ -3,7 +3,7 @@ Name:        recompile.py
 Description: translates the game's V70 program into C, one C function per function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    20-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/recompile.py [rom folder or .zip] --trace build/scenarios/*/executed.txt
@@ -19,7 +19,11 @@ someone works out what they do.
 
 Instructions take no time. The board's events and the interrupts they raise run only in the game's
 frame loop (frame_wait_loop in symbols.txt), as system32/reference/s32ref runs them with frame timing.
+
+This is the V60's (and V70's) translator. A game on another CPU names its CPU's in its profile
+(TRANSLATOR, a module with a main(arguments): "m68000.translate" for the 68000), which this runs instead.
 """
+import importlib
 import sys
 from collections import Counter
 from pathlib import Path
@@ -429,6 +433,10 @@ HEADER = f"""/*
 
 
 def main():
+    translator = getattr(game_profile, "TRANSLATOR", None)
+    if translator:
+        # (a game on another CPU translates with its CPU's translator: m68000/translate.py for the 68000)
+        return importlib.import_module(translator).main(sys.argv[1:])
     arguments = sys.argv[1:]
     # each option takes the files that follow it, up to the next option (the scenarios' traces, by a glob)
     options = {"--trace": [], "--calls": []}

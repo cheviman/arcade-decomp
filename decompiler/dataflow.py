@@ -34,6 +34,8 @@ zero). A summary also keeps what a function always writes on its exits where the
 halfword or the whole of R0 ends up zero, and where it does not, so the caller's side of such a test
 takes only the matching results as written.
 """
+from collections import deque
+
 from v60 import ir
 
 from . import cpu
@@ -43,6 +45,17 @@ FULL = 0xFFFFFFFF
 # the field of an object that holds the handler the object loop calls (OutRunners: "jsr [4[R20]]", 011CD2),
 # then fields holding handlers the object later moves there (SegaSonic: 1C, and 9C)
 HANDLER_SLOTS = ()
+# whether the summaries are solved again only for the functions whose callees' summaries changed (a list of them),
+# instead of every function in every round: the same summaries, sooner (the 68000's 2000 functions; the V60's
+# games keep the rounds: False)
+WORKLIST = False
+
+
+def handler_slot():
+    """The field of an object that holds its handler (HANDLER_SLOTS[0]); None for a program with no objects"""
+    return HANDLER_SLOTS[0] if HANDLER_SLOTS else None
+
+
 ZERO_MASKS = (0xFF, 0xFFFF, FULL)                 # what a test of R0 looks at: byte, halfword, word
 
 
@@ -370,6 +383,8 @@ class Program:
                 key = value & 0xFFFFFF
                 if value and key in self.functions:
                     slots.setdefault(slot, set()).add(key)
+        if not HANDLER_SLOTS:
+            return slots    # (a program with no object handlers: the Z80's sound programs)
         handlers = slots.setdefault(HANDLER_SLOTS[0], set())
         for slot in HANDLER_SLOTS[1:]:
             handlers |= slots.get(slot, set())
@@ -767,6 +782,8 @@ class Program:
 
     def solve_summaries(self):
         """Summaries of every function, repeated until none changes."""
+        if WORKLIST:
+            return self.solve_summaries_by_callers()
         rounds = 0
         changed = True
         while changed:
@@ -779,10 +796,55 @@ class Program:
                     changed = True
         return rounds
 
+    def summary_users(self):
+        """{function: the functions whose summaries read its own}: its callers (calls and tail calls), and for an
+        interrupt handler every function with an effect interrupts may run in"""
+        users = {entry: set() for entry in self.functions}
+        waiting = set()
+        for entry, function in self.functions.items():
+            for block in function.blocks.values():
+                for statement in block.statements + [block.end]:
+                    if isinstance(statement, ir.Call):
+                        try:
+                            targets = self.call_targets(statement)
+                        except ValueError:
+                            targets = []
+                        for target in targets:
+                            users.setdefault(target, set()).add(entry)
+                    elif isinstance(statement, ir.TailCall):
+                        users.setdefault(statement.target & 0xFFFFFF, set()).add(entry)
+                    elif isinstance(statement, ir.Effect) and statement.name in INTERRUPT_EFFECTS:
+                        waiting.add(entry)
+        for handler in self.interrupt_handlers:
+            users.setdefault(handler, set()).update(waiting)
+        return users
+
+    def solve_summaries_by_callers(self):
+        """solve_summaries with a list of the functions to solve again: a function whose summary changes puts
+        back the ones that read it (WORKLIST)"""
+        if getattr(self, "_users", None) is None:
+            self._users = self.summary_users()
+        pending = deque(self.functions)
+        queued = set(pending)
+        solved = 0
+        while pending:
+            entry = pending.popleft()
+            queued.discard(entry)
+            solved += 1
+            new = self.solve_function(entry)
+            if new.key() != self.summaries[entry].key():
+                self.summaries[entry] = new
+                for user in self._users.get(entry, ()):
+                    if user not in queued and user in self.functions:
+                        queued.add(user)
+                        pending.append(user)
+        return solved
+
     def reset(self):
         """Forgets the summaries and outputs, for functions that changed so that they read less."""
         self.summaries = {entry: Summary() for entry in self.functions}
         self.exit_live = {}
+        self._users = None
 
     def solve(self):
         """Summaries and outputs together. What a function hands back is live where it returns, so a

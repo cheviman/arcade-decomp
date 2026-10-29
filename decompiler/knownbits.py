@@ -32,6 +32,9 @@ from v60 import ir
 from . import cpu
 
 FULL = 0xFFFFFFFF
+# a sign extension of a value whose sign bit is known zero widens it with zeros: followed as one, and written as
+# the plain value (the 68000's word indexes, "(A0,D0.w)", of a byte times 4: m68000/decompile.py sets it)
+SIGN_EXTENSIONS = False
 
 
 def width_mask(bits):
@@ -91,6 +94,12 @@ class KnownBits:
             return (self.zero(inner, state, temps) | (mask & ~width_mask(inner.bits))) & mask
         if name in ("trunc", "fits"):
             return self.zero(args[0], state, temps) & mask
+        if name == "sext" and SIGN_EXTENSIONS:
+            inner = args[0]
+            known = self.zero(inner, state, temps) & width_mask(inner.bits)
+            if known & (1 << (inner.bits - 1)):
+                return (known | (mask & ~width_mask(inner.bits))) & mask
+            return known & mask
         if name == "and":
             return (self.zero(args[0], state, temps) | self.zero(args[1], state, temps)) & mask
         if name in ("or", "xor"):
@@ -165,6 +174,10 @@ class KnownBits:
                 may = possible(self.zero(args[0], state, temps), args[0].bits)
                 if not may & ~width_mask(bits):
                     return ir.Op("fits", (args[0],), bits)
+            if name == "sext" and SIGN_EXTENSIONS and args[0].bits < bits:
+                known = self.zero(args[0], state, temps)
+                if known & (1 << (args[0].bits - 1)):
+                    return ir.zext(args[0], bits)
             if name in ("or", "xor") and args[0] == ir.Const(0, bits):
                 return args[1]
             if name in ("or", "xor") and args[1] == ir.Const(0, bits):
@@ -263,10 +276,13 @@ def call_targets(statement):
     return list(statement.choices)
 
 
-def across(functions, signatures, context, call_results, closed, rounds=100):
+def across(functions, signatures, context, call_results, closed, rounds=100, written=None):
     """({function: {parameter register: bits every call passes as zero}}, {function: {result register: bits
     every way back leaves zero}}) (see the module's notes); 'call_results' is each function's
-    {id(call): registers it hands back}, 'closed' the functions the C does not have every call of."""
+    {id(call): registers it hands back}, 'closed' the functions the C does not have every call of. With
+    'written' ({function: {register: the bits it may write}}), a result hands back as known only the bits the
+    function writes: the C writes those through the result's pointer and leaves the caller's others as they
+    were, whatever the function's own variable holds there (m68000/decompile.py)."""
     context = set(context)
     registers = {entry: ({value[1] for value in signature.params if value[0] == "r"} - context,
                          {value[1] for value in signature.results if value[0] == "r"} - context)
@@ -290,6 +306,8 @@ def across(functions, signatures, context, call_results, closed, rounds=100):
                         bits = handed.get(statement.target, {}).get(index, 0)
                     else:
                         bits = state.get(index, 0)
+                    if written is not None:
+                        bits &= written.get(entry, {}).get(index, FULL)
                     found[index] = found.get(index, FULL) & bits
 
         for entry, function in functions.items():

@@ -203,12 +203,24 @@ public:
 	void resolve_safe() {}
 };
 
-// an 8-bit output of a device: the host may connect it (set)
+// an 8-bit output of a device: the host may connect it (set). As MAME's, bind() hands out a binder that
+// refers back to it (a device's "auto port_write() { return m_handler.bind(); }" returns it by value, and
+// the set has to reach the device's own handler, not a copy)
 class devcb_write8
 {
 public:
+	class binder
+	{
+	public:
+		explicit binder(devcb_write8 &target) : m_target(target) {}
+		void set(std::function<void (offs_t, u8)> function) { m_target.set(std::move(function)); }
+
+	private:
+		devcb_write8 &m_target;
+	};
+
 	template <typename T> explicit devcb_write8(T &) {}
-	devcb_write8 &bind() { return *this; }
+	binder bind() { return binder(*this); }
 	void set(std::function<void (offs_t, u8)> function) { m_function = std::move(function); }
 	void operator()(offs_t offset, u8 data, u8 mem_mask = 0xff) { (void)mem_mask; if (m_function) m_function(offset, data); }
 	void operator()(u8 data) { if (m_function) m_function(0, data); }
@@ -283,6 +295,9 @@ class address_space
 public:
 	std::function<u8(offs_t)> read;
 	std::function<void(offs_t, u8)> write;
+	// the reads of data (the CPU's 'specific' accesses, not its opcode and argument fetches), when the host
+	// tells them apart; read otherwise
+	std::function<u8(offs_t)> data_read;
 
 	template <typename Access> void cache(Access &target) { target.space = this; }
 	template <typename Access> void specific(Access &target) { target.space = this; }
@@ -309,9 +324,9 @@ struct memory_access
 	struct specific
 	{
 		address_space *space = nullptr;
-		u8 read_byte(offs_t address) { return space->read(address); }
+		u8 read_byte(offs_t address) { return space->data_read ? space->data_read(address) : space->read(address); }
 		void write_byte(offs_t address, u8 data) { space->write(address, data); }
-		u8 read_interruptible(offs_t address) { return space->read(address); }
+		u8 read_interruptible(offs_t address) { return read_byte(address); }
 		void write_interruptible(offs_t address, u8 data) { space->write(address, data); }
 	};
 };

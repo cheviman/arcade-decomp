@@ -22,6 +22,7 @@
 #ifndef KONAMI_REFERENCE_SOUND_H
 #define KONAMI_REFERENCE_SOUND_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -31,6 +32,10 @@ extern "C" {
 
 /* Hooks the sound board to tmnt_board (after tmnt_reset and the ROM set) */
 void ks_attach(void);
+
+/* Keeps the Z80's time with the timing model of the game's own sound board (the table tools/decompile_sound.py
+   --timing writes, build/sound/timing.txt), after ks_attach: false when the file has none */
+bool ks_use_timing(const char *path);
 
 /* Runs the sound board up to board time 'time' */
 void ks_run_until(uint64_t time);
@@ -42,6 +47,10 @@ void ks_end_frame(uint64_t time);
 uint64_t ks_frame_samples_hash(void);
 uint64_t ks_state_hash(void);
 
+/* The frame's samples of each source alone (0 the YM2151, 1 the K007232, 2 the uPD7759, 3 the title music):
+   which one differs */
+void ks_frame_source_hashes(uint64_t hashes[4]);
+
 /* The frame's samples mixed as MAME's routes do (the YM2151's two outputs at 0.40, the K007232's at 0.15,
    the uPD7759 at 0.30, the title music at 0.25, all to one speaker) at the YM2151's rate, the others held
    between their samples */
@@ -51,6 +60,17 @@ uint32_t ks_mix_rate(void);
 /* The Z80's progress: the cycles it ran, and the addresses it executed (8 KB, address >> 3, bit address & 7) */
 uint64_t ks_z80_cycles(void);
 const uint8_t *ks_executed(void);
+
+/* The program ROM's bytes the Z80 reads as data (not its opcode and argument fetches), noted from
+   ks_record_rom_reads on: ks_rom_reads gives them sorted, each (instruction address << 16 | address) */
+void ks_record_rom_reads(void);
+const uint32_t *ks_rom_reads(size_t *count);
+
+/* The game's own sound chips (runtime/src: ym2151.c...) fed what MAME's get, their samples compared: from
+   ks_check_chips on (after ks_attach); ks_chip_report gives, by chip (0 the YM2151, 1 the K007232, 2 the
+   uPD7759, 3 the title music), the samples compared, how many differed and the first that did */
+void ks_check_chips(void);
+void ks_chip_report(uint64_t samples[4], uint64_t differences[4], uint64_t first[4]);
 
 #ifdef __cplusplus
 }
