@@ -5,7 +5,7 @@ Description: the game's variables, tables and hardware registers by name: work R
              named addresses
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 Work RAM (0x200000-0x20FFFF) stays the board's byte array, so the state compares byte for byte with the
@@ -205,6 +205,11 @@ def whole_elements(rest, bits):
     return base if factor == size and base is not rest else None
 
 
+def signed_number(index):
+    """True for an index that is a signed byte or halfword, widened: a number, not an address."""
+    return isinstance(index, ir.Op) and index.name == "sext" and index.args[0].bits <= 16
+
+
 def small(index):
     """True for an index that cannot be negative or huge: a zero-extended byte or halfword."""
     if isinstance(index, ir.Const):
@@ -271,6 +276,10 @@ class Memory:
         for address, (name, kind) in names.tables.items():
             bits, signed = SIGNED[kind]
             self.tables[address] = Item(address, name, bits, signed)
+            count = getattr(names, "counts", {}).get(address)
+            if count is not None:
+                self.tables[address].count = count
+                self.tables[address].indexed = True
         for address, (name, kind) in names.hardware.items():
             self.hardware[address] = Item(address, name, SIGNED[kind][0])
 
@@ -373,11 +382,11 @@ class Memory:
             return name if byte == 0 and bits == array.bits else cprint.part(bits, name, byte, array.bits)
         return None
 
-    def access(self, address, bits, index_text, indexed=False):
+    def access(self, address, bits, index_text, indexed=False, signed_text=None):
         """C for an access of 'bits' at 'address' (an IR expression): (text, signed, is RAM) or None. The
-        text is an lvalue for work RAM and an rvalue for the ROM. 'index_text' prints an index. With
-        'indexed', what is added to the constant is an index whatever its size (a pointer to a variable
-        moved by it: no pointer of its own)."""
+        text is an lvalue for work RAM and an rvalue for the ROM. 'index_text' prints an index, 'signed_text'
+        a signed one as the number it is. With 'indexed', what is added to the constant is an index whatever
+        its size (a pointer to a variable moved by it: no pointer of its own)."""
         if bits not in TYPES:
             return None
         value = constant_address(address)
@@ -409,7 +418,8 @@ class Memory:
         # of the table's elements; a register that may hold anything could be a pointer with a
         # displacement, and that read stays on the bus
         index = element_index(rest, bits)
-        if not indexed and not table_index(rest, bits):
+        centered = not indexed and not table_index(rest, bits)
+        if centered and not signed_number(index):
             return None
         ram = work_ram(base)
         board = plain_hardware(base) and base in self.board
@@ -425,6 +435,8 @@ class Memory:
             # R25 plus an offset the code reads from a table (direction_to_player_offsets): the variable
             # that many bytes into the variables
             return f"RAM{bits}(GAME_VARIABLES + {index_text(rest)})", False, True
+        if centered and (base in items or self.element(items, base) is None):
+            return None    # (a signed number only from an element past an array's first, below)
         if base not in items:
             found = self.element(items, base)
             following = items.get(base + bits // 8)
@@ -434,10 +446,14 @@ class Memory:
                 return f"{following.name}[{index_text(before)}]", following.signed, lvalue
             if found is None:
                 return None
-            # an index from an element of an array past its first (the scrolls of the second tile layer)
+            # an index from an element of an array past its first (the scrolls of the second tile layer), a
+            # signed one too from its middle (steer_frames_by_steering[64 + steering])
             array, number, byte = found
             if byte == 0 and index is not None and array.bits == bits:
-                return f"{array.name}[{number} + {index_text(index)}]", array.signed, lvalue
+                text = (signed_text or index_text)(index) if centered else index_text(index)
+                return f"{array.name}[{number} + {text}]", array.signed, lvalue
+            if centered:
+                return None
             narrow = element_index(rest, array.bits) if byte == 0 and array.bits < bits and lvalue else None
             if narrow is not None:
                 # several elements at once, as the original's one wider access (AS32(video_registers[32 +

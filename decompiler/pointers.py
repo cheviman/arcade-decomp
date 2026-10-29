@@ -4,7 +4,7 @@ Description: works out which registers point at which of the game's structures, 
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    27-10-2026
+Modified:    29-10-2026
 Author:      Sebastian Toyos
 
 The structures (STRUCTS) are OutRunners': the game objects (0x100 bytes, 124 of them below each screen's
@@ -865,6 +865,13 @@ def array_element(kind, pointer, constant, rest, zeros, whole_records, before):
                 break
         else:
             offset = kind[1] + constant
+            if before and count is not None and len(element_terms) == 1 and not records \
+                    and 0 < start - offset < size and (start - offset) % width == 0:
+                # so many elements before the array as one term of the number counts in, where the code counts
+                # that term from more than 0: road_surface_update's page_table[(page_set - 3u) * 5u + scroll]
+                counted = counted_from(element_terms[0], (start - offset) // width)
+                if counted is not None:
+                    return kind[0], start, pointer, kind[1], family_of(kind), None, counted
             record, inside = divmod(offset, size) if count is not None else (0, offset)
             if record and not whole_records:
                 continue
@@ -887,6 +894,26 @@ def array_element(kind, pointer, constant, rest, zeros, whole_records, before):
             else:
                 number = ir.Const(record & 0xFFFFFFFF, 32) if record or isinstance(pointer, ir.Const) else None
             return kind[0], start, pointer, kind[1], family_of(kind), number, element
+    return None
+
+
+def counted_from(element, behind):
+    """'element' (an array's element number) with its term x * m counted from behind / m instead of 0, where
+    the code works its address out from that many elements before the array: (x - behind / m) * m; None if
+    no term counts in a step that 'behind' is a few of."""
+    if isinstance(element, ir.Op) and element.name == "add":
+        for position, term in enumerate(element.args):
+            changed = counted_from(term, behind)
+            if changed is not None:
+                args = list(element.args)
+                args[position] = changed
+                return ir.op("add", tuple(args), element.bits)
+        return None
+    if isinstance(element, ir.Op) and element.name == "mul" and isinstance(element.args[1], ir.Const):
+        step = element.args[1].value
+        if 1 < step and behind % step == 0 and behind // step <= 16:
+            counted = ir.op("sub", (element.args[0], ir.Const(behind // step, element.bits)), element.bits)
+            return ir.op("mul", (counted, element.args[1]), element.bits)
     return None
 
 
