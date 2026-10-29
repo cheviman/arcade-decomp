@@ -21,6 +21,9 @@ Nothing here is a game's: no ROM, no names, no data.
 - `v60/`: the NEC V60 and V70's decoder, disassembler and lift into the decompiler's IR (the V70's extra
   instructions too).
 - `z80/`: the Z80's decoder, analysis, lift, timing model and C writer, for the sound boards' programs.
+- `m68000/`: the Motorola 68000's decoder and disassembler, ported from MAME's (Musashi's) and checked
+  against it at every even offset of a program and of an image of every opcode
+  (`konami/reference/compare_m68k_with_mame.py`), with each instruction's operands and control flow.
 - `decompiler/`: the decompiler, from the IR to C with no CPU left in it: data flow, signatures, the
   structuring of loops and branches (no goto), variables, the types of pointers (structures, families of
   objects, records of the program ROM, fixed instances), the program's memory by name, and the C writer.
@@ -57,7 +60,8 @@ Nothing here is a game's: no ROM, no names, no data.
   board's memories, with MAME's video (`video/kvideo.cpp`) each frame's picture hash and frames as BMP,
   and with its sound board (`sound/ksound.cpp`: MAME's Z80, K007232 and uPD7759, ymfm's YM2151, the title
   music) each frame's samples and sound RAM hashes, the sound as a WAV and the Z80 addresses executed;
-  `oracle_m68k`, MAME's 68000 disassembler, for the 68000 frontend to come. `reference.cmake` builds
+  `oracle_m68k`, MAME's 68000 disassembler, which `compare_m68k_with_mame.py` checks `m68000/` against
+  (every even offset of the game's program and of an image of every opcode). `reference.cmake` builds
   them: the game's CMake includes it after its board runtime (`K_GAME_RUNTIME`). MAME 0.289's sources are
   in `mame/` (the 68000 core, whose handlers `m68000gen.py` writes from `m68000.lst` at build time, the
   direct ones only; util's bitmap and palette and emu's drawgfx and tilemap; the `tmnt.cpp` driver and its
