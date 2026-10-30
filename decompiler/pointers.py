@@ -4,7 +4,7 @@ Description: works out which registers point at which of the game's structures, 
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 The structures (STRUCTS) are OutRunners': the game objects (0x100 bytes, 124 of them below each screen's
@@ -68,6 +68,8 @@ This only decides how accesses are written, never what they do: the C reads and 
 The structures, places and rules above are the V60 program's. Another program sets its own in the module's
 names below (tools/decompile_sound.py: the Z80's sound channels in its shared RAM, 16-bit pointers).
 """
+import re
+
 from v60 import ir
 
 STRUCTS = {}
@@ -1513,6 +1515,20 @@ class Layouts:
         for struct, families in self.scoped.items():
             taken = set(self.names.get(struct, {}).values()) | macros
             self.views[struct] = {family: family if family not in taken else f"{family}_view" for family in families}
+
+    def drop_unread(self, texts):
+        """Forgets the fields with a made-up name (unk_30) that the code of none of the C 'texts' reads: it
+        reaches their bytes through a family's view or a wider field, and nothing is left for the name to
+        declare, so their bytes are padding. A field with a narrower name of its own over its first bytes
+        stays."""
+        words = set()
+        for text in texts:
+            words.update(re.findall(r"\w+", re.sub(r"/\*.*?\*/", "", text, flags=re.S)))
+        for struct, names in self.names.items():
+            overlaid = {offset for offset, _ in self.overlays.get(struct, {})}
+            for offset in [offset for offset, name in names.items()
+                           if name.startswith("unk_") and name not in words and offset not in overlaid]:
+                del self.fields[struct][offset], names[offset], self.signed[struct][offset]
 
     @staticmethod
     def array_count(struct, offset):

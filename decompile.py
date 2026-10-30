@@ -1174,13 +1174,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     numbers = [f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
                                                                           in emitter.constants.items()})]
     named.drop_unread(texts.values())
+    emitter.layouts.drop_unread(texts.values())
     (out_dir / "ram.h").write_text(
         file_header("ram.h", "the game's variables, tables, board registers and structures")
         + f"#ifndef {game_profile.GUARD}_RAM_H\n#define {game_profile.GUARD}_RAM_H\n\n"
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM symbols.txt labels */\n"
         + "\n".join(labels) + "\n\n/* numbers the code uses, by name (symbols.txt constant lines) */\n"
         + "\n".join(numbers) + "\n\n/* the game's structures in work RAM */\n"
-        + "\n".join(emitter.layouts.declarations()) + "\n\n#endif\n", encoding="ascii")
+        + "\n".join(emitter.layouts.declarations()) + "\n\n"
+        + ("\n".join(memory.NOTES.get("state", []) + named.state_declaration()) + "\n\n" if memory.STATE else "")
+        + "#endif\n", encoding="ascii")
     write_sources(out_dir, files, texts, "game.h", keep=("sound",))
 
     wrappers = []

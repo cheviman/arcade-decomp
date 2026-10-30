@@ -1251,7 +1251,7 @@ class FunctionWriter:
         index = memory.element_index(parts[1], bits)
         if item is None or not item.indexed or item.bits != bits or index is None:
             return None
-        return f"{item.name}[{self.exact(index)}]", item.signed, True
+        return f"{item.c}[{self.exact(index)}]", item.signed, True
 
     def own_variable(self, address, bits):
         """(C, signed, True) for work RAM the function's family names its own way ("scoped global"): the
@@ -1262,13 +1262,13 @@ class FunctionWriter:
             return None
         item = items.get(address)
         if item is not None and item.bits == bits:
-            return (f"{item.name}[0]" if item.indexed else item.name), item.signed, True
+            return (f"{item.c}[0]" if item.indexed else item.c), item.signed, True
         overlay = self.emitter.memory.scoped_overlays.get(self.global_family, {}).get((address, bits))
         if overlay is not None:
-            return overlay.name, overlay.signed, True
+            return overlay.c, overlay.signed, True
         for start, item in items.items():
             if start <= address and address + bits // 8 <= start + item.bits // 8 and bits < item.bits:
-                name = f"{item.name}[0]" if item.indexed else item.name
+                name = f"{item.c}[0]" if item.indexed else item.c
                 return cprint.part(bits, name, address - start, item.bits), False, True
         return None
 
@@ -1480,16 +1480,16 @@ class FunctionWriter:
         scoped = self.emitter.memory.scoped.get(self.global_family) if self.global_family else None
         if scoped and address in scoped:
             item = scoped[address]
-            return (f"{item.name}[0]" if item.indexed else item.name), item.bits, item.signed
+            return (f"{item.c}[0]" if item.indexed else item.c), item.bits, item.signed
         item = variables.get(address)
         if item is not None:
-            return (f"{item.name}[0]" if item.indexed else item.name), item.bits, item.signed
+            return (f"{item.c}[0]" if item.indexed else item.c), item.bits, item.signed
         for start in range(address - 1, address - 0x40, -1):
             item = variables.get(start)
             if item is None:
                 continue
             if item.indexed and (address - start) % (item.bits // 8) == 0:
-                return f"{item.name}[{(address - start) // (item.bits // 8)}]", item.bits, item.signed
+                return f"{item.c}[{(address - start) // (item.bits // 8)}]", item.bits, item.signed
             return None
         return None
 
@@ -2211,15 +2211,15 @@ class FunctionWriter:
         scoped = named.scoped.get(self.global_family) if self.global_family else {}
         for start in range(value + low, value + low - 4, -1):
             if start in scoped:
-                candidates.append((scoped[start].bits, start, scoped[start].name))
+                candidates.append((scoped[start].bits, start, scoped[start].c))
                 continue
             item = named.variables.get(memory.own_copy(start))
             if item is not None and not item.indexed:
-                candidates.append((item.bits, start, item.name))
+                candidates.append((item.bits, start, item.c))
             for width in (8, 16, 32):
                 overlay = named.overlays.get((start, width))
                 if overlay is not None:
-                    candidates.append((width, start, overlay.name))
+                    candidates.append((width, start, overlay.c))
         for width, start, name in sorted(candidates):
             if start <= value + low and value + high <= start + width // 8 and not memory.bus_only(start, width):
                 return name, value - start, width
@@ -2990,7 +2990,8 @@ class Emitter:
                 if found is not None:
                     # a place inside an array (symbols.txt: var NAME[COUNT]): its address plus how far in
                     return f"{found[0].name}_ADDRESS + 0x{address - found[0].address:X}u", cprint.ADD
-            return (f"{item.name}_ADDRESS", cprint.PRIMARY) if item is not None else None
+            # (a name made up of the address, a place the code reaches as a field, is no name for it)
+            return (f"{item.name}_ADDRESS", cprint.PRIMARY) if item is not None and not item.unnamed else None
         if memory.program_rom(address):
             if address < memory.ROM_NAMES_FROM and address not in self.referenced:
                 return None    # (a number below it is no address, unless an instruction names it as one)

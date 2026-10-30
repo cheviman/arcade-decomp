@@ -5,7 +5,7 @@ Name:        emit.py
 Description: writes the sound program's functions as C, through the decompiler's writer
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    25-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 The decompiler's FunctionWriter does the work (decompiler/emit.py); this gives it the Z80's memory and
@@ -52,6 +52,7 @@ def use_memory_map(names, arrays):
     memory.BUS_ONLY = []
     memory.BYTE_INDEXES = True
     memory.NAMED_BASES = {}
+    memory.STATE, memory.STATE_BLOCKS = None, ()    # (its RAM is the sound board's, which the V70 shares)
     memory.NOTES = dict(game_profile.SOUND_NOTES)
     pointers.STRUCTS = dict(names.structs)
     pointers.PLAYERS = (0, 0, 0)

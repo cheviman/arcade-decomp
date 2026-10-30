@@ -5,15 +5,18 @@ Description: the game's variables, tables and hardware registers by name: work R
              named addresses
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
-Work RAM (0x200000-0x20FFFF) stays the board's byte array, so the state compares byte for byte with the
-reference. A variable is a macro for a typed lvalue at its address (game/support.h: RAM8, RAM16, RAM32):
+Work RAM (0x200000-0x20FFFF) keeps the layout the board gives it, so the state compares byte for byte with
+the reference. A variable is a macro for a typed lvalue at its address (game/support.h: RAM8, RAM16, RAM32):
 "frames_to_wait = 1;", "unk_20E5A2 &= 0x7Fu;". One the code reads with an index ("[R0]") is an array:
-"unk_20E590[r0]". The program ROM's data is read the same way through rom(): "rom_10B6CC[r1]". The
-board's registers keep going through the bus (reading or writing them does things), by name:
-"mem_write8(IO_PORT_D, r2)".
+"unk_20E590[r0]". With STATE (the game's profile), the work RAM is the game's state instead, one structure
+the C reaches through a pointer: each variable a field of it at its place ("game->frames_to_wait = 1;"),
+the blocks STATE_BLOCKS names between them (state_declaration); a place the code works out by its address
+is still the byte there ("RAM8(settings_magic_ADDRESS + offset)"). The program ROM's data is read the same
+way through rom(): "rom_10B6CC[r1]". The board's registers keep going through the bus (reading or writing
+them does things), by name: "mem_write8(IO_PORT_D, r2)".
 
 Names come from symbols.txt (var, io and table lines, disassemble.load_names). Whatever has none yet
 gets one made of its address, with the width the code uses most: unk_ for work RAM, rom_ for tables,
@@ -74,6 +77,13 @@ VARIABLES = None    # where the game's variables start, as a constant base (R24:
 # work RAM addresses with a name of their own: the blocks of the two screens (R25 of each task) and the race
 # records (each screen's, and the copy of them each screen keeps)
 NAMED_BASES = {}
+# The game's state as one structure the C reaches through a pointer of this name (game->frame_count): the
+# work RAM, its variables at their places and its blocks (STATE_BLOCKS) between them, laid out as the board
+# has it so that each frame's state compares byte for byte with the original's. None: each variable a macro
+# over its address (RAM16(NAME_ADDRESS))
+STATE = None
+# (address, member, structure or None, count of structures or bytes) of the blocks of STATE's structure
+STATE_BLOCKS = ()
 HARDWARE = [(0x300000, 0x320000, "VIDEO"), (0x400000, 0x420000, "SPRITE_RAM"), (0x500000, 0x500010, "SPRITE_CONTROL"),
             (0x600000, 0x610000, "PALETTE"), (0x610000, 0x620000, "MIXER"), (0x700000, 0x702000, "SOUND"),
             (0xC00000, 0xC00080, "IO"), (0xD00000, 0xD00010, "IRQ"), (0xD80000, 0xD80010, "RANDOM")]
@@ -240,6 +250,13 @@ class Item:
         self.indexed = False
         self.count = None     # an array's number of elements (symbols.txt: var NAME[COUNT])
         self.unnamed = False  # a name the decompiler made up for an address symbols.txt names nothing at
+        self.state = False    # a variable of the game's state, a field of STATE's structure
+
+    @property
+    def c(self):
+        """The item as the C names it: a variable of the game's state as its field (game->frame_count),
+        anything else by its name."""
+        return f"{STATE}->{self.name}" if self.state else self.name
 
 
 class Memory:
@@ -338,6 +355,17 @@ class Memory:
                 parts = based(address_expression)
                 if parts is not None and parts[0] in items and table_index(parts[1], bits):
                     items[parts[0]].indexed = True
+        if STATE is not None:
+            for item in self.state_items():
+                item.state = True
+
+    def state_items(self):
+        """The work RAM's variables under every name: the program's, the narrower ones over their first
+        bytes, and the ones a family of functions gives the places it uses its own way."""
+        found = list(self.variables.values()) + list(self.overlays.values())
+        for items in list(self.scoped.values()) + list(self.scoped_overlays.values()):
+            found += list(items.values())
+        return [item for item in found if work_ram(item.address)]
 
     def add_unnamed(self, items, widths, name_of):
         for address, counts in sorted(widths.items()):
@@ -383,18 +411,18 @@ class Memory:
     def scalar(self, items, address, bits):
         item = items.get(address)
         if item is not None:
-            name = f"{item.name}[0]" if item.indexed else item.name
+            name = f"{item.c}[0]" if item.indexed else item.c
             overlay = self.overlays.get((address, bits)) if items is self.variables else None
             if item.bits != bits and overlay is not None:
-                return overlay.name
+                return overlay.c
             return name if item.bits == bits else cprint.part(bits, name, 0, item.bits)
         outer = self.inside(items, address)
         if outer is not None:
-            return cprint.part(bits, outer.name, address - outer.address, outer.bits)
+            return cprint.part(bits, outer.c, address - outer.address, outer.bits)
         found = self.element(items, address)
         if found is not None:
             array, number, byte = found
-            name = f"{array.name}[{number}]"
+            name = f"{array.c}[{number}]"
             return name if byte == 0 and bits == array.bits else cprint.part(bits, name, byte, array.bits)
         return None
 
@@ -459,7 +487,7 @@ class Memory:
             if found is None and following is not None and following.bits == bits and index is not None:
                 # one element before an array, where the code counts from 1 (car_numbers[players_left - 1])
                 before = ir.op("sub", (index, ir.Const(1, index.bits)), index.bits)
-                return f"{following.name}[{index_text(before)}]", following.signed, lvalue
+                return f"{following.c}[{index_text(before)}]", following.signed, lvalue
             if found is None:
                 return None
             # an index from an element of an array past its first (the scrolls of the second tile layer), a
@@ -467,14 +495,14 @@ class Memory:
             array, number, byte = found
             if byte == 0 and index is not None and array.bits == bits:
                 text = (signed_text or index_text)(index) if centered else index_text(index)
-                return f"{array.name}[{number} + {text}]", array.signed, lvalue
+                return f"{array.c}[{number} + {text}]", array.signed, lvalue
             if centered:
                 return None
             narrow = element_index(rest, array.bits) if byte == 0 and array.bits < bits and lvalue else None
             if narrow is not None:
                 # several elements at once, as the original's one wider access (AS32(video_registers[32 +
                 # index * 2u]): two halfword registers cleared together)
-                return cprint.part(bits, f"{array.name}[{number} + {index_text(narrow)}]", 0, array.bits), False, lvalue
+                return cprint.part(bits, f"{array.c}[{number} + {index_text(narrow)}]", 0, array.bits), False, lvalue
             if LOADED_TABLES and not lvalue:
                 return f"TABLE{bits}({array.name}, 0x{base - array.address:X}u + {index_text(rest)})", False, False
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
@@ -484,7 +512,7 @@ class Memory:
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
             return f"{macro}(GAME_VARIABLES + {index_text(rest)})", False, lvalue
         if index is not None and item.bits == bits:
-            return f"{item.name}[{index_text(index)}]", item.signed, lvalue
+            return f"{item.c}[{index_text(index)}]", item.signed, lvalue
         if LOADED_TABLES and not lvalue:
             # a loaded table read at another width than its elements': by its name and the offset in bytes
             return f"TABLE{bits}({item.name}, {index_text(rest)})", False, False
@@ -546,6 +574,8 @@ class Memory:
             kind = kind[1:]
         constness = "const " if macro == ROM_MACRO else ""
         lines = [f"#define {item.name}_ADDRESS 0x{item.address:0{ADDRESS_DIGITS}X}u"]
+        if item.state:
+            return lines    # (a field of the game's state: state_declaration())
         if macro == ROM_MACRO and LOADED_TABLES:
             lines.append(f"extern const void *{item.name}_data;")
             if item.indexed:
@@ -559,6 +589,87 @@ class Memory:
             suffix = "S" if item.signed else ""
             lines.append(f"#define {item.name} {macro}{item.bits}{suffix}({item.name}_ADDRESS)")
         return lines
+
+    def state_declaration(self):
+        """C lines for the game's state (STATE): a structure that is the work RAM, its blocks (STATE_BLOCKS)
+        and its variables at their places, as the board has them. Names that share bytes (a narrower name
+        over a variable's first bytes, a family's own name for a place, a variable inside a block) share a
+        union, each at its place in it. An array the code indexes with no count of its own runs as far as
+        the next name, or the end of the block it is in."""
+        if STATE is None:
+            return []
+        start, end = WORK_RAM
+        blocks = []
+        for address, member, struct, count in STATE_BLOCKS:
+            if struct is None:
+                blocks.append((address, count, f"uint8_t {member}[0x{count:X}];", member))
+            else:
+                blocks.append((address, pointers.STRUCTS[struct] * count,
+                               f"struct {struct} {member}" + (f"[{count}]" if count > 1 else "") + ";", member))
+        items = self.state_items()
+        starts = sorted({block[0] for block in blocks} | {item.address for item in items})
+        members = list(blocks)
+        for item in items:
+            kind = TYPES[item.bits][1:] if item.signed else TYPES[item.bits]
+            count = item.count
+            if item.indexed and count is None:
+                limit = next((address for address in starts if address > item.address), end)
+                for address, size, _, _ in blocks:
+                    if address <= item.address < address + size:
+                        limit = min(limit, address + size)
+                count = max((limit - item.address) // (item.bits // 8), 1)
+            members.append((item.address, item.bits // 8 * (count if item.indexed else 1),
+                            f"{kind} {item.name}" + (f"[0x{count:X}]" if item.indexed else "") + ";", item.name))
+        names = [member[3] for member in members]
+        if len(set(names)) != len(names):
+            raise SystemExit("the game's state has two places of one name: " +
+                             ", ".join(sorted({name for name in names if names.count(name) > 1})))
+        clusters = []    # [first, end, members]: places that share bytes
+        for member in sorted(members, key=lambda member: (member[0], -member[1])):
+            if clusters and member[0] < clusters[-1][1]:
+                clusters[-1][1] = max(clusters[-1][1], member[0] + member[1])
+                clusters[-1][2].append(member)
+            else:
+                clusters.append([member[0], member[0] + member[1], [member]])
+        lines = ["#pragma pack(push, 1)", f"struct {STATE}", "{"]
+        position = start
+        for first, last, found in clusters:
+            if first > position:
+                lines.append(f"\tuint8_t pad_{position:0{ADDRESS_DIGITS}X}[0x{first - position:X}];")
+            if len(found) == 1:
+                lines.append("\t" + found[0][2])
+            else:
+                # the union's ways of reading those bytes: each the places that follow one another without
+                # sharing any (an array, and beside it the names of its bytes one after another)
+                ways = []
+                for member in found:
+                    way = next((way for way in ways if member[0] >= way[-1][0] + way[-1][1]), None)
+                    if way is None:
+                        ways.append([member])
+                    else:
+                        way.append(member)
+                lines += ["\tunion", "\t{"]
+                for way in ways:
+                    if len(way) == 1 and way[0][0] == first:
+                        lines.append("\t\t" + way[0][2])
+                        continue
+                    lines += ["\t\tstruct", "\t\t{"]
+                    place = first
+                    for address, size, declaration, name in way:
+                        if address > place:
+                            lines.append(f"\t\t\tuint8_t pad_to_{name}[0x{address - place:X}];")
+                        lines.append("\t\t\t" + declaration)
+                        place = address + size
+                    lines.append("\t\t};")
+                lines.append("\t};")
+            position = last
+        if position < end:
+            lines.append(f"\tuint8_t pad_{position:0{ADDRESS_DIGITS}X}[0x{end - position:X}];")
+        lines += ["};", "#pragma pack(pop)",
+                  f"_Static_assert(sizeof(struct {STATE}) == 0x{end - start:X}, \"struct {STATE} is the work RAM\");"]
+        lines += [f"_Static_assert(offsetof(struct {STATE}, {member}) == 0x{address - start:X}, "
+                  f"\"{member} at its place in the work RAM\");" for address, _, _, member in blocks]
+        return lines + [f"extern struct {STATE} *{STATE};"]
 
     def loaded_tables(self):
         """[(address, name)] of the tables the game loads (LOADED_TABLES): the plain ones and the tables of
