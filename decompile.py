@@ -1084,6 +1084,18 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         structure.split_loop_entries(function, notes)
     writers = {entry: emit.FunctionWriter(emitter, function, live_after[entry], fields[entry], live_at_start[entry])
                for entry, function in built.items()}
+    if memory.STATE is not None:
+        # the parameters and results that are C pointers, from each function's own code, before any call to
+        # it is written; then each function's pointers again, its parameters among them
+        emitter.param_structs, emitter.result_structs = {}, {}
+        for entry, writer in writers.items():
+            params, result = writer.signature_pointers()
+            if params:
+                emitter.param_structs[entry] = params
+            if result is not None:
+                emitter.result_structs[entry] = result
+        for writer in writers.values():
+            writer.retype()
     for entry, writer in writers.items():
         try:
             texts[entry] = writer.write()
@@ -1114,7 +1126,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             continue
         _, controls, lines = write_backs(text)
         _, usual_controls, usual_lines = write_backs(texts[entry])
-        if set(re.findall(r"r\d+", text)) - set(re.findall(r"r\d+", texts[entry])):
+        shared = {emitter.context_name(index) for index in signatures.CONTEXT}    # (globals of the C)
+        if set(re.findall(r"\br\d+\b", text)) - set(re.findall(r"\br\d+\b", texts[entry])) - shared:
             continue    # (a register the copy's notes do not find a variable for: not the same C)
         if controls < usual_controls or controls == usual_controls and lines < usual_lines:
             writers[entry], texts[entry] = other, text
@@ -1146,10 +1159,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     # memory slots keeps it, for table.c)
     entries = sorted(entry for entry in built
                      if entry not in emitter.trampolines or entry in table or entry == RESET_ADDRESS)
-    context = ", ".join(emitter.context_name(index) for index in signatures.CONTEXT)
+    # (a register the C keeps a pointer in is declared with its structure's type, the rest as numbers)
+    numbers = [index for index in signatures.CONTEXT if emitter.pointer_struct(index) is None]
+    kept = [index for index in signatures.CONTEXT if emitter.pointer_struct(index) is not None]
+    context = ", ".join(emitter.context_name(index) for index in numbers) + ";" + "".join(
+        f"\nextern {emitter.context_type(index)}{emitter.context_name(index)};" for index in kept)
     defined = ", ".join(emitter.context_name(index) + (f" = 0x{signatures.INITIAL[index]:X}u" if index in signatures.INITIAL else "")
-                        for index in signatures.CONTEXT)
-    context_pointers = ", ".join("&" + emitter.context_name(index) for index in signatures.CONTEXT)
+                        for index in numbers) + ";" + "".join(
+        f"\n{emitter.context_type(index)}{emitter.context_name(index)};" for index in kept)
+    context_pointers = ", ".join(f"{{ &{emitter.context_name(index)}, {int(emitter.pointer_struct(index) is not None)} }}"
+                                 for index in signatures.CONTEXT)
     context_numbers = ", ".join(str(index) for index in signatures.CONTEXT)
     files = game_files(entries)
     # (a function something else replaces is declared twice: as the game calls it and as its original)
@@ -1161,7 +1180,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                     "memory slots")
         + f"#ifndef {game_profile.GUARD}_GAME_H\n#define {game_profile.GUARD}_GAME_H\n\n"
         + "#include \"game/support.h\"\n#include \"ram.h\"\n\n"
-        f"/* registers the whole program shares */\nextern uint32_t {context};\n\n"
+        f"/* registers the whole program shares */\nextern uint32_t {context}\n\n"
         "/* where the code the program keeps in memory slots (objects' handlers, hooks) is, as the game's own\n"
         "   addresses: what it stores and compares, and what call_code() runs */\n"
         + "\n".join(addresses) + "\n\n"
@@ -1204,9 +1223,10 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         file_header("table.c", "the registers the whole program shares, the code calls through memory "
                     "slots reach (by address), and the reset entry")
         + '#include "game.h"\n\n'
-        f"uint32_t {defined};\n\n"
-        "/* the same, for the runtime to keep a copy for each of the game's tasks */\n"
-        f"uint32_t *const game_context[] = {{ {context_pointers} }};\n"
+        f"uint32_t {defined}\n\n"
+        "/* the same, for the runtime to keep a copy for each of the game's tasks (1: a pointer into the game's\n"
+        "   state, where the original holds its address) */\n"
+        f"const game_register game_context[] = {{ {context_pointers} }};\n"
         f"const uint8_t game_context_registers[] = {{ {context_numbers} }};\n"
         f"const size_t game_context_count = {len(signatures.CONTEXT)};\n\n" + "\n".join(wrappers) + "\n"
         "/* the code calls through memory slots and interrupts can reach, by address */\n"

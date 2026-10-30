@@ -53,7 +53,7 @@ MEMORY_ROUTINES = getattr(game_profile, "MEMORY_ROUTINES", {})
 BASELINE = ROOT / "tools" / "noise_baseline.txt"
 UNNAMED_ADDRESSES = ROOT / "build" / "decompile" / "unnamed_addresses.txt"
 
-FUNCTION = re.compile(r"^(?:static )?\w[\w ]*?\b(\w+)\((.*)\)$")
+FUNCTION = re.compile(r"^(?:static )?\w[\w *]*?\b(\w+)\((.*)\)$")
 # a result written back through its pointer from the function's variable for it, whole or the part the
 # function writes: *p_x = x; *p_x = (*p_x & 0xFFFF0000u) | x; *p_x = (*p_x & 0xFFFF0000u) | (x & 0xFFFFu);
 # the Z80's registers, which the sound program's C (src/sound/) names its values after until a line names them
@@ -103,11 +103,14 @@ KINDS = {
     "page_links": ("places worked out within a page of the board's memory (LINKED, PAGE_ADD, IN_PAGE)", None),
     "ram_blocks": ("memory moved, filled or searched through its address, as the V60's string instructions do "
                    "(move_halfwords, move_string, set_bytes, search_bytes)", None),
+    "pointer_conversions": ("pointers the C keeps turned back into the address the original holds where the C "
+                            "still needs it, or made from one (address_of(current_object), pointer_to(address))",
+                            None),
 }
 # the kinds that keep the game's state in the board's memory model, counted in the game's C (not the sound
 # program's, whose memory is the sound board's)
 MODEL = ("ram_structures", "ram_variables", "ram_addresses", "code_addresses", "table_addresses", "page_links",
-         "ram_blocks")
+         "ram_blocks", "pointer_conversions")
 INFORMATION = {
     "functions": "functions",
     "lines": "lines of C",
@@ -293,6 +296,7 @@ def memory_model(source):
         "code_addresses": words(code_names | {"call_code"}),
         "table_addresses": words(casts.get("data_at", set()) | table_names),
         "page_links": re.compile(r"\b(?:LINKED|PAGE_ADD|IN_PAGE)\("),
+        "pointer_conversions": re.compile(r"\b(?:address_of|pointer_to)\("),
         "ram_blocks": re.compile(r"\b(?:move_(?:string|bytes|halfwords|bytes_backward|halfwords_backward|bits_down|bits_up)"
                                  r"|set_(?:bytes|halfwords)|search_(?:bytes|bits_up))\("),
     }

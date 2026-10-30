@@ -270,8 +270,16 @@ class Names:
         return self.writer.slot_name(node), (32 if node.offset == 0 else self.writer.slot_bits(node))
 
     def pointer(self, node):
-        """True if 'node' reads a variable the function reads fields through (FunctionWriter.typed_bases)."""
+        """True if 'node' reads a variable the function reads fields through (FunctionWriter.typed_bases), or
+        a register the C keeps a pointer in."""
+        if self.writer.kept_node(node) is not None:
+            return True
         return isinstance(node, ir.Reg) and self.writer.register_read(node)[0] in self.writer.pointer_names
+
+    def kept(self, node):
+        """The C name of a pointer the C keeps that 'node' reads, or None."""
+        found = self.writer.kept_node(node)
+        return found[0] if found is not None else None
 
     def link(self, load):
         """True if 'load' reads a field or variable that holds the low half of an object's address."""
@@ -415,6 +423,25 @@ def renumbered(head, body, local_name, given=frozenset()):
             lines[:] = [pattern.sub(base, line) for line in lines]
         used.add(base)
         used.discard(name)
+
+
+def state_place(value, struct, layouts):
+    """C for a pointer to the 'struct' at the constant address 'value' when a block of the game's state is
+    one there, or holds one (a structure inside it: &game->screen_2.car); None otherwise."""
+    if memory.STATE is None:
+        return None
+    for address, member, block_struct, count in memory.STATE_BLOCKS:
+        size = pointers.STRUCTS.get(block_struct) if block_struct is not None else None
+        if not size or not address <= value < address + size * count:
+            continue
+        number, offset = divmod(value - address, size)
+        place = f"{memory.STATE}->{member}" + (f"[{number}]" if count > 1 else "")
+        if offset == 0 and block_struct == struct:
+            return f"&{place}" if count > 1 else f"&{place}"
+        inside = layouts.member_at(block_struct, offset, struct)
+        if inside is not None:
+            return f"&{place}.{inside}"
+    return None
 
 
 def state_block(value, struct):
@@ -578,6 +605,7 @@ class FunctionWriter:
         self.params = emitter.by_value(function.entry)
         self.has_results = bool(self.results) or self.returned is not None
         self.current = None
+        self.local_pointers = {}    # the function's own variables that are C pointers (pointer_locals)
         entry_registers = {value[1] for value in self.params + self.results if value[0] == "r"}
         # the object family this function belongs to (symbols.txt scoped fields), and where the registers
         # still point at the object its code runs on
@@ -601,6 +629,7 @@ class FunctionWriter:
                                         {index: emitter.context_name(index) for index in self.scratch_context},
                                         self.returned_value)
         self.widths = self.vars.declarations()
+        self.local_pointers = self.pointer_locals()
         self.pointer_names = self.typed_bases()
         # (and the parameters symbols.txt says point at a structure, though the function only puts an address
         # together from them: start_sequence's player, a field of which is IN_PAGE(player, 0x1Bu))
@@ -936,10 +965,184 @@ class FunctionWriter:
             return own
         return set()
 
+    def kept_pointer(self, index):
+        """The structure a register the whole program shares points at, where the C keeps a pointer in it
+        (Emitter.pointer_struct); None for any other register."""
+        if index not in self.context or index in self.scratch_context:
+            return None
+        return self.emitter.pointer_struct(index)
+
+    def kept_node(self, node):
+        """(C name, structure) when 'node' reads a pointer the C keeps: a register the whole program shares
+        (kept_pointer) or one of the function's own variables (pointer_locals); else None."""
+        if not isinstance(node, ir.Reg):
+            return None
+        struct = self.kept_pointer(node.index)
+        if struct is not None:
+            return self.emitter.context_name(node.index), struct
+        if node.index in self.context:
+            return None    # (a global of the C here: its type is the program's)
+        name = self.vars.use_name(node) if hasattr(self, "vars") else None
+        return (name, self.local_pointers[name]) if name in self.local_pointers else None
+
+    def pointer_locals(self, with_params=False):
+        """{name: structure} of the function's own variables that point at the start of one structure of
+        the game's state (not the program ROM's, nor a memory of the board's) wherever the code reaches a
+        field through them, and that it neither takes, nor hands back, nor lends a call to write: C
+        pointers (struct object *object = NULL; object->state). The rest of what they hold is the address
+        the original holds, which address_of() gives where the C needs the number."""
+        if memory.STATE is None:
+            return {}
+        found, mixed = {}, set()
+        excluded = {self.vars.entry_name(value[1]) for value in self.params + self.results if value[0] == "r"}
+        excluded |= {self.emitter.param_name(self.entry, value) for value in self.params + self.results}
+        # (the parameters the function's signature makes pointers: Emitter.param_structs; all of them where
+        # signature_pointers asks which ones could be)
+        typed = self.emitter.param_structs.get(self.entry, {}) if not with_params else \
+            {value[1]: None for value in self.params if value[0] == "r"}
+        excluded -= {self.vars.entry_name(index) for index in typed}
+        writing = self.current
+        for block in self.function.blocks.values():
+            for statement in block.statements + ([block.end] if block.end is not None else []):
+                if isinstance(statement, (ir.Call, ir.TailCall)) and statement.target is not None:
+                    # (a variable a call writes through its pointer is the callee's number)
+                    target = self.emitter.resolve(statement.target & 0xFFFFFF, getattr(statement, "entry", None))[0]
+                    self.current = statement
+                    excluded |= {self.vars.def_name(statement, value[1]) for value in self.emitter.by_pointer(target)
+                                 if value[0] == "r"}
+                accesses = [statement] if isinstance(statement, ir.Store) and id(statement) in self.fields else []
+                for expression in ir.statement_expressions(statement):
+                    accesses += [node for node in ir.walk(expression)
+                                 if isinstance(node, ir.Load) and id(node) in self.fields]
+                for access in accesses:
+                    field = self.fields[id(access)]
+                    if field[0] not in pointers.STRUCTS:
+                        continue
+                    base = field[2]
+                    if not isinstance(base, ir.Reg) or base.index in self.context:
+                        continue    # (a global of the C here: its type is the program's)
+                    name = self.vars.use_name(base)
+                    if name is None:
+                        continue
+                    if field[3] or field[0] in pointers.ELEMENTS or field[0] in pointers.ROM_STRUCTS \
+                            or field[0] in pointers.BOARD_STRUCTS:
+                        mixed.add(name)
+                    else:
+                        found.setdefault(name, set()).add(field[0])
+        self.current = writing
+        kinds = {name: next(iter(structs)) for name, structs in found.items()
+                 if len(structs) == 1 and name not in mixed and name not in excluded and name is not None}
+        if not with_params:
+            # (a parameter the signature makes a pointer is one, whatever this way of writing it says)
+            for index, struct in self.emitter.param_structs.get(self.entry, {}).items():
+                name = self.vars.entry_name(index)
+                if name is not None:
+                    kinds[name] = struct
+        return kinds
+
+    def signature_pointers(self):
+        """({register: structure} of the parameters, the structure of the result or None) that point at the
+        start of one structure of the game's state, as pointer_locals decides for the function's own
+        variables: the ones its signature makes C pointers. None for a function the board puts its own in
+        place of, or that the runtime calls with other than its parameters."""
+        if memory.STATE is None or self.emitter.names.get(self.entry) in self.emitter.replaced \
+                or self.emitter.second_entries.get(self.entry) or self.entry in self.emitter.needs_return_address:
+            return {}, None
+        kinds = self.pointer_locals(with_params=True)
+        params = {}
+        for value in self.params:
+            if value[0] != "r":
+                continue
+            name = self.vars.entry_name(value[1])
+            if name is not None and name == self.emitter.param_name(self.entry, value) and name in kinds:
+                params[value[1]] = kinds[name]
+        result = None
+        if self.returned is not None and self.returned[0] == "r":
+            found = set()
+            writing = self.current
+            for block in self.function.blocks.values():
+                if isinstance(block.end, ir.Return):
+                    self.current = block.end
+                    found.add(kinds.get(self.register_value(self.returned[1])))
+                elif isinstance(block.end, ir.TailCall):
+                    found.add(None)    # (what another function hands back: its own type)
+            self.current = writing
+            if len(found) == 1:
+                result = found.pop()
+        return params, result
+
+    def retype(self):
+        """The pointers again, once the emitter knows which parameters are (Emitter.param_structs)."""
+        self.local_pointers = self.pointer_locals()
+        self.pointer_names = self.typed_bases()
+        self.pointer_names |= {self.vars.entry_name(index) for index in self.emitter.param_pointers.get(self.entry, ())
+                               if self.vars.entry_live(index)}
+
+    def pointer_argument(self, name, struct):
+        """C for the pointer to a 'struct' a callee takes, where this function holds 'name': the pointer
+        itself, one of another structure's to the same place, the pointer for an address."""
+        held = self.local_pointers.get(name)
+        if held is None and name in {self.emitter.context_name(index) for index in self.context}:
+            held = next((self.kept_pointer(index) for index in self.context
+                         if self.emitter.context_name(index) == name), None)
+        if held == struct:
+            return name
+        if held is not None:
+            return f"(struct {struct} *){name}"
+        return f"pointer_to({name})"
+
+    def converted(self, text, held, wanted):
+        """'text', a value of a callee's that is a pointer to 'held' (None: a number), as a pointer to
+        'wanted' (None: the address the original holds)."""
+        if held == wanted:
+            return text
+        if wanted is None:
+            return f"address_of({text})"
+        if held is None:
+            return f"pointer_to({text})"
+        return f"(struct {wanted} *){text}"
+
+    def pointer_value(self, value, struct):
+        """C for the pointer to a 'struct' the C keeps where the original holds the address 'value': the
+        pointer another one is, moved by whole records; a block of the game's state, or a structure inside
+        one, at a constant address (&game->screen_2.car); a structure inside one a pointer points at
+        (&screen->car); else the pointer for that address (pointer_to(address)), which may be into any
+        memory the original's register points into (the test mode's R20 walks the bookkeeping in the sound
+        board's RAM)."""
+        node = value
+        while isinstance(node, ir.Op) and node.name in ("trunc", "fits", "zext") and node.bits >= 32:
+            node = node.args[0]
+        base, offset = node, 0
+        if isinstance(node, ir.Op) and node.name in ("add", "sub") and isinstance(node.args[1], ir.Const):
+            base = node.args[0]
+            offset = node.args[1].value & 0xFFFFFFFF
+            offset = (-offset if node.name == "sub" else offset) & 0xFFFFFFFF
+            offset = offset - (1 << 32) if offset & 0x80000000 else offset
+        kept = self.kept_node(base)
+        if kept is not None:
+            name, own = kept
+            size = pointers.STRUCTS[struct]
+            if own == struct and offset % size == 0:
+                count = offset // size
+                return name if not count else f"{name} + {count}" if count > 0 else f"{name} - {-count}"
+            inside = self.emitter.layouts.member_at(own, offset, struct) if offset >= 0 else None
+            if inside is not None:
+                return f"&{name}->{inside}"
+        if isinstance(node, ir.Const):
+            place = state_place(node.value & 0xFFFFFF, struct, self.emitter.layouts)
+            if place is not None:
+                return place
+        return f"pointer_to({self.stored(value, 32)})"
+
     def register_read(self, node):
         if node.index in self.context and node.index not in self.scratch_context:
+            if self.emitter.pointer_struct(node.index) is not None:
+                # (a pointer the C keeps, read where the C needs the address the original holds)
+                return f"address_of({self.emitter.context_name(node.index)})", 32
             return self.emitter.context_name(node.index), 32
         name = self.vars.use_name(node) or cpu.variable_name(node.index)
+        if name in self.local_pointers:
+            return f"address_of({name})", 32    # (a pointer the C keeps, where the C needs the address)
         return name, self.widths.get(name, 32)
 
     def float_kinds(self):
@@ -1136,7 +1339,7 @@ class FunctionWriter:
                     finally:
                         self.current = writing
                     text = found[0] if found is not None else None
-                    match = None if text is None else re.fullmatch(r"(?:\w+\(\w+\)->(?:\w+\.)?)?(\w+)", text)
+                    match = None if text is None else re.fullmatch(r"(?:(?:\w+\(\w+\)|\w+)->(?:\w+\.)?)?(\w+)", text)
                     saved.add(match.group(1) if match else None)
                 elif isinstance(value, ir.Reg) and self.emitter.saved_locals:
                     # a local variable pushed to get it back later (the Z80's PUSH HL ... POP HL)
@@ -1681,9 +1884,14 @@ class FunctionWriter:
             if isinstance(base, ir.Const) and not base_offset and table is None else None
         if block is not None and block[1] is None and index is not None:
             block = None    # (records counted on from a block that is one: by its address)
+        held = self.kept_node(base) if not base_offset and table is None and block is None else None
+        kept = held is not None and held[1] == struct
         if table is not None:
             # a table of records by its name: hud_gauge_positions_3p[player].y
             pointer = table[0]
+        elif kept:
+            # through a pointer the C keeps (current_object->handler, object->state)
+            pointer = held[0]
         elif block is not None:
             # a block of the game's state (game->screen_1.unpack_state), a record of one by its number
             # (game->race_copies[player].model)
@@ -1702,7 +1910,13 @@ class FunctionWriter:
                     offset = start + (offset - start) % width
                     break
         element = struct in pointers.ELEMENTS
-        if block is not None:
+        if kept:
+            if index is not None:
+                pointer = f"{pointer}[{self.record_number(index)}]"
+                member = "."
+            else:
+                member = "->"
+        elif block is not None:
             if block[1] is not None:
                 number = self.record_number(index)
                 first = block[1]
@@ -2027,6 +2241,9 @@ class FunctionWriter:
             if statement.index not in cpu.current.registers:
                 raise EmitError(f"{self.function.name}: writes register {statement.index}")
             name = self.register_set(statement.index)
+            struct = self.kept_pointer(statement.index) or self.local_pointers.get(name)
+            if struct is not None:
+                return [f"{name} = {self.pointer_value(statement.value, struct)};"]
             changed = self.changed_in_place(statement, name)
             if changed is not None:
                 return [changed]
@@ -2483,9 +2700,15 @@ class FunctionWriter:
                 continue
             if self.never_set(value[1]):
                 # nothing in this function sets the register, and it is no parameter of its own: 0
-                values.append("0u")
+                values.append("NULL" if self.emitter.param_structs.get(target, {}).get(value[1]) else "0u")
                 continue
             name = self.implicit_value(value[1])
+            wanted = self.emitter.param_structs.get(target, {}).get(value[1])
+            if wanted is not None:
+                values.append(self.pointer_argument(name, wanted))    # (the callee takes a pointer)
+                continue
+            if name in self.local_pointers or self.kept_pointer(value[1]) is not None:
+                name = f"address_of({name})"    # (the callee takes the address the original passes)
             width = widths.get(value[1], 32)
             # a parameter narrower than the variable takes its low bits, and says so
             values.append(name if self.widths.get(name, 32) <= width else f"({cprint.UNSIGNED[width]}){name}")
@@ -2521,6 +2744,10 @@ class FunctionWriter:
                 and returned[1] not in self.end_registers(ir.Return()):
             return f"{call};"    # a tail call whose value this function does not hand back
         target_name = self.register_set(returned[1]) if returned[0] == "r" else self.use(returned)
+        if returned[0] == "r":
+            held = self.emitter.result_structs.get(self.emitter.resolve(target, entry)[0])
+            wanted = self.local_pointers.get(target_name) or self.kept_pointer(returned[1])
+            return f"{target_name} = {self.converted(call, held, wanted)};"
         return f"{target_name} = {call};"
 
     def call(self, statement):
@@ -2571,7 +2798,9 @@ class FunctionWriter:
             if self.returned is not None and self.emitter.returned(self.emitter.resolve(end.target, end.entry)[0]) \
                     == self.returned:
                 self.not_copied.update(self.results)
-                return [f"return {self.call_expression(end.target, None, end.entry)};"]
+                callee = self.emitter.resolve(end.target, end.entry)[0]
+                call = self.call_expression(end.target, None, end.entry)
+                return [f"return {self.converted(call, self.emitter.result_structs.get(callee), self.emitter.result_structs.get(self.entry))};"]
             return [self.call_text(end.target, None, end.entry)] + self.copy_out() + [self.return_text()]
         if isinstance(end, ir.InterruptReturn):
             if not (isinstance(end.frame, ir.Const) and end.frame.value == 0):
@@ -2604,7 +2833,12 @@ class FunctionWriter:
         return lines
 
     def out_value(self, value):
-        return self.register_value(value[1]) if value[0] == "r" else self.use(value)
+        if value[0] != "r":
+            return self.use(value)
+        name = self.register_value(value[1])
+        if value == self.returned:
+            return self.converted(name, self.local_pointers.get(name), self.emitter.result_structs.get(self.entry))
+        return f"address_of({name})" if name in self.local_pointers else name
 
     def return_text(self):
         return f"return {self.out_value(self.returned)};" if self.returned is not None else "return;"
@@ -2804,10 +3038,18 @@ class FunctionWriter:
         floating = self.float_kinds()
         for bits in (8, 16, 32):
             names = sorted((name for name, width in self.widths.items()
-                            if width == bits and name not in declared and name in words and name not in floating),
+                            if width == bits and name not in declared and name in words and name not in floating
+                            and name not in self.local_pointers),
                            key=variable_order)
             if names:
                 lines.append(f"{cprint.UNSIGNED[bits]} " + ", ".join(f"{name} = 0" for name in names) + ";")
+        kept = {}
+        for name, struct in self.local_pointers.items():
+            if name not in declared and name in words:
+                kept.setdefault(struct, []).append(name)
+        for struct, names in sorted(kept.items()):
+            lines.append(f"struct {struct} " + ", ".join(f"*{name} = NULL" for name in sorted(names, key=variable_order))
+                         + ";")
         for bits in (8, 16, 32):
             names = [name for offset, name in sorted(self.slots.items(), reverse=True)
                      if self.slot_widths[offset] == bits and name in words]
@@ -2878,6 +3120,26 @@ class Emitter:
     def context_name(self, index):
         """The C name of a register the whole program shares."""
         return self.register_names.get(index, register_name(index))
+
+    param_structs = {}     # entry -> {register: structure}: the parameters that are C pointers
+    result_structs = {}    # entry -> structure: the result that is a C pointer
+
+    def pointer_struct(self, index):
+        """The structure of the game's state a register the whole program shares points at, for the C to
+        keep a pointer in it (struct object *current_object) where the original holds its address; None for
+        a register the C keeps as a number (no state, a scratch register, one that points nowhere fixed)."""
+        if memory.STATE is None or index in signatures.SCRATCH_CONTEXT:
+            return None
+        kind = pointers.CONTEXT_KINDS.get(index)
+        if kind is None or kind[1] or kind[0] not in pointers.STRUCTS or kind[0] in pointers.ELEMENTS \
+                or kind[0] in pointers.ROM_STRUCTS or kind[0] in pointers.BOARD_STRUCTS:
+            return None
+        return kind[0]
+
+    def context_type(self, index):
+        """The C type of a register the whole program shares."""
+        struct = self.pointer_struct(index)
+        return f"struct {struct} *" if struct is not None else "uint32_t "
 
     def after_call(self, target, written, current, cursor):
         """restores_current's (R20, R23) states after a call to 'target' (None: not known) that may write
@@ -3183,6 +3445,10 @@ class Emitter:
         widths = self.param_widths.get(entry, {})
         for value in self.by_value(entry):
             width = widths.get(value[1], register_bits(value[1])) if value[0] == "r" else 32
+            struct = self.param_structs.get(entry, {}).get(value[1]) if value[0] == "r" else None
+            if struct is not None:
+                params.append(f"struct {struct} *{self.param_name(entry, value)}")    # (a pointer the C keeps)
+                continue
             params.append(f"{self.value_type(value, width)} {self.param_name(entry, value)}")
         for value in self.by_pointer(entry):
             width = register_bits(value[1]) if value[0] == "r" else 32
@@ -3190,6 +3456,9 @@ class Emitter:
         returned = self.returned(entry)
         kind = "void" if returned is None \
             else self.value_type(returned, self.result_bits.get(entry, register_bits(returned[1])) if returned[0] == "r" else 32)
+        if self.result_structs.get(entry) is not None:
+            kind = f"struct {self.result_structs[entry]} *"
+            return f"{kind}{self.names[entry]}({', '.join(params) if params else 'void'})"
         return f"{kind} {self.names[entry]}({', '.join(params) if params else 'void'})"
 
     def definition(self, entry):

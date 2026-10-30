@@ -3,7 +3,7 @@ Name:        disassemble.py
 Description: recursive-descent disassembly of the V70 program into a listing and a coverage report
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (default ROM: rom/)
@@ -131,7 +131,7 @@ def parse_layout(attributes, where):
 
 
 NAME_KINDS = ("var", "io", "table", "struct", "field", "register", "scoped", "param", "result", "local", "port",
-              "file", "anchor", "comment", "elements", "constant", "task", "unread", "exit")    # names for the decompiled C (load_names; file lines:
+              "file", "anchor", "comment", "elements", "constant", "task", "unread", "exit", "member")    # names for the decompiled C (load_names; file lines:
                                               # decompile.source_files)
 
 
@@ -214,6 +214,8 @@ class Names(NamedTuple):
                         # video RAM, the sprite RAM, the RAM the sound program shares
     scoped_arrays: dict  # (struct, family, offset) -> how many elements a family's field holds when it is an
                          # array ('scoped STRUCT FAMILY OFFSET NAME TYPE[N]'), read ->view.name[i]
+    members: dict = None  # (struct, offset) -> (name, structure, count): structures inside another one, which
+                          # its declaration holds as its member ('member' lines)
 
 
 def load_names(path, registers=None):
@@ -238,6 +240,9 @@ def load_names(path, registers=None):
                                          hexadecimal) an array of N in the record, TYPE[] (a record of the
                                          program ROM) one that goes on past the record's end, read
                                          STRUCT(p)->name[i]
+        member   STRUCT OFFSET NAME INNER[N]  structures INNER inside STRUCT, from OFFSET (N of them, in
+                                         hexadecimal; one without [N]): the declaration of STRUCT holds them
+                                         as its member NAME, with the fields STRUCT names in their bytes
     A second var or field at the same place with another width names the first bytes of the wider one
     (x_fraction, the low half of the 16.16 x).
     A struct name after the type says the value points at one: a u32 its address, a u16 the low half of
@@ -280,7 +285,7 @@ def load_names(path, registers=None):
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {}, set(), set(), {})
+                  set(), {}, set(), set(), {}, {})
     registers = registers or {}
 
     def register_number(text):
@@ -419,6 +424,13 @@ def load_names(path, registers=None):
                 raise SystemExit(f"{where}: expected 'register RN NAME'")
             names.registers[int(parts[1][1:])] = parts[2]
             continue
+        if parts[0] == "member":
+            inner = re.fullmatch(r"(\w+)(?:\[([0-9A-Fa-f]+)\])?", parts[4]) if len(parts) == 5 else None
+            if inner is None or not parts[3].isidentifier() or not re.fullmatch(r"[0-9A-Fa-f]+", parts[2]):
+                raise SystemExit(f"{where}: expected 'member STRUCT OFFSET NAME INNER[COUNT]'")
+            names.members[(parts[1], int(parts[2], 16))] = (parts[3], inner.group(1),
+                                                            int(inner.group(2), 16) if inner.group(2) else 1)
+            continue
         if parts[0] == "field":
             array = re.fullmatch(r"(\w+)\[([0-9A-Fa-f]*)\]", parts[4]) if len(parts) in (5, 6) else None
             if array is not None and array.group(1) in VALUE_TYPES:
@@ -470,6 +482,11 @@ def load_names(path, registers=None):
         pointed = pointed.partition("@")[0].partition("+")[0]
         struct, dot, family = pointed.partition(".")
         return struct in names.structs and (not dot or family.isidentifier())
+    for (struct, offset), (name, inner, count) in names.members.items():
+        if struct not in names.structs or inner not in names.structs \
+                or offset + names.structs[inner] * count > names.structs[struct]:
+            raise SystemExit(f"{path.name}: the member {name} of {struct} at {offset:X} is no structure, or runs "
+                             "past its end")
     for (struct, offset), count in names.field_arrays.items():
         if count is None and (struct not in names.rom_structs or offset != names.structs.get(struct)):
             raise SystemExit(f"{path.name}: {struct}'s array at {offset:X} goes on past the record: it has to be a "

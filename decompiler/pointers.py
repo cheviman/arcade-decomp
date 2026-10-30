@@ -1469,6 +1469,9 @@ class Layouts:
         self.views = {}     # struct -> family -> the member that holds the family's view
         self.overlays = {}  # struct -> {(offset, bits): (name, signed)}: a narrower name for a field's first bytes
         self.scoped_overlays = {}    # struct -> family -> {(offset, bits): (name, signed)}: the same in a family's view
+        self.nested = {}    # struct -> {offset: (name, structure, count)}: structures inside it, its members
+        for (struct, offset), member in (getattr(names, "members", None) or {}).items():
+            self.nested.setdefault(struct, {})[offset] = member
         if names is not None:
             for (struct, offset, bits), (name, kind) in names.overlays.items():
                 if struct != "global":
@@ -1515,6 +1518,16 @@ class Layouts:
         for struct, families in self.scoped.items():
             taken = set(self.names.get(struct, {}).values()) | macros
             self.views[struct] = {family: family if family not in taken else f"{family}_view" for family in families}
+
+    def member_at(self, struct, offset, inner):
+        """C for the 'inner' structure at 'offset' of 'struct' when one of its members ('member' lines) holds
+        one there ("car", "road_segments[3]"); None otherwise."""
+        for start, (name, member_struct, count) in self.nested.get(struct, {}).items():
+            size = STRUCTS.get(member_struct, 0)
+            if member_struct == inner and size and start <= offset < start + size * count \
+                    and not (offset - start) % size:
+                return name + (f"[{(offset - start) // size}]" if count > 1 else "")
+        return None
 
     def drop_unread(self, texts):
         """Forgets the fields with a made-up name (unk_30) that the code of none of the C 'texts' reads: it
@@ -1629,9 +1642,22 @@ class Layouts:
         def lay(members, start, end, pad):
             lines = []
             position = start
-            for offset, bits, parts in members:
+            for member in members:
+                offset, bits, parts = member[:3]
                 if offset > position:
                     lines.append(f"{pad}uint8_t pad_{position:02X}[0x{offset - position:X}];")
+                if len(member) > 3:
+                    # structures inside this one: its member, in a union with the fields named in its bytes
+                    name, inner, count, size = member[3]
+                    declaration = f"struct {inner} {name}" + (f"[0x{count:X}]" if count > 1 else "") + ";"
+                    if not parts:
+                        lines.append(pad + declaration)
+                    else:
+                        lines += [f"{pad}union", f"{pad}{{", f"{pad}\t{declaration}", f"{pad}\tstruct", f"{pad}\t{{"]
+                        lines += lay(parts, offset, offset, pad + "\t\t")
+                        lines += [f"{pad}\t}};", f"{pad}}};"]
+                    position = offset + size
+                    continue
                 own = [(found_bits, found) for (found_offset, found_bits), found in sorted(overlays.items())
                        if found_offset == offset and found_bits < bits]
                 count = self.array_count(struct, offset) if generic else (arrays or {}).get(offset)
@@ -1657,6 +1683,20 @@ class Layouts:
             if position < end:
                 lines.append(f"{pad}uint8_t pad_{position:02X}[0x{end - position:X}];")
             return lines
+        if generic and self.nested.get(struct):
+            # the structures inside this one, each holding the fields named in its bytes
+            merged, inside_any = [], set()
+            for offset, (name, inner, count) in sorted(self.nested[struct].items()):
+                size = STRUCTS[inner] * count
+                inside = [member for member in members if offset <= member[0] < offset + size]
+                if any(member[0] + member[1] // 8 > offset + size for member in inside) \
+                        or any(member[0] < offset < member[0] + member[1] // 8 for member in members):
+                    raise ValueError(f"{struct}: a field runs across the edge of its member {name}")
+                inside_any |= {id(member) for member in inside}
+                if offset < end and offset + size > start:
+                    merged.append((offset, size * 8, inside, (name, inner, count, size)))
+            members = sorted(merged + [member for member in members if id(member) not in inside_any],
+                             key=lambda member: member[0])
         return lay(members, start, end, pad)
 
     def pointer_type(self, struct):
@@ -1679,7 +1719,17 @@ class Layouts:
 
     def declarations(self):
         lines = ["#pragma pack(push, 1)"]
-        for struct, size in STRUCTS.items():
+        order = []
+
+        def after_its_members(struct):
+            if struct not in order:
+                for _, inner, _ in self.nested.get(struct, {}).values():
+                    after_its_members(inner)
+                order.append(struct)
+        for struct in STRUCTS:
+            after_its_members(struct)
+        for struct in order:
+            size = STRUCTS[struct]
             if struct in ELEMENTS:
                 continue    # (an array of plain values: no structure)
             fields = self.fields.get(struct, {})
@@ -1726,6 +1776,9 @@ class Layouts:
                 "the board's memory" if struct in BOARD_STRUCTS else "the game's blocks"
             lines.append(f"_Static_assert(sizeof(struct {struct}) == 0x{size:X}, "
                          f"\"struct {struct} has the size of {what}\");")
+            for offset, (name, _, _) in sorted(self.nested.get(struct, {}).items()):
+                lines.append(f"_Static_assert(offsetof(struct {struct}, {name}) == 0x{offset:X}, "
+                             f"\"{name} at its place in struct {struct}\");")
         lines.append("")
         for struct in STRUCTS:
             lines.append(f"#define {struct.upper()}(address) ({self.pointer_type(struct)}(address))")
