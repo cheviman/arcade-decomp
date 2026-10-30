@@ -421,6 +421,14 @@ class Printer:
 
     def arithmetic(self, node):
         name, (left_node, right_node), bits = node.name, node.args, node.bits
+        moved = getattr(self.names, "moved_place", None)
+        if moved is not None and name in ("add", "sub") and isinstance(right_node, ir.Const) and bits == 32:
+            # a pointer the C keeps to the record it walks, plus a constant: the place in the record there
+            distance = right_node.value & 0xFFFFFFFF
+            distance = distance - (1 << 32) if distance & 0x80000000 else distance
+            text = moved(left_node, distance if name == "add" else -distance)
+            if text is not None:
+                return Value(text, PRIMARY, True, "u32")
         left, right = self.any(left_node), self.any(right_node)
         ctype = self.joined(left, right)
         small = name == "mul" and isinstance(right_node, ir.Const) and right_node.value < 0x8000 \
