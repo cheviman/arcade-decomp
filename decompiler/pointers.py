@@ -1103,6 +1103,22 @@ def fold(node):
     return None
 
 
+class Hits(dict):
+    """id(access) -> what it reaches (access(): a field of a structure, a variable, a memory of the board),
+    as Program.note() finds it; and, in 'moves', id(statement) -> (the kinds of the registers that point into
+    a structure before the statement, the kind a SetReg leaves in its register): how far into its record
+    each pointer is there, for the C of a pointer that walks its record (emit.py, walk_steps)."""
+
+    def __init__(self):
+        super().__init__()
+        self.moves = {}
+
+
+def pointing(state):
+    """The kinds of the registers in 'state' that point into a structure."""
+    return {index: kind for index, kind in state.items() if isinstance(index, int) and kind[0] in STRUCTS}
+
+
 class Program:
     """The kinds of every function's registers, across calls."""
 
@@ -1139,7 +1155,7 @@ class Program:
             pending = self.changed
         fields, accesses = {}, []
         for entry in self.functions:
-            found = {}
+            found = Hits()
             self.analyse(entry, record=(found, accesses))
             fields[entry] = found
         return fields, accesses
@@ -1428,10 +1444,16 @@ class Program:
             for statement in block.statements:
                 if record is not None:
                     self.note(statement, state, record, zeros)
+                    before = pointing(state)
                 self.step(statement, state, zeros, record)
+                if record is not None:
+                    record[0].moves[id(statement)] = (before, state.get(statement.index)
+                                                      if isinstance(statement, ir.SetReg) else None)
             end = block.end
             if record is not None:
                 self.note(end, state, record, zeros)
+                if end is not None:
+                    record[0].moves[id(end)] = (pointing(state), None)
             if isinstance(end, ir.TailCall):
                 if record is None:
                     self.tell_callee(end.target, self.told(end.target, state))

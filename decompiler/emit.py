@@ -425,6 +425,21 @@ def renumbered(head, body, local_name, given=frozenset()):
         used.discard(name)
 
 
+def constant_parts(node):
+    """(the rest, the constants added up, signed) of a value that is something plus or minus constants
+    (race - 0x10u - 1u: race and -0x11); (node, 0) for any other."""
+    total = 0
+    while True:
+        while isinstance(node, ir.Op) and node.name in ("trunc", "fits") and node.bits >= 32:
+            node = node.args[0]
+        if not (isinstance(node, ir.Op) and node.name in ("add", "sub") and isinstance(node.args[1], ir.Const)):
+            return node, total
+        amount = node.args[1].value & 0xFFFFFFFF
+        amount = amount - (1 << 32) if amount & 0x80000000 else amount
+        total += amount if node.name == "add" else -amount
+        node = node.args[0]
+
+
 def state_place(value, struct, layouts):
     """C for a pointer to the 'struct' at the constant address 'value' when a block of the game's state is
     one there, or holds one (a structure inside it: &game->screen_2.car); None otherwise."""
@@ -606,6 +621,7 @@ class FunctionWriter:
         self.has_results = bool(self.results) or self.returned is not None
         self.current = None
         self.local_pointers = {}    # the function's own variables that are C pointers (pointer_locals)
+        self.walks = {}             # ... those of them that walk their record (walk_steps)
         entry_registers = {value[1] for value in self.params + self.results if value[0] == "r"}
         # the object family this function belongs to (symbols.txt scoped fields), and where the registers
         # still point at the object its code runs on
@@ -994,7 +1010,7 @@ class FunctionWriter:
         gives where the C needs the number."""
         if memory.STATE is None:
             return {}
-        found, mixed = {}, set()
+        found, mixed, walked = {}, set(), set()
         excluded = {self.vars.entry_name(value[1]) for value in self.params + self.results if value[0] == "r"}
         excluded |= {self.emitter.param_name(self.entry, value) for value in self.params + self.results}
         # (the parameters the function's signature makes pointers: Emitter.param_structs; all of them where
@@ -1025,20 +1041,124 @@ class FunctionWriter:
                     name = self.vars.use_name(base)
                     if name is None:
                         continue
-                    if field[3] or field[0] in pointers.ELEMENTS or field[0] in pointers.BOARD_STRUCTS:
+                    if field[0] in pointers.ELEMENTS or field[0] in pointers.BOARD_STRUCTS:
                         mixed.add(name)
-                    else:
-                        found.setdefault(name, set()).add(field[0])
+                        continue
+                    if field[3]:
+                        walked.add(name)    # (into the structure past its start: a pointer that walks it)
+                    found.setdefault(name, set()).add(field[0])
         self.current = writing
         kinds = {name: next(iter(structs)) for name, structs in found.items()
                  if len(structs) == 1 and name not in mixed and name not in excluded and name is not None}
+        walks = {}
+        for name in walked & set(kinds):
+            steps = self.walk_steps(name, kinds[name]) if not with_params else None
+            if steps is None:
+                del kinds[name]
+            else:
+                walks[name] = steps
         if not with_params:
+            self.walks = walks
             # (a parameter the signature makes a pointer is one, whatever this way of writing it says)
             for index, struct in self.emitter.param_structs.get(self.entry, {}).items():
                 name = self.vars.entry_name(index)
                 if name is not None:
                     kinds[name] = struct
         return kinds
+
+    def walk_steps(self, name, struct):
+        """How the C keeps 'name', a variable of the function's own that points into a 'struct' past its
+        start (a pointer that walks its record: it reads a field and moves on to the next), as a pointer to
+        the record it is in: {id(statement): ("step", records moved) for a step it takes, ("set", how far
+        into its record the value it gets points) for any other value it gets}. The fields through it are
+        that record's (place->width, not SPRITE_PLACE(place - 0x2u)->width); a step within the record goes,
+        one onto another record moves the pointer by records. None when that is not so everywhere: where
+        pointers.py does not know how far into its record it points, where it moves by other than whole
+        records from one record to another, where anything but a field through it or its own step reads
+        it while it points past the start of its record, or where a call sets it."""
+        moves = getattr(self.fields, "moves", None)
+        if not moves:
+            return None
+        size = pointers.STRUCTS[struct]
+        if getattr(self, "_implicit_reads", None) is None:
+            self._implicit_reads = {}
+            for statement_id, index in self.vars.implicit:
+                self._implicit_reads.setdefault(statement_id, []).append(index)
+        steps = {}
+        writing = self.current
+        try:
+            for block in self.function.blocks.values():
+                for statement in block.statements + ([block.end] if block.end is not None else []):
+                    self.current = statement
+                    before, after = moves.get(id(statement), ({}, None))
+                    # the fields the statement reaches through the variable: as far into its record as the
+                    # variable points there
+                    bases = 0
+                    accesses = [statement] if isinstance(statement, ir.Store) else []
+                    for expression in ir.statement_expressions(statement):
+                        accesses += [node for node in ir.walk(expression) if isinstance(node, ir.Load)]
+                    for access in accesses:
+                        hit = self.fields.get(id(access))
+                        if hit is None or hit[0] not in pointers.STRUCTS or not isinstance(hit[2], ir.Reg) \
+                                or self.vars.use_name(hit[2]) != name:
+                            continue
+                        kind = before.get(hit[2].index)
+                        if hit[0] != struct or kind is None or kind[0] != struct or kind[1] != hit[3]:
+                            return None
+                        bases += 1
+                    defined = isinstance(statement, ir.SetReg) and self.vars.def_name(statement, statement.index) == name
+                    step, distance = None, 0
+                    if defined:
+                        inner, distance = constant_parts(statement.value)
+                        if isinstance(inner, ir.Reg) and self.vars.use_name(inner) == name:
+                            step = inner    # (its own step: from where it points, on by constants)
+                    # any other read of it: where it points at the start of its record (address_of(name)). The
+                    # reads are counted, not told apart by node: the IR shares a node between a field's base
+                    # and a value (turntable_scenery_show's group + 2u + group->item_list_offset)
+                    reads = [node for expression in ir.statement_expressions(statement) for node in ir.walk(expression)
+                             if isinstance(node, ir.Reg) and self.vars.use_name(node) == name]
+                    if len(reads) > bases + (step is not None):
+                        kind = before.get(reads[0].index)
+                        if kind is None or kind[0] != struct or kind[1] != 0:
+                            return None
+                    for index in self._implicit_reads.get(id(statement), ()):
+                        if self.vars.implicit_name(statement, index) == name:
+                            kind = before.get(index)
+                            if kind is None or kind[0] != struct or kind[1] != 0:
+                                return None    # (a call, or the end of the function, that reads it)
+                    if not defined:
+                        if any(self.vars.def_name(statement, index) == name
+                               for index in self.vars.statement_defs(statement)):
+                            return None    # (a call or an instruction that sets it)
+                        continue
+                    if after is None or after[0] != struct:
+                        return None
+                    if step is None:
+                        steps[id(statement)] = ("set", after[1])
+                        continue
+                    kind = before.get(step.index)
+                    if kind is None or kind[0] != struct:
+                        return None
+                    moved = kind[1] + distance - after[1]
+                    if moved % size:
+                        return None
+                    steps[id(statement)] = ("step", moved // size)
+        finally:
+            self.current = writing
+        return steps
+
+    def walk_text(self, name, struct, statement, walk):
+        """The C of 'statement', which sets 'name', a pointer that walks its record (walk_steps): nothing for
+        a step within the record, the pointer moved by records for one onto another, else the pointer to
+        the record its value points into."""
+        how, amount = walk
+        if how == "set":
+            return [f"{name} = {self.pointer_value(statement.value, struct, -amount)};"]
+        if amount == 0:
+            return []
+        if amount in (1, -1):
+            return [f"{name}{'++' if amount > 0 else '--'};"]
+        return [f"{name} {'+' if amount > 0 else '-'}= {abs(amount)};"]
 
     def signature_pointers(self):
         """({register: structure} of the parameters, the structure of the result or None) that point at the
@@ -1107,22 +1227,19 @@ class FunctionWriter:
             return f"{self.pointer_from(wanted)}({text})"
         return f"({self.emitter.pointer_ctype(wanted)}){text}"
 
-    def pointer_value(self, value, struct):
-        """C for the pointer to a 'struct' the C keeps where the original holds the address 'value': the
-        pointer another one is, moved by whole records; a block of the game's state, or a structure inside
-        one, at a constant address (&game->screen_2.car); a structure inside one a pointer points at
-        (&screen->car); else the pointer for that address (pointer_to(address)), which may be into any
-        memory the original's register points into (the test mode's R20 walks the bookkeeping in the sound
-        board's RAM)."""
+    def pointer_value(self, value, struct, shift=0):
+        """C for the pointer to a 'struct' the C keeps where the original holds the address 'value' (and
+        'shift' bytes on: the start of the record a value that points into it is in): the pointer another
+        one is, moved by whole records; a block of the game's state, or a structure inside one, at a
+        constant address (&game->screen_2.car); a structure inside one a pointer points at (&screen->car);
+        else the pointer for that address (pointer_to(address)), which may be into any memory the
+        original's register points into (the test mode's R20 walks the bookkeeping in the sound board's
+        RAM)."""
         node = value
         while isinstance(node, ir.Op) and node.name in ("trunc", "fits", "zext") and node.bits >= 32:
             node = node.args[0]
-        base, offset = node, 0
-        if isinstance(node, ir.Op) and node.name in ("add", "sub") and isinstance(node.args[1], ir.Const):
-            base = node.args[0]
-            offset = node.args[1].value & 0xFFFFFFFF
-            offset = (-offset if node.name == "sub" else offset) & 0xFFFFFFFF
-            offset = offset - (1 << 32) if offset & 0x80000000 else offset
+        base, offset = constant_parts(node)
+        offset += shift
         kept = self.kept_node(base)
         if kept is not None:
             name, own = kept
@@ -1134,9 +1251,16 @@ class FunctionWriter:
             if inside is not None:
                 return f"&{name}->{inside}"
         if isinstance(node, ir.Const):
-            place = state_place(node.value & 0xFFFFFF, struct, self.emitter.layouts)
+            place = state_place((node.value + shift) & 0xFFFFFF, struct, self.emitter.layouts)
             if place is not None:
                 return place
+        if shift:
+            if isinstance(base, ir.Const):
+                value = ir.Const((base.value + offset) & 0xFFFFFFFF, 32)
+            elif offset:
+                value = ir.op("add" if offset > 0 else "sub", (base, ir.Const(abs(offset), 32)), 32)
+            else:
+                value = base
         return f"{self.pointer_from(struct)}({self.stored(value, 32)})"
 
     def register_read(self, node):
@@ -1889,7 +2013,8 @@ class FunctionWriter:
             if isinstance(base, ir.Const) and not base_offset and table is None else None
         if block is not None and block[1] is None and index is not None:
             block = None    # (records counted on from a block that is one: by its address)
-        held = self.kept_node(base) if not base_offset and table is None and block is None else None
+        walking = isinstance(base, ir.Reg) and base.index not in self.context and self.vars.use_name(base) in self.walks
+        held = self.kept_node(base) if (not base_offset or walking) and table is None and block is None else None
         kept = held is not None and held[1] == struct
         if table is not None:
             # a table of records by its name: hud_gauge_positions_3p[player].y
@@ -2247,6 +2372,9 @@ class FunctionWriter:
                 raise EmitError(f"{self.function.name}: writes register {statement.index}")
             name = self.register_set(statement.index)
             struct = self.kept_pointer(statement.index) or self.local_pointers.get(name)
+            walk = self.walks.get(name, {}).get(id(statement)) if struct is not None else None
+            if walk is not None:
+                return self.walk_text(name, struct, statement, walk)
             if struct is not None:
                 return [f"{name} = {self.pointer_value(statement.value, struct)};"]
             changed = self.changed_in_place(statement, name)
