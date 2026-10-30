@@ -4,7 +4,7 @@
  *                 runtime's Multi 32 model, to find code, log hardware use and record state per frame
  *    Version:     0.1.0
  *    Created:     11-10-2026
- *    Modified:    22-10-2026
+ *    Modified:    30-10-2026
  *    Author:      Sebastian Toyos
  *
  *    Not part of the game. Usage:
@@ -250,7 +250,7 @@ bool write_file(const std::string &path, const void *data, size_t size)
 
 void dump_state(const std::string &dir)
 {
-	write_file(dir + "/work_ram.bin", s32_board.work_ram, sizeof(s32_board.work_ram));
+	write_file(dir + "/work_ram.bin", s32_board.work_ram, S32_WORK_RAM_SIZE);
 	write_file(dir + "/video_ram.bin", s32_board.video_ram, sizeof(s32_board.video_ram));
 	write_file(dir + "/sprite_ram.bin", s32_board.sprite_ram, sizeof(s32_board.sprite_ram));
 	write_file(dir + "/palette.bin", s32_board.palette, sizeof(s32_board.palette));

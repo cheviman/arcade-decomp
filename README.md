@@ -94,6 +94,43 @@ and gives the core
 
 Each module keeps neutral defaults, and says which of its settings a profile gives.
 
+## The game's state
+
+A profile that sets `memory.STATE` (OutRunners: `"game"`) gets the work RAM as one structure, the game's
+state, which the C reaches through a pointer of that name: its variables at their places
+(`game->frame_count`) and the blocks `memory.STATE_BLOCKS` names between them (`game->screen_1`,
+`game->race_copies[player]`), laid out as the board has it, so that each frame's state still compares byte
+for byte with the original's. `src/ram.h` declares it, with static asserts on its size and on its blocks'
+places. A structure inside another is a member of it (`member STRUCT OFFSET NAME INNER[N]` in
+`symbols.txt`: `&screen->car`).
+
+Where the code reaches a structure the C keeps a pointer, not an address: in the registers the whole
+program shares (`pointers.CONTEXT_KINDS`: `current_object->state`); in a function's own variables,
+parameters and results that point at one structure of the state or one record of the program ROM (`struct
+object *object`, `const struct sprite_animation *animation`, read in place in the game's data); and in a
+variable that walks its record, reading one field and moving on to the next, as a pointer to the record it
+is in (`place->width` where the original reads 2 bytes past the place it moved to; its steps within the
+record go, `place++` takes it onto the next record).
+
+The game's runtime gives what that C calls, and takes what it gives:
+
+- `game`, a pointer to the state, which the runtime may put anywhere (several of them, one at a time);
+- `ram(address)`: the place an address the code works out reaches, in the state or in another of the
+  board's memories;
+- `address_of(pointer)`: the address the original holds for the place a pointer the C keeps points at (in
+  the state, its work RAM address; in another of the board's memories or in the program's data, its
+  address there; for NULL, 0), where the C still needs the number; and the other way, `pointer_to(address)`
+  for a place of the state or of the board's memories, `rom_pointer(address)` for one of the program's
+  data, read in place;
+- `game_context` (from the C): the registers the whole program shares, each one's variable and whether the
+  C keeps a pointer in it, for the runtime's tasks to keep and start with.
+
+`noise_report.py` counts what still keeps the state in the board's memory model (`MODEL`: structures
+reached by casting an address, addresses used as values, functions kept as their address, tables reached
+through an address, places worked out within a page, memory moved by its address, and the conversions
+between the pointers the C keeps and the addresses the original holds), and the share of the game's
+functions and lines of code with none of it.
+
 ## Using it in a game
 
 The game's scripts in `tools/` (`decompile.py`, `decompile_sound.py`, `recompile.py`, `disassemble.py`,

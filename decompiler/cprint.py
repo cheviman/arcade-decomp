@@ -3,7 +3,7 @@ Name:        cprint.py
 Description: prints IR expressions as plain C, with casts and parentheses only where the value needs them
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 An IR value has a width; C has its integer types and promotions. Every printed value says whether it
@@ -352,8 +352,11 @@ class Printer:
                 # a control variable is true or false: "!found", "found"
                 value = self.emit(args[0])
                 return Value(f"!{value.text}", UNARY, True, "int") if name == "eq" else value
-            left, right = self.exact(args[0]), self.exact(args[1])
             symbol = "==" if name == "eq" else "!="
+            kept = self.kept_against_zero(args[0], args[1])
+            if kept is not None:
+                return Value(f"{kept} {symbol} NULL", EQUALITY, True, "int")    # (a pointer the C keeps, or none)
+            left, right = self.exact(args[0]), self.exact(args[1])
             return Value(f"{self.wrap(left, RELATION)} {symbol} {self.wrap(right, RELATION)}", EQUALITY, True, "int")
         if name in ("lt", "le"):
             return self.signed_compare(node)
@@ -364,8 +367,14 @@ class Printer:
                 return ranged
             # unsigned: 1 <= x is x != 0, and x < 1 is x == 0
             if name == "ule" and left_node == ir.Const(1, left_node.bits) and not isinstance(right_node, ir.Const):
+                kept = self.kept_against_zero(right_node, ir.Const(0, 32))
+                if kept is not None:
+                    return Value(f"{kept} != NULL", EQUALITY, True, "int")
                 return Value(f"{self.wrap(self.exact(right_node), RELATION)} != 0u", EQUALITY, True, "int")
             if name == "ult" and right_node == ir.Const(1, right_node.bits) and not isinstance(left_node, ir.Const):
+                kept = self.kept_against_zero(left_node, ir.Const(0, 32))
+                if kept is not None:
+                    return Value(f"{kept} == NULL", EQUALITY, True, "int")
                 return Value(f"{self.wrap(self.exact(left_node), RELATION)} == 0u", EQUALITY, True, "int")
             left, right = self.exact(left_node), self.exact(right_node)
             if isinstance(left_node, ir.Const) and not isinstance(right_node, ir.Const):
@@ -431,6 +440,21 @@ class Printer:
         text = f"{self.wrap(left, prec)} {symbol} {right_text}"
         exact = (bits == 32 and ctype == "u32") or (bits == 64 and ctype == "u64")
         return Value(text, prec, exact, ctype)
+
+    def kept_against_zero(self, left, right):
+        """The C name of a pointer the C keeps when one side of a comparison reads it, whole, and the other
+        is 0 (its address is 0 only when it points at no place: NULL); else None."""
+        kept = getattr(self.names, "kept", None)
+        if kept is None:
+            return None
+        for one, other in ((left, right), (right, left)):
+            while isinstance(one, ir.Op) and one.name in ("zext", "fits") and one.bits >= 32:
+                one = one.args[0]
+            if isinstance(other, ir.Const) and other.value == 0 and getattr(one, "bits", 0) == 32:
+                name = kept(one)
+                if name is not None:
+                    return name
+        return None
 
     def pointer_base(self, node):
         """True for a pointer, or a pointer plus a constant (screen + 0x2000u)."""

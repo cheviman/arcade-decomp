@@ -3,7 +3,7 @@ Name:        decompile.py
 Description: decompiles the game's V70 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--checks] [--out DIR] [--symbols FILE]
@@ -370,6 +370,9 @@ def analyse_after_stack(program, built):
         constants.substitute(function)
     flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
     signatures.OPEN = open_entries(program, built, flow)
+    # (the scratch context registers are live where the functions no caller runs end: dataflow.py)
+    flow.scratch = dict(signatures.SCRATCH_CONTEXT)
+    flow.boundaries = set(code_table(program, flow)) | set(signatures.OPEN)
     flow.declared = declared_results(program, signatures.OPEN)
     signatures.UNREAD = declared_unread(program)
     # (from the start: what a caller would hand them there is not live at its calls)
@@ -394,7 +397,65 @@ def analyse_after_stack(program, built):
     if flow.reaches:
         flow.reset()
         flow.solve()
+    signatures.GLOBAL_USERS = global_users(built, flow)
     return flow
+
+
+def global_users(built, flow):
+    """For each scratch context register, the functions where it is the global variable: the boundary
+    functions (an object's handler, an interrupt, a task: what runs next reads what they leave), the ones that
+    call through a memory slot or wait for an interrupt (which reads and writes them), the ones it only goes
+    through (taken from a caller or a callee to the next, never read nor written there: the global variable
+    takes it), and every function that calls one of those. In the others it is a register like the rest:
+    parameters, results, locals."""
+    seeds = set(flow.boundaries)
+    callers = {}
+    for entry, function in built.items():
+        for block in function.blocks.values():
+            for statement in block.statements + [block.end]:
+                if isinstance(statement, ir.Call):
+                    if statement.slot is not None:
+                        seeds.add(entry)
+                        continue
+                    for target in flow.call_targets(statement):
+                        callers.setdefault(target, set()).add(entry)
+                elif isinstance(statement, ir.TailCall):
+                    callers.setdefault(statement.target, set()).add(entry)
+                elif isinstance(statement, ir.Effect) and statement.name in dataflow.INTERRUPT_EFFECTS:
+                    seeds.add(entry)
+    found = {}
+    for index in signatures.SCRATCH_CONTEXT:
+        users = set(seeds)
+        for entry, function in built.items():
+            summary = flow.summaries.get(entry)
+            goes_through = summary is not None and any(variable[0] == "r" and variable[1] == index
+                                                       for variable in summary.reads | summary.writes)
+            if goes_through and not uses_register(function, index):
+                users.add(entry)
+        pending = list(users)
+        while pending:
+            entry = pending.pop()
+            for caller in callers.get(entry, ()):
+                if caller not in users:
+                    users.add(caller)
+                    pending.append(caller)
+        found[index] = users
+    return found
+
+
+def uses_register(function, index):
+    """True if 'function' reads or writes register 'index' itself: in an expression, a condition, an
+    address, an assignment (handing it to a call or back to its caller is no use of it)."""
+    for block in function.blocks.values():
+        for statement in block.statements + [block.end]:
+            if isinstance(statement, (ir.Call, ir.TailCall, ir.Return)):
+                continue
+            if isinstance(statement, ir.SetReg) and statement.index == index:
+                return True
+            for expression in ir.statement_expressions(statement):
+                if any(isinstance(node, ir.Reg) and node.index == index for node in ir.walk(expression)):
+                    return True
+    return False
 
 
 CREATED = "12-10-2026"    # when the C was first written; the files say when it was last written too
@@ -1025,6 +1086,18 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         structure.split_loop_entries(function, notes)
     writers = {entry: emit.FunctionWriter(emitter, function, live_after[entry], fields[entry], live_at_start[entry])
                for entry, function in built.items()}
+    if memory.STATE is not None:
+        # the parameters and results that are C pointers, from each function's own code, before any call to
+        # it is written; then each function's pointers again, its parameters among them
+        emitter.param_structs, emitter.result_structs = {}, {}
+        for entry, writer in writers.items():
+            params, result = writer.signature_pointers()
+            if params:
+                emitter.param_structs[entry] = params
+            if result is not None:
+                emitter.result_structs[entry] = result
+        for writer in writers.values():
+            writer.retype()
     for entry, writer in writers.items():
         try:
             texts[entry] = writer.write()
@@ -1055,7 +1128,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             continue
         _, controls, lines = write_backs(text)
         _, usual_controls, usual_lines = write_backs(texts[entry])
-        if set(re.findall(r"r\d+", text)) - set(re.findall(r"r\d+", texts[entry])):
+        shared = {emitter.context_name(index) for index in signatures.CONTEXT}    # (globals of the C)
+        if set(re.findall(r"\br\d+\b", text)) - set(re.findall(r"\br\d+\b", texts[entry])) - shared:
             continue    # (a register the copy's notes do not find a variable for: not the same C)
         if controls < usual_controls or controls == usual_controls and lines < usual_lines:
             writers[entry], texts[entry] = other, text
@@ -1087,10 +1161,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     # memory slots keeps it, for table.c)
     entries = sorted(entry for entry in built
                      if entry not in emitter.trampolines or entry in table or entry == RESET_ADDRESS)
-    context = ", ".join(emitter.context_name(index) for index in signatures.CONTEXT)
+    # (a register the C keeps a pointer in is declared with its structure's type, the rest as numbers)
+    numbers = [index for index in signatures.CONTEXT if emitter.pointer_struct(index) is None]
+    kept = [index for index in signatures.CONTEXT if emitter.pointer_struct(index) is not None]
+    context = ", ".join(emitter.context_name(index) for index in numbers) + ";" + "".join(
+        f"\nextern {emitter.context_type(index)}{emitter.context_name(index)};" for index in kept)
     defined = ", ".join(emitter.context_name(index) + (f" = 0x{signatures.INITIAL[index]:X}u" if index in signatures.INITIAL else "")
-                        for index in signatures.CONTEXT)
-    context_pointers = ", ".join("&" + emitter.context_name(index) for index in signatures.CONTEXT)
+                        for index in numbers) + ";" + "".join(
+        f"\n{emitter.context_type(index)}{emitter.context_name(index)};" for index in kept)
+    context_pointers = ", ".join(f"{{ &{emitter.context_name(index)}, {int(emitter.pointer_struct(index) is not None)} }}"
+                                 for index in signatures.CONTEXT)
     context_numbers = ", ".join(str(index) for index in signatures.CONTEXT)
     files = game_files(entries)
     # (a function something else replaces is declared twice: as the game calls it and as its original)
@@ -1102,7 +1182,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                     "memory slots")
         + f"#ifndef {game_profile.GUARD}_GAME_H\n#define {game_profile.GUARD}_GAME_H\n\n"
         + "#include \"game/support.h\"\n#include \"ram.h\"\n\n"
-        f"/* registers the whole program shares */\nextern uint32_t {context};\n\n"
+        f"/* registers the whole program shares */\nextern uint32_t {context}\n\n"
         "/* where the code the program keeps in memory slots (objects' handlers, hooks) is, as the game's own\n"
         "   addresses: what it stores and compares, and what call_code() runs */\n"
         + "\n".join(addresses) + "\n\n"
@@ -1115,13 +1195,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     numbers = [f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
                                                                           in emitter.constants.items()})]
     named.drop_unread(texts.values())
+    emitter.layouts.drop_unread(texts.values())
     (out_dir / "ram.h").write_text(
         file_header("ram.h", "the game's variables, tables, board registers and structures")
         + f"#ifndef {game_profile.GUARD}_RAM_H\n#define {game_profile.GUARD}_RAM_H\n\n"
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM symbols.txt labels */\n"
         + "\n".join(labels) + "\n\n/* numbers the code uses, by name (symbols.txt constant lines) */\n"
         + "\n".join(numbers) + "\n\n/* the game's structures in work RAM */\n"
-        + "\n".join(emitter.layouts.declarations()) + "\n\n#endif\n", encoding="ascii")
+        + "\n".join(emitter.layouts.declarations()) + "\n\n"
+        + ("\n".join(memory.NOTES.get("state", []) + named.state_declaration()) + "\n\n" if memory.STATE else "")
+        + "#endif\n", encoding="ascii")
     write_sources(out_dir, files, texts, "game.h", keep=("sound",))
 
     wrappers = []
@@ -1142,9 +1225,10 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         file_header("table.c", "the registers the whole program shares, the code calls through memory "
                     "slots reach (by address), and the reset entry")
         + '#include "game.h"\n\n'
-        f"uint32_t {defined};\n\n"
-        "/* the same, for the runtime to keep a copy for each of the game's tasks */\n"
-        f"uint32_t *const game_context[] = {{ {context_pointers} }};\n"
+        f"uint32_t {defined}\n\n"
+        "/* the same, for the runtime to keep a copy for each of the game's tasks (1: a pointer into the game's\n"
+        "   state, where the original holds its address) */\n"
+        f"const game_register game_context[] = {{ {context_pointers} }};\n"
         f"const uint8_t game_context_registers[] = {{ {context_numbers} }};\n"
         f"const size_t game_context_count = {len(signatures.CONTEXT)};\n\n" + "\n".join(wrappers) + "\n"
         "/* the code calls through memory slots and interrupts can reach, by address */\n"

@@ -3,7 +3,7 @@ Name:        dataflow.py
 Description: what each function reads, writes and hands back in registers and flags, across the program
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Variables are the parts of the V60 registers (("r", n, part): part 0 is bits 0-7, part 1 bits 8-15,
@@ -366,6 +366,14 @@ class Program:
         # live where each function ends: what it hands back to its callers (solve)
         self.exit_live = {}
         self.declared = {}    # entry -> register numbers a function nothing calls hands back (symbols.txt)
+        # the context registers the game uses as scratch (signatures.SCRATCH_CONTEXT): register -> the bits the
+        # code that runs after a boundary function may read without setting them; and the boundary functions:
+        # the ones no caller runs, but a memory slot, an interrupt or a task (decompile.py: code_table)
+        self.scratch = {}
+        self.boundaries = set()
+        # entry -> the parts of the scratch context registers live after some call to it: live where it ends,
+        # whether it writes them or not, as the global variable takes them through it to its caller (outputs)
+        self.through = {}
 
     def code_pointer_slots(self):
         """For each memory slot calls read their target from (by displacement): the functions the program
@@ -830,8 +838,14 @@ class Program:
                 zeroed = self.zeroed.get(entry, ())
                 start = self.functions[entry].entry
                 for key in sorted(keys):
-                    exit_live = frozenset(v for v in self.context if (v[0], v[1]) == key) \
-                        | frozenset(v for v in self.exit_live.get(entry, ()) if (v[0], v[1]) == key)
+                    # (a scratch one is live where a boundary function ends, else where its callers read it)
+                    if key[0] == "r" and key[1] in self.scratch:
+                        base = frozenset(register_parts(key[1], self.scratch[key[1]])) \
+                            if entry in self.boundaries else frozenset()
+                        base |= frozenset(v for v in self.through.get(entry, ()) if (v[0], v[1]) == key)
+                    else:
+                        base = frozenset(v for v in self.context if (v[0], v[1]) == key)
+                    exit_live = base | frozenset(v for v in self.exit_live.get(entry, ()) if (v[0], v[1]) == key)
                     found, _ = self.liveness(entry, exit_live=exit_live)
                     reads = {variable for variable in found[start] if variable[0] in ("r", "f")
                              and (variable[0], variable[1]) not in zeroed}
@@ -842,10 +856,16 @@ class Program:
     def live_after_calls(self, entry):
         return self.liveness(entry, record_calls=True)[1]
 
+    def scratch_left(self, entry):
+        """The parts of the scratch context registers a boundary function may write that later code may read."""
+        return {variable for variable in self.summaries[entry].writes if variable[0] == "r"
+                and variable[1] in self.scratch and variable in register_parts(variable[1], self.scratch[variable[1]])}
+
     def outputs(self):
         """For each function: the variables some caller reads after calling it, out of what it writes. A call
         through a memory slot takes nothing back (signatures.py)."""
         handed = {entry: set() for entry in self.functions}
+        through = {entry: set() for entry in self.functions}
         for entry in self.functions:
             for call, live in self.live_after_calls(entry):
                 if call.slot is not None:
@@ -853,6 +873,12 @@ class Program:
                 for target in self.call_targets(call):
                     if target in handed:
                         handed[target] |= live & self.summaries[target].writes
+                        through[target] |= {variable for variable in live
+                                            if variable[0] == "r" and variable[1] in self.scratch}
+        # what a boundary function leaves in the scratch context registers, which the code that runs next (the
+        # next object's handler) may read: the rest of what the program does with them follows from there
+        for entry in self.boundaries & set(handed):
+            handed[entry] |= self.scratch_left(entry)
         # what a function nothing calls hands back: symbols.txt says it ("result" lines)
         for entry, registers in self.declared.items():
             if entry in handed:
@@ -869,4 +895,14 @@ class Program:
                         if not new <= handed[block.end.target]:
                             handed[block.end.target] |= new
                             changed = True
+                        # (and what is live where this function ends is where the callee ends)
+                        ends = through[entry] | {variable for variable in handed[entry]
+                                                 if variable[0] == "r" and variable[1] in self.scratch}
+                        if entry in self.boundaries:
+                            for index, mask in self.scratch.items():
+                                ends |= register_parts(index, mask)
+                        if not ends <= through[block.end.target]:
+                            through[block.end.target] |= ends
+                            changed = True
+        self.through = through
         return handed

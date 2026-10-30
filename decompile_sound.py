@@ -3,7 +3,7 @@ Name:        decompile_sound.py
 Description: decompiles the Z80 sound program into readable C, one C function per original function
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    27-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile_sound.py [--check] [--checks] [--out DIR] [--timing FILE]
@@ -398,6 +398,7 @@ def write_c(program, out_dir, variables_path=None):
     entries = sorted(built)
     files = sound_files(entries)
     prototypes = grouped_prototypes(files, emitter.prototype)
+    emitter.layouts.drop_unread(texts.values())
     (out_dir / "sound.h").write_text(
         file_header("sound.h", "the sound program's ports, variables, tables, structures and functions")
         + f"#ifndef {game_profile.GUARD}_SOUND_H\n#define {game_profile.GUARD}_SOUND_H\n\n"
