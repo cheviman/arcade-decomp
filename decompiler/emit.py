@@ -417,6 +417,18 @@ def renumbered(head, body, local_name, given=frozenset()):
         used.discard(name)
 
 
+def state_block(value, struct):
+    """(C of the block of the game's state that holds a 'struct' at the constant address 'value', the number of
+    the record of it there, or None for a block that is one) when one does (memory.STATE_BLOCKS); else None."""
+    if memory.STATE is None:
+        return None
+    for address, member, block_struct, count in memory.STATE_BLOCKS:
+        size = pointers.STRUCTS.get(block_struct) if block_struct == struct else None
+        if size and address <= value < address + size * count and (value - address) % size == 0:
+            return f"{memory.STATE}->{member}", (value - address) // size if count > 1 else None
+    return None
+
+
 def group_key(statements):
     """What a group of statements does, its temporaries named by their order in it (an instruction's are
     named after its address: t0109B4_2_operand), so that one instruction's group is equal to the next's."""
@@ -1665,9 +1677,17 @@ class FunctionWriter:
             base = ir.op("add", (ir.Const((base.args[0].value - base_offset) & 0xFFFFFFFF), base.args[1]), 32)
             base_offset = 0
         table = pointers.record_table_name(base.value & 0xFFFFFF) if isinstance(base, ir.Const) else None
+        block = state_block(base.value & 0xFFFFFF, struct) \
+            if isinstance(base, ir.Const) and not base_offset and table is None else None
+        if block is not None and block[1] is None and index is not None:
+            block = None    # (records counted on from a block that is one: by its address)
         if table is not None:
             # a table of records by its name: hud_gauge_positions_3p[player].y
             pointer = table[0]
+        elif block is not None:
+            # a block of the game's state (game->screen_1.unpack_state), a record of one by its number
+            # (game->race_copies[player].model)
+            pointer = block[0]
         else:
             start = self.printer.any(base).text
             pointer = f"{struct.upper()}({start})" if not base_offset else \
@@ -1682,7 +1702,13 @@ class FunctionWriter:
                     offset = start + (offset - start) % width
                     break
         element = struct in pointers.ELEMENTS
-        if index is not None or element or table is not None:
+        if block is not None:
+            if block[1] is not None:
+                number = self.record_number(index)
+                first = block[1]
+                pointer += f"[{number}]" if not first else f"[{first}]" if number == "0" else f"[{first} + {number}]"
+            member = "."
+        elif index is not None or element or table is not None:
             # a record (or an element) by its number: STRUCT(p)[i].field, NAME(p)[i]
             pointer = f"{pointer}[{self.record_number(index)}]"
             member = "" if element else "."
@@ -1696,7 +1722,7 @@ class FunctionWriter:
             if scoped is None:
                 raise EmitError(f"{self.function.name}: no field of {struct} at {offset:X}")
             view, scoped_name, scoped_offset, scoped_bits, scoped_signed = scoped
-            text = f"{pointer}->{view}.{scoped_name}" + self.scoped_element(struct, family, scoped_offset, element_number)
+            text = f"{pointer}{member}{view}.{scoped_name}" + self.scoped_element(struct, family, scoped_offset, element_number)
             if scoped_offset == offset and scoped_bits == bits:
                 return text, scoped_signed
             return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
@@ -1731,7 +1757,7 @@ class FunctionWriter:
                 # that reaches past it is the structure's if the structure has a name for all of it (one of
                 # its own, not one made of the offset: then the family's field names its start)
                 if generic[2] and (offset - scoped_offset) * 8 + bits > scoped_bits \
-                        and not generic[0].split("->")[-1].startswith("unk_"):
+                        and not re.split(r"->|\.", generic[0])[-1].startswith("unk_"):
                     return generic[:2]
                 return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
         self.note_missing(struct, offset, bits, base, base_offset, generic)
@@ -1822,7 +1848,7 @@ class FunctionWriter:
         region = self.emitter.layouts.region(struct)
         if struct != "object" or base_offset or region is None or offset < region or not isinstance(base, ir.Reg):
             return
-        if not generic[0].split("->")[-1].startswith(("var_", "unk_")) and generic[2]:
+        if not re.split(r"->|\.", generic[0])[-1].startswith(("var_", "unk_")) and generic[2]:
             return    # a generic field with a name and the access's width
         where = self.statement_reading(base)
         if base.index not in self.own.get(where, frozenset()):
