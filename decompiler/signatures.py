@@ -3,7 +3,7 @@ Name:        signatures.py
 Description: the C signature of every function: its parameters and the results it hands back
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 The game passes values in registers, as hand-written assembly does. In C:
@@ -50,6 +50,10 @@ CONTEXT = ()
 INITIAL = {}
 # context registers the game uses as scratch: the bits code that runs later may read without setting them
 SCRATCH_CONTEXT = {}
+# register -> the functions where it is the global variable (decompile.py: global_users): the boundary
+# functions, the ones that call through a memory slot or wait for an interrupt, the ones that only take it
+# through, and their callers; in the others it is a register like the rest (None: all of them)
+GLOBAL_USERS = None
 CONSTANT = {}
 # the functions nothing reaches (decompile.py)
 OPEN = set()
@@ -62,16 +66,25 @@ def register_of(variable):
     return variable[1] if variable[0] == "r" else None
 
 
-def scratch(variables):
-    """The C values in a set of data flow variables: registers (any part) and flags, without the context ones."""
+def scratch(variables, entry=None):
+    """The C values in a set of data flow variables: registers (any part) and flags, without the context ones
+    (but the scratch ones in a function where they are no global variables: GLOBAL_USERS)."""
+    own = own_scratch(entry)
     found = set()
     for variable in variables:
         if variable[0] == "r":
-            if variable[1] not in CONTEXT and variable[1] not in CONSTANT:
+            if (variable[1] not in CONTEXT or variable[1] in own) and variable[1] not in CONSTANT:
                 found.add(("r", variable[1]))
         elif variable[0] == "f":
             found.add(variable)
     return found
+
+
+def own_scratch(entry):
+    """The scratch context registers that are registers like the rest in function 'entry' (GLOBAL_USERS)."""
+    if entry is None or GLOBAL_USERS is None:
+        return set()
+    return {index for index in SCRATCH_CONTEXT if entry not in GLOBAL_USERS.get(index, ())}
 
 
 class Signature:
@@ -116,7 +129,7 @@ def written_before_calls(flow, entry):
 def provided_inputs(flow, written):
     """Parameters of every function: the inputs some caller sets before calling it, or holds as a
     parameter of its own (a value handed down through a function that does not touch it)."""
-    inputs = {entry: scratch(summary.reads) for entry, summary in flow.summaries.items()}
+    inputs = {entry: scratch(summary.reads, entry) for entry, summary in flow.summaries.items()}
     params = {entry: set() for entry in flow.functions}
     changed = True
     while changed:
@@ -126,7 +139,9 @@ def provided_inputs(flow, written):
             for call, before in calls:
                 if call.slot is not None:
                     continue    # a slot call passes nothing
-                available = scratch(before) | params[entry]
+                available = scratch(before, entry) | params[entry]
+                # (a function where one is the global variable hands it on as it is)
+                available |= {("r", index) for index in set(SCRATCH_CONTEXT) - own_scratch(entry)}
                 for target in flow.call_targets(call):
                     if target in provided:
                         provided[target] |= available
@@ -158,6 +173,6 @@ def compute(flow):
         signature = Signature()
         signature.params = set(params[entry])
         signature.zeroed = set(flow.zeroed.get(entry, set()))
-        signature.results = scratch(outputs[entry] & summary.writes)
+        signature.results = scratch(outputs[entry] & summary.writes, entry)
         signatures[entry] = signature
     return signatures

@@ -4,7 +4,7 @@ Description: splits each register of a function into the variables it really hol
              definitions and uses), each with the width its uses need
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Hand-written assembly reuses a register for one thing after another. A definition (an assignment, a call
@@ -184,11 +184,27 @@ class Variables:
             return found + sorted(self.context_effects(statement)[0] - set(found))
         if isinstance(statement, (ir.Return, ir.TailCall, ir.InterruptReturn)):
             reads = set(self.end_reads(statement))
+            scratch = self.end_scratch(statement)
             if isinstance(statement, ir.TailCall):
                 reads -= self.new_values(statement)    # the function it goes on in writes them, whatever they held
-            # (and the code that runs next may read the scratch context registers)
-            return sorted({index for index in reads if self.scratch(index)} | self.scratch_context)
+                scratch |= self.context_effects(statement)[0]
+            # (and the scratch context registers the code that runs next may read)
+            return sorted({index for index in reads if self.scratch(index)} | scratch)
         return []
+
+    def end_scratch(self, statement):
+        """The scratch context registers live where block end 'statement' leaves the function (cleanup.py's
+        liveness: those the callers read, all of them where an object's handler ends); all of them unknown."""
+        if self.after is None:
+            return set(self.scratch_context)
+        if not hasattr(self, "_ends"):
+            self._ends = {id(block.end): block for block in self.function.blocks.values()}
+        block = self._ends.get(id(statement))
+        live = self.after.get(("end", id(block))) if block is not None else None
+        if live is None:
+            return set(self.scratch_context)
+        return {index for index in self.scratch_context
+                if any(variable[0] == "r" and variable[1] == index for variable in live)}
 
     def effect_uses(self, statement):
         if statement.name in ("divx", "divux") and isinstance(statement.args[1], ir.Const):

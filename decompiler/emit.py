@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -544,6 +544,9 @@ class FunctionWriter:
         self.function = function
         self.entry = function.entry
         self.signature = emitter.signatures[function.entry]
+        # the registers that are global variables here: the scratch context ones only where they are
+        # (signatures.GLOBAL_USERS)
+        self.context = set(emitter.context) - signatures.own_scratch(function.entry)
         self.after = after
         self.printer = Printer(self)
         self.temps = {}
@@ -575,7 +578,7 @@ class FunctionWriter:
         self.chosen = {(spot, value): name for (entry, spot, value), name in emitter.local_names.items()
                        if entry == function.entry and emitter.local_name(name) is not None}
         self.chosen.update(self.emitter.local_sites_free())
-        self.vars = variables.Variables(function, emitter.context, self.call_registers, self.end_registers,
+        self.vars = variables.Variables(function, self.context, self.call_registers, self.end_registers,
                                         entry_registers, after, live_in, self.local_hint,
                                         {register: name for register, name in entry_names.items()
                                          if name != register_name(register)},
@@ -661,7 +664,7 @@ class FunctionWriter:
     def reaching(self, node):
         """The definitions that reach register node 'node': variables.py's, or context_reaching's for a
         register the whole program shares."""
-        if node.index in self.emitter.context:
+        if node.index in self.context:
             return self.context_reaching().get(id(node), frozenset())
         return self.vars.uses.get(id(node), frozenset()) if hasattr(self, "vars") else frozenset()
 
@@ -671,7 +674,7 @@ class FunctionWriter:
         register, ("entry", n)."""
         if hasattr(self, "_context_reaching"):
             return self._context_reaching
-        context = set(self.emitter.context)
+        context = set(self.context)
         uses = {}
 
         def step(statement, state, record):
@@ -740,7 +743,7 @@ class FunctionWriter:
     def scratch_context(self):
         """The context registers the game uses as scratch (signatures.SCRATCH_CONTEXT): variables.py makes
         locals of their webs that carry nothing between functions."""
-        return set(signatures.SCRATCH_CONTEXT) & set(self.emitter.context)
+        return set(signatures.SCRATCH_CONTEXT) & set(self.context)
 
     def context_effects(self, statement):
         """(the scratch context registers a call or an effect reads, or may leave partly as they were; those
@@ -922,7 +925,7 @@ class FunctionWriter:
         return set()
 
     def register_read(self, node):
-        if node.index in self.emitter.context and node.index not in self.scratch_context:
+        if node.index in self.context and node.index not in self.scratch_context:
             return self.emitter.context_name(node.index), 32
         name = self.vars.use_name(node) or cpu.variable_name(node.index)
         return name, self.widths.get(name, 32)
@@ -973,20 +976,20 @@ class FunctionWriter:
 
     def register_value(self, index):
         """The variable a call or the end of the function reads for a register."""
-        if index in self.emitter.context and index not in self.scratch_context:
+        if index in self.context and index not in self.scratch_context:
             return self.emitter.context_name(index)
         return self.vars.def_name(self.current, index) or self.vars.implicit_name(self.current, index) \
             or cpu.variable_name(index)
 
     def register_set(self, index):
         """The variable a statement writes for a register."""
-        if index in self.emitter.context and index not in self.scratch_context:
+        if index in self.context and index not in self.scratch_context:
             return self.emitter.context_name(index)
         return self.vars.def_name(self.current, index) or cpu.variable_name(index)
 
     def implicit_value(self, index):
         """The variable a call reads as an argument (before the call writes anything)."""
-        if index in self.emitter.context and index not in self.scratch_context:
+        if index in self.context and index not in self.scratch_context:
             return self.emitter.context_name(index)
         return self.vars.implicit_name(self.current, index) or cpu.variable_name(index)
 
@@ -994,7 +997,7 @@ class FunctionWriter:
 
     def use(self, value):
         """C name of a register or flag, noting it as used."""
-        if value[0] == "r" and value[1] in self.emitter.context:
+        if value[0] == "r" and value[1] in self.context:
             return self.emitter.context_name(value[1])
         self.used.add(value)
         return value_name(value)
@@ -1111,7 +1114,7 @@ class FunctionWriter:
                 value = statement.value
                 while isinstance(value, ir.Op) and value.name in ("zext", "trunc", "fits"):
                     value = value.args[0]
-                if isinstance(value, ir.Reg) and value.index in self.emitter.context:
+                if isinstance(value, ir.Reg) and value.index in self.context:
                     saved.add(self.emitter.context_name(value.index))
                 elif isinstance(value, ir.Load):
                     writing = self.current
@@ -2055,7 +2058,7 @@ class FunctionWriter:
         inner = value
         while isinstance(inner, ir.Op) and inner.name in ("zext", "fits", "trunc"):
             inner = inner.args[0]
-        if isinstance(inner, ir.Reg) and (inner.index not in self.emitter.context
+        if isinstance(inner, ir.Reg) and (inner.index not in self.context
                                           or inner.index in self.scratch_context):
             width = self.widths.get(self.register_read(inner)[0], 32)
         elif isinstance(inner, ir.Load):
@@ -2301,7 +2304,7 @@ class FunctionWriter:
                     addresses += [node.address for node in ir.walk(expression) if isinstance(node, ir.Load)]
                 for address in addresses:
                     for node in ir.walk(address):
-                        if isinstance(node, ir.Reg) and (node.index not in self.emitter.context
+                        if isinstance(node, ir.Reg) and (node.index not in self.context
                                                          or node.index in self.scratch_context):
                             found.add(self.vars.use_name(node))
         found.discard(None)
@@ -2421,7 +2424,7 @@ class FunctionWriter:
 
     def fill_register(self):
         """The variable a string move's fill (R26) is read from."""
-        name = self.vars.implicit_name(self.current, 26) if 26 not in self.emitter.context else None
+        name = self.vars.implicit_name(self.current, 26) if 26 not in self.context else None
         return name if name is not None else self.use(("r", 26))
 
     def address_argument(self, node):
@@ -2467,7 +2470,7 @@ class FunctionWriter:
     def never_set(self, index):
         """True if the call being written reads a register this function never sets and does not take:
         its variable still holds the 0 it starts with."""
-        if index in self.emitter.context:
+        if index in self.context:
             return False
         reaching = self.vars.implicit.get((id(self.current), index))
         return reaching == frozenset([("entry", index)]) and index not in self.vars.entry_registers
@@ -2769,7 +2772,7 @@ class FunctionWriter:
             lines.append("bool " + ", ".join(f"{name} = false" for name in sorted(self.controls.values())) + ";")
         flags = ordered(value for value in self.used if value[0] == "f" and value not in params
                         and value not in self.results and value_name(value) in words)
-        declared |= {self.emitter.context_name(index) for index in self.emitter.context}    # (globals)
+        declared |= {self.emitter.context_name(index) for index in self.context}    # (globals)
         if flags:
             lines.append("uint32_t " + ", ".join(f"{value_name(value)} = 0" for value in flags) + ";")
         floating = self.float_kinds()

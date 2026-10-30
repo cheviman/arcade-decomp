@@ -4,7 +4,7 @@ Description: removes the statements whose results nothing reads (flags no branch
              before use), once every function's signature is known
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Liveness runs backwards over each function with the data flow's own rules (demanded bits, what calls
@@ -152,12 +152,24 @@ class Liveness:
 
 def context_live(flow, entry, context):
     """The parts of the global registers live where a function ends: all of them, but of the scratch ones
-    (signatures.SCRATCH_CONTEXT) only the bits later code may read without setting them, and those its
-    callers read after calling it."""
+    (signatures.SCRATCH_CONTEXT) only those its callers read after calling it, whether it writes them or not
+    (the global variable takes them through it: dataflow.Program.through), and where a boundary function
+    ends (an object's handler: dataflow.Program.boundaries) the bits the code that runs next may read without
+    setting them."""
     live = set()
     handed = flow.exit_live.get(entry, frozenset())
+    own = signatures.own_scratch(entry)
     for index in context:
-        live |= dataflow.register_parts(index, signatures.SCRATCH_CONTEXT.get(index, dataflow.FULL))
+        if index in own:
+            continue    # (a register like the rest there: live where it ends only as one of its results)
+        mask = signatures.SCRATCH_CONTEXT.get(index)
+        if mask is None:
+            live |= dataflow.register_parts(index, dataflow.FULL)
+        else:
+            if entry in flow.boundaries:
+                live |= dataflow.register_parts(index, mask)
+            # (what its callers read after calling it, which the global takes through it written or not)
+            live |= {variable for variable in flow.through.get(entry, ()) if variable[1] == index}
         live |= {variable for variable in handed if variable[0] == "r" and variable[1] == index}
     return live
 

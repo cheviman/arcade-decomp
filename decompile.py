@@ -3,7 +3,7 @@ Name:        decompile.py
 Description: decompiles the game's V70 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    30-10-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--checks] [--out DIR] [--symbols FILE]
@@ -370,6 +370,9 @@ def analyse_after_stack(program, built):
         constants.substitute(function)
     flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
     signatures.OPEN = open_entries(program, built, flow)
+    # (the scratch context registers are live where the functions no caller runs end: dataflow.py)
+    flow.scratch = dict(signatures.SCRATCH_CONTEXT)
+    flow.boundaries = set(code_table(program, flow)) | set(signatures.OPEN)
     flow.declared = declared_results(program, signatures.OPEN)
     signatures.UNREAD = declared_unread(program)
     # (from the start: what a caller would hand them there is not live at its calls)
@@ -394,7 +397,65 @@ def analyse_after_stack(program, built):
     if flow.reaches:
         flow.reset()
         flow.solve()
+    signatures.GLOBAL_USERS = global_users(built, flow)
     return flow
+
+
+def global_users(built, flow):
+    """For each scratch context register, the functions where it is the global variable: the boundary
+    functions (an object's handler, an interrupt, a task: what runs next reads what they leave), the ones that
+    call through a memory slot or wait for an interrupt (which reads and writes them), the ones it only goes
+    through (taken from a caller or a callee to the next, never read nor written there: the global variable
+    takes it), and every function that calls one of those. In the others it is a register like the rest:
+    parameters, results, locals."""
+    seeds = set(flow.boundaries)
+    callers = {}
+    for entry, function in built.items():
+        for block in function.blocks.values():
+            for statement in block.statements + [block.end]:
+                if isinstance(statement, ir.Call):
+                    if statement.slot is not None:
+                        seeds.add(entry)
+                        continue
+                    for target in flow.call_targets(statement):
+                        callers.setdefault(target, set()).add(entry)
+                elif isinstance(statement, ir.TailCall):
+                    callers.setdefault(statement.target, set()).add(entry)
+                elif isinstance(statement, ir.Effect) and statement.name in dataflow.INTERRUPT_EFFECTS:
+                    seeds.add(entry)
+    found = {}
+    for index in signatures.SCRATCH_CONTEXT:
+        users = set(seeds)
+        for entry, function in built.items():
+            summary = flow.summaries.get(entry)
+            goes_through = summary is not None and any(variable[0] == "r" and variable[1] == index
+                                                       for variable in summary.reads | summary.writes)
+            if goes_through and not uses_register(function, index):
+                users.add(entry)
+        pending = list(users)
+        while pending:
+            entry = pending.pop()
+            for caller in callers.get(entry, ()):
+                if caller not in users:
+                    users.add(caller)
+                    pending.append(caller)
+        found[index] = users
+    return found
+
+
+def uses_register(function, index):
+    """True if 'function' reads or writes register 'index' itself: in an expression, a condition, an
+    address, an assignment (handing it to a call or back to its caller is no use of it)."""
+    for block in function.blocks.values():
+        for statement in block.statements + [block.end]:
+            if isinstance(statement, (ir.Call, ir.TailCall, ir.Return)):
+                continue
+            if isinstance(statement, ir.SetReg) and statement.index == index:
+                return True
+            for expression in ir.statement_expressions(statement):
+                if any(isinstance(node, ir.Reg) and node.index == index for node in ir.walk(expression)):
+                    return True
+    return False
 
 
 CREATED = "12-10-2026"    # when the C was first written; the files say when it was last written too
