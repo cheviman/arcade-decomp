@@ -987,10 +987,11 @@ class FunctionWriter:
 
     def pointer_locals(self, with_params=False):
         """{name: structure} of the function's own variables that point at the start of one structure of
-        the game's state (not the program ROM's, nor a memory of the board's) wherever the code reaches a
-        field through them, and that it neither takes, nor hands back, nor lends a call to write: C
-        pointers (struct object *object = NULL; object->state). The rest of what they hold is the address
-        the original holds, which address_of() gives where the C needs the number."""
+        the game's state or one of the program ROM's records (not a memory of the board's) wherever the
+        code reaches a field through them, and that it neither takes, nor hands back, nor lends a call to
+        write: C pointers (struct object *object = NULL; object->state; const struct sound_cue *sound_cue,
+        read in place). The rest of what they hold is the address the original holds, which address_of()
+        gives where the C needs the number."""
         if memory.STATE is None:
             return {}
         found, mixed = {}, set()
@@ -1024,8 +1025,7 @@ class FunctionWriter:
                     name = self.vars.use_name(base)
                     if name is None:
                         continue
-                    if field[3] or field[0] in pointers.ELEMENTS or field[0] in pointers.ROM_STRUCTS \
-                            or field[0] in pointers.BOARD_STRUCTS:
+                    if field[3] or field[0] in pointers.ELEMENTS or field[0] in pointers.BOARD_STRUCTS:
                         mixed.add(name)
                     else:
                         found.setdefault(name, set()).add(field[0])
@@ -1088,8 +1088,13 @@ class FunctionWriter:
         if held == struct:
             return name
         if held is not None:
-            return f"(struct {struct} *){name}"
-        return f"pointer_to({name})"
+            return f"({self.emitter.pointer_ctype(struct)}){name}"
+        return f"{self.pointer_from(struct)}({name})"
+
+    def pointer_from(self, struct):
+        """The runtime's function that gives a pointer to a 'struct' for an address: rom_pointer for the
+        program ROM's records (read in place), pointer_to for the rest."""
+        return "rom_pointer" if struct in pointers.ROM_STRUCTS else "pointer_to"
 
     def converted(self, text, held, wanted):
         """'text', a value of a callee's that is a pointer to 'held' (None: a number), as a pointer to
@@ -1099,8 +1104,8 @@ class FunctionWriter:
         if wanted is None:
             return f"address_of({text})"
         if held is None:
-            return f"pointer_to({text})"
-        return f"(struct {wanted} *){text}"
+            return f"{self.pointer_from(wanted)}({text})"
+        return f"({self.emitter.pointer_ctype(wanted)}){text}"
 
     def pointer_value(self, value, struct):
         """C for the pointer to a 'struct' the C keeps where the original holds the address 'value': the
@@ -1132,7 +1137,7 @@ class FunctionWriter:
             place = state_place(node.value & 0xFFFFFF, struct, self.emitter.layouts)
             if place is not None:
                 return place
-        return f"pointer_to({self.stored(value, 32)})"
+        return f"{self.pointer_from(struct)}({self.stored(value, 32)})"
 
     def register_read(self, node):
         if node.index in self.context and node.index not in self.scratch_context:
@@ -3048,8 +3053,8 @@ class FunctionWriter:
             if name not in declared and name in words:
                 kept.setdefault(struct, []).append(name)
         for struct, names in sorted(kept.items()):
-            lines.append(f"struct {struct} " + ", ".join(f"*{name} = NULL" for name in sorted(names, key=variable_order))
-                         + ";")
+            kind = self.emitter.pointer_ctype(struct)[:-1]    # ("const struct sound_cue *": its declarators')
+            lines.append(kind + ", ".join(f"*{name} = NULL" for name in sorted(names, key=variable_order)) + ";")
         for bits in (8, 16, 32):
             names = [name for offset, name in sorted(self.slots.items(), reverse=True)
                      if self.slot_widths[offset] == bits and name in words]
@@ -3135,6 +3140,10 @@ class Emitter:
                 or kind[0] in pointers.ROM_STRUCTS or kind[0] in pointers.BOARD_STRUCTS:
             return None
         return kind[0]
+
+    def pointer_ctype(self, struct):
+        """The C type of a pointer the C keeps to a 'struct': const for the program ROM's records."""
+        return f"const struct {struct} *" if struct in pointers.ROM_STRUCTS else f"struct {struct} *"
 
     def context_type(self, index):
         """The C type of a register the whole program shares."""
@@ -3447,7 +3456,7 @@ class Emitter:
             width = widths.get(value[1], register_bits(value[1])) if value[0] == "r" else 32
             struct = self.param_structs.get(entry, {}).get(value[1]) if value[0] == "r" else None
             if struct is not None:
-                params.append(f"struct {struct} *{self.param_name(entry, value)}")    # (a pointer the C keeps)
+                params.append(f"{self.pointer_ctype(struct)}{self.param_name(entry, value)}")    # (a pointer the C keeps)
                 continue
             params.append(f"{self.value_type(value, width)} {self.param_name(entry, value)}")
         for value in self.by_pointer(entry):
@@ -3457,7 +3466,7 @@ class Emitter:
         kind = "void" if returned is None \
             else self.value_type(returned, self.result_bits.get(entry, register_bits(returned[1])) if returned[0] == "r" else 32)
         if self.result_structs.get(entry) is not None:
-            kind = f"struct {self.result_structs[entry]} *"
+            kind = self.pointer_ctype(self.result_structs[entry])
             return f"{kind}{self.names[entry]}({', '.join(params) if params else 'void'})"
         return f"{kind} {self.names[entry]}({', '.join(params) if params else 'void'})"
 
