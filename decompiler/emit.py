@@ -2204,9 +2204,19 @@ class FunctionWriter:
             # (game->race_copies[player].model)
             pointer = block[0]
         else:
-            start = self.printer.any(base).text
-            pointer = f"{struct.upper()}({start})" if not base_offset else \
-                f"{struct.upper()}({start} - 0x{base_offset:X}u)"
+            distance = -base_offset
+            if struct in pointers.BOARD_STRUCTS and isinstance(index, ir.Const):
+                # a memory of the board's: the record the whole address the code puts on the bus reaches, as the
+                # bus decodes it (SPRITE_WORDS(sprite_entry + 0x3000u)[0], not SPRITE_WORDS(sprite_entry)[6144],
+                # which would step past the memory's end where the bus goes round)
+                count = index.value & 0xFFFFFFFF
+                distance += (count - (1 << 32) if count & 0x80000000 else count) * pointers.STRUCTS[struct]
+                index = None
+            if distance:
+                start = self.printer.wrap(self.printer.any(base), cprint.ADD)
+                pointer = f"{struct.upper()}({start} {'+' if distance > 0 else '-'} 0x{abs(distance):X}u)"
+            else:
+                pointer = f"{struct.upper()}({self.printer.any(base).text})"
         if element_number is None and offset not in layouts.fields.get(struct, {}):
             for (array_struct, start), (element_bits, count) in pointers.FIELD_ARRAYS.items():
                 width = element_bits // 8
