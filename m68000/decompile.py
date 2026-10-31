@@ -340,7 +340,9 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     variable_addresses = {name: address for address, (name, _) in known.variables.items()}
 
     def hinted_kind(struct):
-        # &NAME: a pointer to that variable
+        # &NAME: a pointer to that variable; none: an address no structure's, whatever starts there (pointers.OFFSET)
+        if struct == "none":
+            return pointers.OFFSET
         return ("global", variable_addresses[struct[1:]]) if struct.startswith("&") else pointers.link_kind(struct)
     hints = {}
     for (function_name, register), struct in known.param_structs.items():
@@ -358,6 +360,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     typing = pointers.Program(built, flow, found, results_of_calls, signatures.CONTEXT, known.targets, hints,
                               site_hints, scoped_targets, families, global_families)
     fields, accesses = typing.run()
+    joined_writes = join_long_writes(built, fields, accesses, live_after)
     through = [(hit[1], hit[2]) for found_fields in fields.values() for hit in found_fields.values()
                if hit[0] == "global"]
     data_names = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "data"}
@@ -520,7 +523,108 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     print(f"branches:   {flow.conditions_recovered} now compare values instead of flags")
     print(f"gotos:      {gotos}, in {sum(1 for text in texts.values() if 'goto ' in text)} functions")
     print(f"tables:     {len(loaded)} the game loads by name")
+    print(f"longs:      {joined_writes} written to the work RAM a half at a time, as one")
     return 0
+
+
+# the statements join_long_writes() took out: kept, so that no new statement takes the id the notes knew them by
+JOINED = []
+
+
+def split_address(address):
+    """(base, constant) of an address: a constant, or something plus a constant, or something alone"""
+    if isinstance(address, ir.Const):
+        return None, address.value & 0xFFFFFF
+    if isinstance(address, ir.Op) and address.name == "add" and isinstance(address.args[1], ir.Const):
+        return address.args[0], address.args[1].value & 0xFFFFFFFF
+    return address, 0
+
+
+def long_value(low, high):
+    """The 32-bit value whose low half 'low' and high half 'high' are, as the lift writes a long a half at a time
+    (trunc(v, 16), then trunc(v >> 16, 16); fits where the bits above are known 0), or None"""
+    if isinstance(low, ir.Const) and isinstance(high, ir.Const):
+        return ir.Const((high.value & 0xFFFF) << 16 | (low.value & 0xFFFF), 32)
+    if not (isinstance(low, ir.Op) and low.name in ("trunc", "fits") and low.args[0].bits == 32):
+        return None
+    whole = low.args[0]
+    if isinstance(high, ir.Op) and high.name in ("trunc", "fits"):
+        shifted = high.args[0]
+        if isinstance(shifted, ir.Op) and shifted.name == "shr" and shifted.args[0] == whole                 and isinstance(shifted.args[1], ir.Const) and shifted.args[1].value == 16:
+            return whole
+    return None
+
+
+def temp_uses(function, temp):
+    """How many times the function's statements read the temporary 'temp'"""
+    found = 0
+    for block in function.blocks.values():
+        for statement in block.statements + [block.end]:
+            for expression in ir.statement_expressions(statement):
+                found += sum(1 for node in ir.walk(expression) if node == temp)
+    return found
+
+
+def in_work_ram(hit, address):
+    """True when a store goes to the work RAM: a variable there (by its address, or through a pointer to it) or a
+    field of one of the work RAM's structures"""
+    if hit is None:
+        start, constant = split_address(address)
+        return start is None and emit.WORK_RAM_AREA[0] <= constant < emit.WORK_RAM_AREA[1]
+    if hit[0] == "global":
+        start, constant = split_address(hit[1])
+        return start is None and emit.WORK_RAM_AREA[0] <= constant < emit.WORK_RAM_AREA[1]
+    return hit[0] in pointers.STRUCTS and hit[0] not in pointers.ROM_STRUCTS and hit[0] not in pointers.BOARD_STRUCTS
+
+
+def join_long_writes(built, fields, accesses, live_after):
+    """The longs the 68000 writes its low word first (the read-modify-write instructions, a MOVE through -(An)): the
+    lift makes them two 16-bit stores, the low half at the address plus 2, then the high half at the address
+    (m68000/lift.py), as MAME's core does on the bus. In the work RAM no device sees the order of the two, and the
+    two halves are one value of the program's: one 32-bit store (x += speed, not its two halves one by one). The
+    notes of the typing ('fields', 'accesses') and the live registers follow. How many were joined"""
+    joined = 0
+    for entry, function in built.items():
+        found = fields.get(entry, {})
+        after = live_after.get(entry, {})
+        for block in function.blocks.values():
+            statements = block.statements
+            index = 0
+            while index + 1 < len(statements):
+                low, high = statements[index], statements[index + 1]
+                if not (isinstance(low, ir.Store) and isinstance(high, ir.Store) and low.bits == high.bits == 16):
+                    index += 1
+                    continue
+                low_start, low_offset = split_address(low.address)
+                high_start, high_offset = split_address(high.address)
+                value = long_value(low.value, high.value)
+                low_hit, high_hit = found.get(id(low)), found.get(id(high))
+                if value is None or low_start != high_start or (low_offset - high_offset) & 0xFFFFFFFF != 2                         or not in_work_ram(low_hit, low.address) or not in_work_ram(high_hit, high.address):
+                    index += 1
+                    continue
+                store = ir.Store(high.address, value, 32)
+                if hasattr(high, "origin"):
+                    store.origin = high.origin
+                statements[index:index + 2] = [store]
+                JOINED.extend((low, high))
+                bound = statements[index - 1] if index else None
+                if isinstance(value, ir.Temp) and isinstance(bound, ir.SetTemp) and bound.temp == value                         and temp_uses(function, value) == 1:
+                    # (the value the lift bound for the two halves, worked out right before them: in the store)
+                    store.value = bound.value
+                    JOINED.append(statements.pop(index - 1))
+                    index -= 1
+                if high_hit is not None:
+                    found[id(store)] = high_hit[:-1] + (32,) if high_hit[0] == "global" else high_hit
+                    if high_hit[0] != "global" and low_hit is not None:
+                        for gone in ((low_hit[0], low_hit[1], 16), (high_hit[0], high_hit[1], 16)):
+                            if gone in accesses:
+                                accesses.remove(gone)
+                        accesses.append((high_hit[0], high_hit[1], 32))
+                if id(high) in after:
+                    after[id(store)] = after[id(high)]
+                joined += 1
+                index += 1
+    return joined
 
 
 def check_clashes(known):

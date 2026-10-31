@@ -439,7 +439,10 @@ class Memory:
             return None
         ram = work_ram(base)
         board = plain_hardware(base) and base in self.board
-        if not ram and not board and (not program_rom(base) or base + index_limit(rest) * (bits // 8) >= ROM_AREAS[0][1]):
+        reach = index_limit(rest) * (bits // 8)
+        if BOUNDED_INDEXES:
+            reach = min(reach, offset_bound(rest))
+        if not ram and not board and (not program_rom(base) or base + reach >= ROM_AREAS[0][1]):
             return None
         items = self.variables if ram else self.board if board else self.tables
         lvalue = ram or board
@@ -591,6 +594,34 @@ def index_limit(rest):
 
 
 BYTE_INDEXES = False    # whether index_limit() looks at the index (the V60's program never needed it)
+# whether a table's reach is also bounded by the masks and shifts of the offset the code adds ((x & 3) << 2 reaches
+# 12 bytes past the table's start, whatever x's width): the 68000's (m68000/emit.py)
+BOUNDED_INDEXES = False
+
+
+def offset_bound(node):
+    """The largest value the offset 'node' can have, from its masks, shifts, constant factors and widths"""
+    if isinstance(node, ir.Const):
+        return node.value
+    whole = (1 << node.bits) - 1 if node.bits <= 64 else 1 << 64
+    if not isinstance(node, ir.Op):
+        return whole
+    name, args = node.name, node.args
+    if name == "and":
+        return min(offset_bound(arg) for arg in args)
+    if name in ("zext", "fits"):
+        return min(whole, offset_bound(args[0]))
+    if name == "trunc":
+        return min(whole, offset_bound(args[0]))
+    if name == "shl" and isinstance(args[1], ir.Const):
+        return min(whole, offset_bound(args[0]) << args[1].value)
+    if name == "shr" and isinstance(args[1], ir.Const):
+        return offset_bound(args[0]) >> args[1].value
+    if name == "mul" and isinstance(args[1], ir.Const):
+        return min(whole, offset_bound(args[0]) * args[1].value)
+    if name in ("add", "or"):
+        return min(whole, sum(offset_bound(arg) for arg in args))
+    return whole
 # whether a table the code reads from one element before its start (its index starts at 1: "ld hl,$0CF8" for
 # note_lengths at 0CF9) is that table, NAME[i - 1], rather than an unnamed one of its own (TMNT's sound program;
 # z80/emit.py sets it from the profile's SOUND_COUNTED_FROM_ONE)

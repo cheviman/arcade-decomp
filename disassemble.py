@@ -255,7 +255,8 @@ def load_names(path, registers=None):
                                          instructions at WHERE (addresses separated by commas) write in
                                          register RN (a call: what it hands back in RN); "entry" in WHERE is
                                          what RN holds when the function starts; a structure: what it holds
-                                         points at one
+                                         points at one; "none": at no structure, though one starts where it
+                                         points (memory the code works on whatever is there)
         local    FUNCTION WHERE TN NAME  likewise the N-th value the instruction at WHERE reads or works
                                          out on its way (t1: what a read-modify-write instruction read)
         local    FUNCTION WHERE SN NAME  the stack slot N bytes (hexadecimal) below where SP stood when the
@@ -479,7 +480,9 @@ def load_names(path, registers=None):
     for (function, _, _), pointed in names.local_structs.items():
         if pointed.startswith("&") and pointed[1:] in variable_names:
             continue    # (a pointer to a variable: &NAME, the test mode's R20 at its settings)
-        if not structure(pointed) and pointed not in ("rom", "io"):
+        # (none: an address the code works on whatever is there, that points at no structure the C names, though one
+        # starts there: TMNT's clear_objects zeroes the objects from their end down, where the players' slots begin)
+        if not structure(pointed) and pointed not in ("rom", "io", "none"):
             raise SystemExit(f"{path.name}: a local of {function} points at '{pointed}', which is no struct "
                              "(nor 'rom' or 'io')")
     return names

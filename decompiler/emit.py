@@ -58,6 +58,9 @@ def flag_name(flag):
 def register_bits(index):
     return cpu.current.register_bits.get(index, 32)
 PSW_INTERRUPTS = 1 << 18    # the processor status bit that lets interrupts in
+# the registers that hold the object a function of a family runs on when it starts (own_object): the V60 games'
+# object loop keeps it in R20 and R23; a CPU frontend whose games keep it elsewhere sets its own
+OWN_OBJECT_REGISTERS = (20, 23)
 # words of C and of the runtime (game/support.h) a local variable must not be called
 GLOBAL_WORDS = set("""auto break case char const continue default do double else enum extern float for goto if
 inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void
@@ -1432,6 +1435,8 @@ class FunctionWriter:
                 first = re.split(r"->|\.", pieces[0][2])[-1]
                 # (an array's element by its array's name and number: time_difficulty[2], time_difficulty_2)
                 first = re.sub(r"\[(\w+)\]", r"_\1", first)
+                # (or written NAME(index), memory.RAM_ELEMENT's: turtle_inputs(0), turtle_inputs_0)
+                first = re.sub(r"\((\w+)\)$", r"_\1", first)
                 temp = self.fresh(f"{first}_{ {8: 'byte', 16: 'halfword', 32: 'long'}[statement.bits] }")
                 lines.append(f"{temp} = {text};")
                 text = temp
@@ -1601,9 +1606,10 @@ class FunctionWriter:
 
     def own_object(self):
         """{id(statement): registers that point at the object the function's code runs on, before it}: the
-        object loop's R20 and R23 when the function starts, and copies of them."""
+        object loop's (OWN_OBJECT_REGISTERS: R20 and R23 on the V60) when the function starts, and copies of
+        them."""
         blocks = self.function.blocks
-        start = {self.function.entry: frozenset((20, 23))}
+        start = {self.function.entry: frozenset(OWN_OBJECT_REGISTERS)}
         pending = [self.function.entry]
         before = {}
         while pending:

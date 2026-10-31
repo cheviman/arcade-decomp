@@ -149,6 +149,10 @@ BASES = {}                     # name -> address of the program's data, for "STR
 # (STRUCT(p + 0xAu)->field, emit.py), never by an index, which would run the other way. Arrays of values
 # (ELEMENTS), fields that are arrays and tables of records are not laid out that way (Layouts says so)
 REVERSED = False
+# A family whose name starts with another's and "_" (enemy_walk, enemy) is a kind of that one: its view holds the
+# fields of the families above it too, unless one of its own takes their bytes (symbols.txt names each field once,
+# in the family that has it in common). Off, every family's view holds only its own scoped lines.
+NESTED_FAMILIES = False
 
 
 def link_kind(link, offset=0):
@@ -1459,6 +1463,8 @@ class Layouts:
             for (struct, family), found in names.scoped.items():
                 self.scoped.setdefault(struct, {})[family] = {offset: (name, *self.TYPES[kind])
                                                               for offset, (name, kind) in found.items()}
+        if NESTED_FAMILIES:
+            self.inherit_fields()
         for struct in set(counts) | set(declared):
             fields, names_, signed = {}, {}, {}
             for offset, (name, bits, is_signed) in declared.get(struct, {}).items():
@@ -1494,6 +1500,32 @@ class Layouts:
         for struct, families in self.scoped.items():
             taken = set(self.names.get(struct, {}).values()) | macros
             self.views[struct] = {family: family if family not in taken else f"{family}_view" for family in families}
+
+    def inherit_fields(self):
+        """NESTED_FAMILIES: each family's view takes the fields (and their overlays) of the families its name
+        is a kind of (enemy_walk takes enemy's), the nearest first, but for those whose bytes a field of its
+        own, or of a nearer family, already holds."""
+        for struct, families in self.scoped.items():
+            if any(key[0] == struct for key in SCOPED_ARRAYS):
+                raise ValueError(f"{struct}: nested families with a field that is an array")
+            own = {family: dict(fields) for family, fields in families.items()}
+            own_overlays = {family: dict(found) for family, found in self.scoped_overlays.get(struct, {}).items()}
+            for family in families:
+                parents = sorted((other for other in families if family.startswith(other + "_")),
+                                 key=len, reverse=True)
+                fields = dict(own[family])
+                overlays = dict(own_overlays.get(family, {}))
+                for parent in parents:
+                    taken = {offset + byte for offset, (_, bits, _) in fields.items() for byte in range(bits // 8)}
+                    for offset, found in own[parent].items():
+                        if not any(offset + byte in taken for byte in range(found[1] // 8)):
+                            fields[offset] = found
+                            for (start, bits), overlay in own_overlays.get(parent, {}).items():
+                                if start == offset:
+                                    overlays[(start, bits)] = overlay
+                families[family] = fields
+                if overlays:
+                    self.scoped_overlays.setdefault(struct, {})[family] = overlays
 
     @staticmethod
     def array_count(struct, offset):

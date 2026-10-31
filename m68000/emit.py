@@ -81,10 +81,17 @@ def use_memory_map(names):
     memory.PLAIN_HARDWARE = ()
     memory.BUS_ONLY = []
     memory.BYTE_INDEXES = True
-    memory.NAMED_BASES = {}
+    memory.BOUNDED_INDEXES = True
+    # work RAM addresses with a name of their own (the profile's NAMED_BASES, none by default): the structures at a
+    # fixed address the code reaches by name (LAYER(WORKING_LAYER)->x rather than LAYER(LAYER_ADDRESS(0))->x)
+    memory.NAMED_BASES = dict(getattr(game_profile, "NAMED_BASES", {}))
     memory.RAM_ELEMENT = ram_element
     memory.NOTES = dict(getattr(game_profile, "NOTES", memory.NOTES))
     emit.REGIONS = list(getattr(game_profile, "REGIONS", []))
+    # the address register the game's handlers find their object in (the profile's OBJECT_REGISTER, TMNT's A0):
+    # a function of a family reads that object's fields by the family's names (symbols.txt scoped lines)
+    own = getattr(game_profile, "OBJECT_REGISTER", None)
+    emit.OWN_OBJECT_REGISTERS = (8 + int(own[1]),) if own and own[0] in "Aa" else ()
     emit.BOARD_MEMORIES = {WORK_RAM_AREA[0]} | {start for start, _, _ in emit.REGIONS}
     pointers.STRUCTS = dict(names.structs)
     pointers.PLAYERS = (0, 0, 0)
@@ -93,14 +100,20 @@ def use_memory_map(names):
     pointers.OBJECT_REGISTERS = ()
     pointers.HANDLER_FIELD = None
     pointers.WORK_RAM = WORK_RAM_AREA
+    # where the board's devices answer (the profile's DEVICE_AREAS, none by default): a pointer the code works out
+    # from an address there (the tile RAM's place a text is drawn at) reaches the device, through the bus by name
+    # (io_write8(p, value)), not memory of the program's
+    pointers.DEVICE_AREAS = tuple(getattr(game_profile, "DEVICE_AREAS", ()))
     pointers.ADDRESS_MASK = 0xFFFFFF
     pointers.POINTER_BITS = 32
-    pointers.PAGE_LINKS = False
+    # (a data register that holds an address takes a link of 16 bits into its low word: move.w (A1)+, D6)
+    pointers.PAGE_LINKS = True
     pointers.ROM_DATA = (memory.ROM_NAMES_FROM, PROGRAM_AREA[1])
     # the game's structures that lie one after another at a fixed address (the profile's STRUCT_ARRAYS: name ->
     # (first, count)), and the ones whose fields the code also reaches by their own address (INSTANCES)
     pointers.ARRAYS = dict(getattr(game_profile, "STRUCT_ARRAYS", {}))
-    pointers.INSTANCES = {}
+    pointers.INSTANCES = {first + number * names.structs[struct]: (struct, names.structs[struct])
+                          for struct, (first, count) in pointers.ARRAYS.items() for number in range(count)}
     pointers.VARIABLE_BLOCKS = {}
     pointers.BASE_KINDS = {}
     pointers.PAGE_LINK_KINDS = {}
@@ -122,6 +135,8 @@ def use_memory_map(names):
     pointers.PAGED = False
     # the work RAM and the program's data run the other way round in the host's memory: so do the structures
     pointers.REVERSED = True
+    # (the profile's NESTED_FAMILIES: enemy_walk's view takes the fields enemy names, decompiler/pointers.py)
+    pointers.NESTED_FAMILIES = getattr(game_profile, "NESTED_FAMILIES", False)
 
 
 class Memory(memory.Memory):
