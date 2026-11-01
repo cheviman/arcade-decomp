@@ -2,7 +2,7 @@
  *    Name:        emu.h
  *    Description: minimal stand-in for MAME's emu.h, enough to build MAME's V60 core and disassembler, and
  *                 its Z80 disassembler, alone
- *    Version:     0.2.2
+ *    Version:     0.2.3
  *    Created:     11-10-2026
  *    Modified:    01-11-2026
  *    Author:      Sebastian Toyos
@@ -136,6 +136,12 @@ void stream_format(std::ostream &stream, const char *format, Args... args)
 	char buffer[256];
 	std::snprintf(buffer, sizeof(buffer), format, format_argument(args)...);
 	stream << buffer;
+}
+
+// A text with nothing to put in it, as it is
+inline void stream_format(std::ostream &stream, const char *text)
+{
+	stream << text;
 }
 
 class disasm_interface
