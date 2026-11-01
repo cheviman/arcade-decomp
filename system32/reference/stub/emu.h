@@ -2,9 +2,9 @@
  *    Name:        emu.h
  *    Description: minimal stand-in for MAME's emu.h, enough to build MAME's V60 core and disassembler, and
  *                 its Z80 disassembler, alone
- *    Version:     0.2.1
+ *    Version:     0.2.2
  *    Created:     11-10-2026
- *    Modified:    22-10-2026
+ *    Modified:    01-11-2026
  *    Author:      Sebastian Toyos
  *
  *    Only what v60.cpp, v60d.cpp, their .hxx files and z80dasm.cpp use. Memory goes through function
@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cassert>
+#include <cmath>    // (the V60's float conversions: roundf, floorf, ceilf, truncf)
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +65,12 @@ std::string string_format(const char *format, Args... args)
 	char buffer[512];
 	std::snprintf(buffer, sizeof(buffer), format, args...);
 	return buffer;
+}
+
+// A text with nothing to put in it, as it is
+inline std::string string_format(const char *text)
+{
+	return text;
 }
 
 // Arithmetic helpers from MAME's eminline.h and coretmpl.h
