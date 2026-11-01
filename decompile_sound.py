@@ -3,7 +3,7 @@ Name:        decompile_sound.py
 Description: decompiles the Z80 sound program into readable C, one C function per original function
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    29-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile_sound.py [--check] [--checks] [--out DIR] [--timing FILE]
@@ -53,6 +53,7 @@ from decompile import source_files  # noqa: E402
 from decompile import write_sources  # noqa: E402
 from decompile import write_variables  # noqa: E402
 from decompile import replaced_functions  # noqa: E402
+from decompile import name_params_by_use  # noqa: E402
 from decompiler import cleanup  # noqa: E402
 from decompiler.gotos import GotoError  # noqa: E402
 from decompiler import cprint  # noqa: E402
@@ -266,13 +267,35 @@ def write_c(program, out_dir, variables_path=None):
     whole = set()
     live_after = {}
     live_at_start = {}
+    # (the profile's SOUND_TABLE_REGISTERS, off by default: a load through a register the same block set to a table's
+    # address plus an index reads that table, expressions.table_registers; the tables are those sound_symbols.txt
+    # names, and the bases the code indexes from up to SOUND_NAMES_BEFORE_TABLES bytes before one)
+    table_registers = getattr(game_profile, "SOUND_TABLE_REGISTERS", False)
+    tables = set(disassemble.load_names(SYMBOLS, REGISTERS).tables) if table_registers else set()
+    pairs.SUMS = table_registers    # (the two bytes of an entry read so are one word: z80/pairs.py)
+    names_before = getattr(game_profile, "SOUND_NAMES_BEFORE_TABLES", 0)
+    # (the profile's SOUND_CONSTANT_ADDRESSES, off by default: an access through a register that holds the same address
+    # of the RAM on every way to it reads that address, expressions.constant_addresses: "ld hl,VARIABLE; dec (hl)" and
+    # the reads of (hl) in the blocks after it no longer keep HL set for the C)
+    constant_addresses = getattr(game_profile, "SOUND_CONSTANT_ADDRESSES", False)
+    ram = getattr(game_profile, "SOUND_RAM_AREA", emit.SHARED_RAM)
+
+    def is_variable(value):
+        return ram[0] <= value < ram[1]
+
+    def is_table(value):
+        parts = memory.based(value)
+        return parts is not None and any(parts[0] + distance in tables for distance in range(names_before + 1))
     for entry, function in built.items():
         expressions.drop_repacks(function, flow)
         after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
         expressions.tidy(function, flow, after, whole)
         results_of_calls = call_results(function, found, flow)
         if expressions.propagate_constants(function, results_of_calls, signatures.CONTEXT) \
-                | expressions.fold_kept_constants(function, results_of_calls, signatures.CONTEXT):
+                | expressions.fold_kept_constants(function, results_of_calls, signatures.CONTEXT) \
+                | (expressions.table_registers(function, flow, is_table) if table_registers else 0) \
+                | (expressions.constant_addresses(function, results_of_calls, signatures.CONTEXT, is_variable)
+                   if constant_addresses else 0):
             after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
             expressions.tidy(function, flow, after, whole)
         if expressions.inline_registers(function, flow, after, whole):
@@ -293,7 +316,10 @@ def write_c(program, out_dir, variables_path=None):
     # taken for one of them
     macros = {name for name, _ in list(known.variables.values()) + list(known.tables.values())
               + list(known.hardware.values())} | set(known.ports.values())
-    clashes = sorted({name for name, _ in known.fields.values()} & macros)
+    # (the families' own names of a structure's fields too: scoped lines)
+    clashes = sorted(({name for name, _ in known.fields.values()}
+                      | {name for (struct, _), found in known.scoped.items() if struct != "global"
+                         for name, _ in found.values()}) & macros)
     if clashes:
         raise SystemExit("sound_symbols.txt: fields named like a variable, table, register or port: "
                          + ", ".join(clashes))
@@ -303,26 +329,30 @@ def write_c(program, out_dir, variables_path=None):
     emit.use_memory_map(known, arrays)
     entries_by_name = {name: entry for entry, name in names.items()}
     hints = {}
+    # (STRUCT, or STRUCT.FAMILY: a structure what is read through it reads as that family's code reads its own)
     for (function, register), struct in known.param_structs.items():
         if function in entries_by_name:
-            hints.setdefault(entries_by_name[function], {})[register] = (struct, 0)
+            hints.setdefault(entries_by_name[function], {})[register] = pointers.link_kind(struct)
     site_hints = {}
     for (function, spot, value), struct in known.local_structs.items():
         if not value.startswith("r"):
             continue    # (a temporary or a stack slot: the structure is for registers only)
         register = int(value[1:])
         if spot == "entry" and function in entries_by_name:
-            hints.setdefault(entries_by_name[function], {})[register] = (struct, 0)
+            hints.setdefault(entries_by_name[function], {})[register] = pointers.link_kind(struct)
         elif spot != "entry":
-            site_hints[(spot, register)] = (struct, 0)
+            site_hints[(spot, register)] = pointers.link_kind(struct)
     typing = pointers.Program(built, flow, found,
                               {entry: call_results(function, found, flow) for entry, function in built.items()},
                               signatures.CONTEXT, known.targets, hints, site_hints)
     fields, accesses = typing.run()
     through = [(hit[1], hit[2]) for found_fields in fields.values() for hit in found_fields.values()
                if hit[0] == "global"]
+    # (a table of code addresses the code indexes from before its first entry, a jumps line with first=, is named by its
+    # table line at that entry: the label the jumps line puts before it would be a second table of that name)
+    table_names = {name for name, _ in known.tables.values()}
     data_names = {address: symbol.name for address, symbol in program.symbols.items()
-                  if symbol.kind in ("data", "jumps")}
+                  if symbol.kind in ("data", "jumps") and (symbol.name not in table_names or address in known.tables)}
     named = memory.Memory(known, memory.accesses_of(built.values()) + through, data_names)
     cprint.PORT_NAMES = dict(known.ports)
 
@@ -334,6 +364,7 @@ def write_c(program, out_dir, variables_path=None):
     emitter.data_labels = {address: name for address, name in data_names.items() if address not in named.tables}
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}
     emitter.comments = dict(known.comments)
+    emitter.constants = dict(known.constants)    # (sound_symbols.txt's constant lines: a number a function uses, by name)
     emitter.replaced = replaced_functions([(ROOT / "runtime" / "sound_replaced.txt", "BOARD_ORIGINAL")])
     entries_by_name = {name: entry for entry, name in names.items()}
     unknown = sorted({function for function, _ in known.params if function not in entries_by_name}
@@ -364,8 +395,19 @@ def write_c(program, out_dir, variables_path=None):
                 structure.split_loop_entries(way, notes)
                 joined[entry].append(way)
         structure.split_loop_entries(function, notes)
+    if getattr(game_profile, "SOUND_LOOP_COUNTERS", False):
+        # (the profile's SOUND_LOOP_COUNTERS, off by default: the variable a DJNZ counts down is the loop's count)
+        from decompiler import emit as decompiler_emit
+        decompiler_emit.COUNTER_SITES = frozenset(address for body in program.bodies.values()
+                                                  for address, instruction in body.items()
+                                                  if instruction.mnemonic == "djnz")
     writers = {entry: emit.SoundWriter(emitter, function, live_after[entry], fields[entry], live_at_start[entry])
                for entry, function in built.items()}
+    if emit.emit.PARAMS_BY_USE:
+        # (the profile's SOUND_PARAMS_BY_USE, z80/emit.py: a parameter or result sound_symbols.txt does not name is
+        # called for what the function does with it)
+        name_params_by_use(emitter, writers, lambda entry: emit.SoundWriter(emitter, built[entry], live_after[entry],
+                                                                             fields[entry], live_at_start[entry]))
     texts = {}
     problems = []
     for entry, writer in writers.items():
@@ -421,6 +463,10 @@ def write_c(program, out_dir, variables_path=None):
         + ("/* the board's I/O ports the program uses */\n" + "\n".join(ports) + "\n\n" if ports else "")
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM sound_symbols.txt labels */\n"
         + "\n".join(f"#define {name}_ADDRESS 0x{address:04X}u" for address, name in sorted(emitter.data_labels.items()))
+        + ("\n\n/* numbers the code uses, by name (sound_symbols.txt's constant lines) */\n"
+           + "\n".join(f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
+                                                                                in emitter.constants.items()}))
+           if emitter.constants else "")
         + "\n\n/* the sound program's structures in the shared RAM */\n"
         + "\n".join(emitter.layouts.declarations()) + "\n\n"
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")

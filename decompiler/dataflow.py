@@ -3,7 +3,7 @@ Name:        dataflow.py
 Description: what each function reads, writes and hands back in registers and flags, across the program
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    23-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Variables are the parts of the V60 registers (("r", n, part): part 0 is bits 0-7, part 1 bits 8-15,
@@ -26,7 +26,9 @@ leave a value it hands back as it found it reads that value from its caller.
 
 A call reads what its callee reads for itself (Summary.base), and, for each value it hands back that the
 caller reads afterwards, what that value is made of (Summary.passes): a caller that does not read a value
-afterwards does not hand the callee its own copy of it, even when the callee may leave it as it was.
+afterwards does not hand the callee its own copy of it, even when the callee may leave it as it was. With
+PASSES_BY_PART, what it is made of is known for each part of a register (Summary.part_passes): a caller that
+reads only the low byte the callee works out does not hand it the high word the callee only passes on.
 
 Many functions answer in R0 whether they did their job (allocating an object, say) and write their other
 results only when they did; their callers test R0 right away ("tb R0", or "test.b R0" and a branch on
@@ -49,6 +51,21 @@ HANDLER_SLOTS = ()
 # instead of every function in every round: the same summaries, sooner (the 68000's 2000 functions; the V60's
 # games keep the rounds: False)
 WORKLIST = False
+# whether what a function reads to hand back a register is known part by part (Summary.part_passes): a caller that
+# reads only the low byte of what a call hands back does not take the call to read what the callee only passes on
+# in the register's other parts (TMNT's enemy_face_object works out D7's low byte and hands back its high word as
+# it found it: a caller that reads only the byte reads nothing of the word). The profile's PASSES_BY_PART; the V60's
+# and the Z80's programs keep the passes by register (False)
+PASSES_BY_PART = False
+# whether a register written whole with an operation that leaves some of its parts as they were ("bset #7, D7", "or.l
+# #$80, D7", "andi.l #$FFFFFF00, D7": the value is the register with a constant or'ed, and'ed or xor'ed) writes only
+# the other parts (Program.unchanged): TMNT's enemy_facing_bits sets bits of D7's low byte and leaves its high word, so
+# a caller that reads the high word after it reads its own. The profile's UNCHANGED_PARTS; False for the V60's and
+# the Z80's programs
+UNCHANGED_PARTS = False
+# whether the outputs, once they settle, are made again from what the callers read with everything known (narrow):
+# the profile's NARROW_OUTPUTS; False for the V60's and the Z80's programs
+NARROW_OUTPUTS = False
 
 
 def handler_slot():
@@ -205,6 +222,55 @@ def partial_write(statement):
     return {part for part, _ in PARTS}, value, 0
 
 
+def unchanged_parts(functions):
+    """{id(SetReg): the parts of its register it leaves as they were} (UNCHANGED_PARTS): a register written whole
+    with itself or'ed, xor'ed or and'ed with a constant, directly or through the temporaries its instruction binds
+    just before ("bset #7, D7": result = D7 | 0x80, then D7 = result), leaves the parts where the constant changes no
+    bit"""
+    found = {}
+    for function in functions.values():
+        for block in function.blocks.values():
+            bound = {}
+            for statement in block.statements:
+                if isinstance(statement, ir.SetTemp):
+                    bound[statement.temp] = statement.value
+                    continue
+                if isinstance(statement, ir.SetReg) and statement.value.bits == 32:
+                    parts = identity_parts(statement.index, statement.value, bound)
+                    if parts:
+                        found[id(statement)] = (statement, frozenset(parts))
+                if isinstance(statement, (ir.SetReg, ir.Call, ir.Effect)):
+                    bound = {}    # (a temporary only reads the registers as they were before its instruction ends)
+    return found
+
+
+def identity_parts(index, value, bound):
+    """The parts of register 'index' that 'value' (32 bits) holds as the register held them, for value = the register
+    or'ed, xor'ed or and'ed with a constant"""
+    def resolve(node):
+        for _ in range(4):
+            if isinstance(node, ir.Temp) and node in bound:
+                node = bound[node]
+            else:
+                break
+        return node
+    value = resolve(value)
+    if not (isinstance(value, ir.Op) and value.name in ("or", "xor", "and") and value.bits == 32
+            and len(value.args) == 2):
+        return set()
+    first, second = (resolve(arg) for arg in value.args)
+    if isinstance(first, ir.Const):
+        first, second = second, first
+    if isinstance(second, ir.Op) and second.name == "not" and isinstance(second.args[0], ir.Const):
+        second = ir.Const(~second.args[0].value & FULL, 32)
+    if not (isinstance(first, ir.Reg) and first.index == index and first.bits == 32 and isinstance(second, ir.Const)):
+        return set()
+    constant = second.value & FULL
+    if value.name == "and":
+        return {part for part, bits in PARTS if constant & bits == bits}
+    return {part for part, bits in PARTS if not constant & bits}
+
+
 # ---- R0 zero tests ----
 
 def constant(expression, temps):
@@ -341,13 +407,17 @@ class Summary:
         self.always_when = {}
         self.base = set()      # what it reads with nothing live where it ends
         self.passes = {}       # ("r", n) or ("f", name) it hands back -> what it reads for that value
+        # ("r", n, part) it hands back -> what it reads for that part (PASSES_BY_PART), where the register's other
+        # parts are handed back too (otherwise the register's passes say it)
+        self.part_passes = {}
 
     def key(self):
         outcomes = tuple(sorted((mask, zero, frozenset(value) if value is not None else None)
                                 for (mask, zero), value in self.always_when.items()))
         passes = tuple(sorted((key, frozenset(value)) for key, value in self.passes.items()))
+        part_passes = tuple(sorted((key, frozenset(value)) for key, value in self.part_passes.items()))
         return (frozenset(self.reads), frozenset(self.writes), frozenset(self.always), outcomes,
-                frozenset(self.base), passes)
+                frozenset(self.base), passes, part_passes)
 
 
 class Program:
@@ -366,6 +436,19 @@ class Program:
         # live where each function ends: what it hands back to its callers (solve)
         self.exit_live = {}
         self.declared = {}    # entry -> register numbers a function nothing calls hands back (symbols.txt)
+        # id(SetReg) -> (it, the parts of its register it leaves as they were) (UNCHANGED_PARTS; the statement is
+        # kept so that no new one takes its id)
+        self.unchanged = unchanged_parts(functions) if UNCHANGED_PARTS else {}
+
+    def left_parts(self, statement):
+        """The parts of its register a SetReg leaves as they were (UNCHANGED_PARTS)"""
+        found = self.unchanged.get(id(statement))
+        return found[1] if found is not None and found[0] is statement else frozenset()
+
+    def written_parts(self, statement):
+        """The parts of its register a SetReg writes: partial_write's, without those it leaves as they were"""
+        parts, _, _ = partial_write(statement)
+        return parts - self.left_parts(statement) if self.unchanged else parts
 
     def code_pointer_slots(self):
         """For each memory slot calls read their target from (by displacement): the functions the program
@@ -441,7 +524,9 @@ class Program:
                 continue
             reads |= summary.base
             for variable in live_after & summary.writes:
-                found = summary.passes.get((variable[0], variable[1]))
+                found = summary.part_passes.get(variable) if PASSES_BY_PART else None
+                if found is None:
+                    found = summary.passes.get((variable[0], variable[1]))
                 # a value not handed back yet (the outputs still grow): everything it may read
                 reads |= summary.reads if found is None else found
         return reads
@@ -481,6 +566,8 @@ class Program:
                 demanded(statement.value, FULL, live, temps)
                 return set(), set()
             parts, value, _ = partial_write(statement)
+            if self.unchanged:
+                parts = parts - self.left_parts(statement)
             written = {("r", index, part) for part in parts}
             needed = parts_mask(live & written, index)
             live -= written
@@ -778,6 +865,13 @@ class Program:
         if summary.base != summary.reads:
             for key in {(variable[0], variable[1]) for variable in handed}:
                 summary.passes[key] = entry_reads(frozenset(v for v in handed if (v[0], v[1]) == key))
+            if PASSES_BY_PART:
+                for key, found in summary.passes.items():
+                    parts = sorted(v for v in handed if v[0] == "r" and (v[0], v[1]) == key)
+                    if len(parts) < 2 or found <= summary.base:
+                        continue    # (one part handed back, or nothing read for it beyond what it reads anyway)
+                    for variable in parts:
+                        summary.part_passes[variable] = entry_reads(frozenset((variable,)))
         return summary
 
     def solve_summaries(self):
@@ -849,15 +943,41 @@ class Program:
     def solve(self):
         """Summaries and outputs together. What a function hands back is live where it returns, so a
         function reads what it may hand back unchanged ("and.b #FF, R0" leaves R0 as it was: the caller's
-        R0 goes through it). Outputs only grow, until they settle."""
+        R0 goes through it). Outputs only grow, until they settle; with NARROW_OUTPUTS they then shrink to what
+        the callers read once everything is known (narrow)."""
+        narrowed = False
         while True:
             self.solve_summaries()
             outputs = self.outputs()
             if all(outputs[entry] <= self.exit_live.get(entry, frozenset()) for entry in self.functions):
+                if NARROW_OUTPUTS and not narrowed:
+                    narrowed = True
+                    if self.narrow(outputs):
+                        continue    # (a narrower round that needed more: they grow again from there, and stay)
                 self.context_passes()
                 return
             for entry in self.functions:
                 self.exit_live[entry] = frozenset(self.exit_live.get(entry, frozenset()) | outputs[entry])
+
+    def narrow(self, outputs, rounds=30):
+        """While the outputs grow, a call whose callee does not hand back a value yet reads everything the callee
+        may read (target_reads), and what that makes live after other calls stays among their outputs once they
+        settle: TMNT's queue_sound kept A6 among them, which no caller reads after it. The outputs are taken for
+        what each function hands back, and the summaries solved again from nothing, as long as that hands back
+        less. Returns True if a round needed more than it had (solve goes on growing from there)"""
+        for _ in range(rounds):
+            narrower = {entry: frozenset(outputs[entry]) for entry in self.functions}
+            if all(narrower[entry] == self.exit_live.get(entry, frozenset()) for entry in self.functions):
+                return False
+            self.exit_live = narrower
+            self.summaries = {entry: Summary() for entry in self.functions}
+            self.solve_summaries()
+            outputs = self.outputs()
+            if not all(outputs[entry] <= self.exit_live[entry] for entry in self.functions):
+                for entry in self.functions:
+                    self.exit_live[entry] = frozenset(self.exit_live[entry] | outputs[entry])
+                return True
+        return False
 
     def context_passes(self):
         """What each function reads for the context registers it writes, kept as for a value it hands back.

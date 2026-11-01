@@ -52,6 +52,11 @@ SHIFT_KINDS = ("asl", "asr", "lsl", "lsr", "rol", "ror", "roxl", "roxr")
 CODE_BYTES = set()
 PIECE_STARTS = []
 BEFORE_TABLES = 0x20
+# a table read with a signed index from a few bytes into a table or piece of data with a name ("(1,A1,D0.w)") reads as
+# that many bytes into it by its name, TABLE8(fire_blocks, 0x1u + index) (the profile's NAMED_TABLE_OFFSETS; off, it
+# stays a read through the bus)
+LOADED_INSIDE = getattr(game_profile, "NAMED_TABLE_OFFSETS", False)
+INSIDE_DISTANCE = 0x40
 
 
 def ram_element(name, index, bits):
@@ -93,6 +98,21 @@ def use_memory_map(names):
     own = getattr(game_profile, "OBJECT_REGISTER", None)
     emit.OWN_OBJECT_REGISTERS = (8 + int(own[1]),) if own and own[0] in "Aa" else ()
     emit.BOARD_MEMORIES = {WORK_RAM_AREA[0]} | {start for start, _, _ in emit.REGIONS}
+    # (the profile's NUMBERS_BY_FIELD, off by default: a constant stored into a field symbols.txt types as a number,
+    # or compared with one, is a number, never an address of the program's: decompiler/emit.py)
+    emit.NUMBERS_BY_FIELD = getattr(game_profile, "NUMBERS_BY_FIELD", False)
+    # (the profile's PARAMS_BY_USE, off by default: a parameter or result symbols.txt does not name takes the name of
+    # the structure read through it, or the one the functions it only passes it on to agree on: decompiler/emit.py)
+    emit.PARAMS_BY_USE = getattr(game_profile, "PARAMS_BY_USE", False)
+    # (the profile's NAMES_BY_STORES, off by default: a variable stored into one field only takes its name)
+    emit.NAMES_BY_STORES = getattr(game_profile, "NAMES_BY_STORES", False)
+    # (the profile's PARAMS_FROM_CALLERS, off by default: a parameter takes the name every caller's variable has)
+    emit.PARAMS_FROM_CALLERS = getattr(game_profile, "PARAMS_FROM_CALLERS", False)
+    # (the profile's NAMES_BY_COMPARISONS, off by default: a variable compared with one field only takes its name)
+    emit.NAMES_BY_COMPARISONS = getattr(game_profile, "NAMES_BY_COMPARISONS", False)
+    # (the profile's INSTANCE_FAMILIES_BY_FUNCTION, none by default: the family a structure at a fixed address is in
+    # the functions whose names start so)
+    emit.INSTANCE_FAMILIES_BY_FUNCTION = dict(getattr(game_profile, "INSTANCE_FAMILIES_BY_FUNCTION", {}))
     pointers.STRUCTS = dict(names.structs)
     pointers.PLAYERS = (0, 0, 0)
     pointers.VARIABLES = None
@@ -114,6 +134,8 @@ def use_memory_map(names):
     pointers.ARRAYS = dict(getattr(game_profile, "STRUCT_ARRAYS", {}))
     pointers.INSTANCES = {first + number * names.structs[struct]: (struct, names.structs[struct])
                           for struct, (first, count) in pointers.ARRAYS.items() for number in range(count)}
+    # (the profile's INSTANCE_FAMILIES, none by default: the family a structure at a fixed address always is)
+    pointers.INSTANCE_FAMILIES = dict(getattr(game_profile, "INSTANCE_FAMILIES", {}))
     pointers.VARIABLE_BLOCKS = {}
     pointers.BASE_KINDS = {}
     pointers.PAGE_LINK_KINDS = {}
@@ -126,6 +148,8 @@ def use_memory_map(names):
     pointers.RUNS = set(names.structs)
     pointers.ELEMENTS = dict(names.arrays)
     pointers.RECORD_TABLES = dict(names.record_tables)
+    pointers.RECORD_COUNTS = {address: names.counts[address] for address in names.record_tables
+                              if address in getattr(names, "counts", {})}
     pointers.FIELD_ARRAYS = {key: (int(names.fields[key][1][1:]), count) for key, count in names.field_arrays.items()}
     pointers.SCOPED_ARRAYS = {(struct, family, offset): (int(names.scoped[(struct, family)][offset][1][1:]), count)
                               for (struct, family, offset), count in names.scoped_arrays.items()}
@@ -135,6 +159,17 @@ def use_memory_map(names):
     pointers.PAGED = False
     # the work RAM and the program's data run the other way round in the host's memory: so do the structures
     pointers.REVERSED = True
+    # (the profile's RECORD_TABLES, off by default: tables of records the loader turns a whole record at a time,
+    # name[i].field: m68000/decompile.py's registry gives each one the record's size)
+    pointers.RECORDS_LOADED_WHOLE = getattr(game_profile, "RECORD_TABLES", False)
+    # (the profile's ELEMENT_READS, off by default: the values a pointer walks, symbols.txt elements lines, read one at a
+    # time at their address, NAME(p), as the structures' copies run)
+    pointers.ELEMENT_READS = getattr(game_profile, "ELEMENT_READS", False)
+    if pointers.ELEMENT_READS:
+        # (what a value of one is called where a local holds it: the elements' name, text, not "element")
+        for struct, kind in names.arrays.items():
+            if names.fields.get((struct, 0), ("",))[0] == "element":
+                names.fields[(struct, 0)] = (struct, kind)
     # (the profile's NESTED_FAMILIES: enemy_walk's view takes the fields enemy names, decompiler/pointers.py)
     pointers.NESTED_FAMILIES = getattr(game_profile, "NESTED_FAMILIES", False)
 
@@ -180,6 +215,11 @@ class Memory(memory.Memory):
             name = self.tables[parts[0]].name if parts[0] in self.tables else self.data_names.get(parts[0])
             if name is not None:
                 return f"TABLE{bits}({name}, {index_text(parts[1])})", False, False
+            # (a few bytes into a table or a piece of data with a name: the code adds a field's offset to its address,
+            # "(1,A1,D0.w)", the bytes into it by its name)
+            inner = self.named_before(parts[0])
+            if inner is not None and LOADED_INSIDE:
+                return f"TABLE{bits}({inner[0]}, 0x{inner[1]:X}u + {index_text(parts[1])})", False, False
         if parts is not None and parts[0] in self.shifted:
             start, distance = self.shifted[parts[0]]
             item = self.tables.get(start)
@@ -189,7 +229,36 @@ class Memory(memory.Memory):
                 return f"{item.name}[{index_text(index)} - {distance // size}u]", item.signed, False
             if item is not None:
                 return f"TABLE{bits}({item.name}, {index_text(parts[1])} - 0x{distance:X}u)", False, False
-        return super().access(address, bits, index_text, indexed)
+        found = super().access(address, bits, index_text, indexed)
+        if found is None and parts is not None and LOADED_INSIDE and memory.program_rom(parts[0]) \
+                and parts[0] >= memory.ROM_NAMES_FROM and parts[0] not in CODE_BYTES:
+            # (a table with a name read at an index the analysis cannot bound: by its name and the bytes into it)
+            name = self.tables[parts[0]].name if parts[0] in self.tables else self.data_names.get(parts[0])
+            if name is not None:
+                return f"TABLE{bits}({name}, {index_text(parts[1])})", False, False
+        return found
+
+    def named_before(self, address):
+        """(name, bytes into it) of the table or piece of data with a name that 'address' is a few bytes into, in the
+        same piece of the assets, or None"""
+        if not memory.program_rom(address) or address < memory.ROM_NAMES_FROM:
+            return None
+        if not hasattr(self, "_named_starts"):
+            names = dict(self.data_names)
+            names.update({start: item.name for start, item in self.tables.items()})
+            self._named = names
+            self._named_starts = sorted(names)
+        import bisect
+        position = bisect.bisect_right(self._named_starts, address) - 1
+        if position < 0:
+            return None
+        start = self._named_starts[position]
+        if not 0 < address - start <= INSIDE_DISTANCE:
+            return None
+        piece = bisect.bisect_right(PIECE_STARTS, address) - 1
+        if piece >= 0 and PIECE_STARTS[piece] > start:
+            return None    # (another piece starts between them)
+        return self._named[start], address - start
 
     def indexed_text(self, items, item, index):
         if memory.RAM_ELEMENT is not None and items is not self.tables and not item.indexed:

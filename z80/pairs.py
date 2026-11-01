@@ -509,9 +509,37 @@ def next_address(first, second):
     if isinstance(second, ir.Op) and second.name == "add" and second.args[0] == first and is_const(second.args[1], 1):
         return True
     # (ix+n) and (ix+n+1)
-    return isinstance(first, ir.Op) and first.name == "add" and isinstance(second, ir.Op) and second.name == "add" \
-        and first.args[0] == second.args[0] and isinstance(first.args[1], ir.Const) \
-        and isinstance(second.args[1], ir.Const) and second.args[1].value == (first.args[1].value + 1) & 0xFFFF
+    if isinstance(first, ir.Op) and first.name == "add" and isinstance(second, ir.Op) and second.name == "add" \
+            and first.args[0] == second.args[0] and isinstance(first.args[1], ir.Const) \
+            and isinstance(second.args[1], ir.Const) and second.args[1].value == (first.args[1].value + 1) & 0xFFFF:
+        return True
+    if SUMS:
+        # a table's address plus an index, and one more (expressions.table_registers): the same terms, whatever
+        # their order, and constants one apart
+        first_constant, first_terms = sum_terms(first)
+        second_constant, second_terms = sum_terms(second)
+        return first_terms == second_terms and bool(first_terms) \
+            and second_constant == (first_constant + 1) & 0xFFFF
+    return False
+
+
+# whether two addresses made of the same terms, whatever their order, with constants one apart are a byte and the next
+# (the profile's SOUND_TABLE_REGISTERS: decompile_sound.py sets it); off, only (x) and (x + 1), (ix+n) and (ix+n+1)
+SUMS = False
+
+
+def sum_terms(node):
+    """(the sum of the constants, the other terms sorted) of a 16-bit sum."""
+    constant, terms, pending = 0, [], [node]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, ir.Op) and item.name == "add" and item.bits == node.bits:
+            pending.extend(item.args)
+        elif isinstance(item, ir.Const):
+            constant += item.value
+        else:
+            terms.append(repr(item))
+    return constant & 0xFFFF, tuple(sorted(terms))
 
 
 def kept_low_byte(node):

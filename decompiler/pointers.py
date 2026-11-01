@@ -4,7 +4,7 @@ Description: works out which registers point at which of the game's structures, 
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    27-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 The structures (STRUCTS) are OutRunners': the game objects (0x100 bytes, 124 of them below each screen's
@@ -126,6 +126,9 @@ BELOW = {}
 # how far into it): the blocks of the two screens (up to the game's variables at 0x20E000) and the race
 # records (each screen's, and the copy of them each screen keeps)
 INSTANCES = {}
+# the family the structure at a fixed address always is (a game profile's: TMNT's objects 0-3 are the turtles), whose
+# fields an access by that address reads; none by default
+INSTANCE_FAMILIES = {}
 # records at a fixed address the code reaches only by a number (a constant there is a name of its own, not their
 # field): start -> struct
 NUMBERED_RECORDS = {}
@@ -135,6 +138,8 @@ ELEMENTS = {}                  # structure -> element type: an array of one valu
                                # "elements"), read as NAME(p)[i] rather than through a field; in the program
                                # ROM, the work RAM or a memory of the board
 RECORD_TABLES = {}             # program ROM address -> (name, ROM structure): a table of records, name[i].field
+RECORD_COUNTS = {}             # program ROM address -> how many records a table of them has (table NAME[COUNT]
+                               # STRUCT): a constant address in any of them reads name[n].field
 SCOPED_ARRAYS = {}             # (struct, family, offset) -> (bits, count): a family's field that is an array
 FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that is an array of 'count' elements
                                # of 'bits' (None: it goes on past the record's end), read STRUCT(p)->field[i]
@@ -149,6 +154,13 @@ BASES = {}                     # name -> address of the program's data, for "STR
 # (STRUCT(p + 0xAu)->field, emit.py), never by an index, which would run the other way. Arrays of values
 # (ELEMENTS), fields that are arrays and tables of records are not laid out that way (Layouts says so)
 REVERSED = False
+# ... and whose loader turns a table of records to the host's order a whole record at a time (its registry gives the
+# record's size), so that each record runs backwards as a structure does and the table reads name[i].field: the
+# 68000's (m68000/decompile.py). Off, a program with REVERSED has no tables of records.
+RECORDS_LOADED_WHOLE = False
+# ... and whose values a pointer walks (ELEMENTS) are read one at a time at their address, NAME(p), and one of another
+# width there NAME_32(p): the 68000's. Off, a program with REVERSED has no ELEMENTS.
+ELEMENT_READS = False
 # A family whose name starts with another's and "_" (enemy_walk, enemy) is a kind of that one: its view holds the
 # fields of the families above it too, unless one of its own takes their bytes (symbols.txt names each field once,
 # in the family that has it in common). Off, every family's view holds only its own scoped lines.
@@ -284,9 +296,11 @@ def in_work_ram(value):
 
 def record_table(value):
     """(structure, offset into its first record) for an address at the start of a table of records, or into
-    its first record (a column of the table: hud_gauge_positions_3p + 2, the y's); None otherwise."""
+    its first record (a column of the table: hud_gauge_positions_3p + 2, the y's); None otherwise. A table
+    symbols.txt gives the number of records of (RECORD_COUNTS) takes an address in any of them: the offset is
+    then past the first record's end."""
     for address, (_, struct) in RECORD_TABLES.items():
-        if 0 <= value - address < STRUCTS[struct]:
+        if 0 <= value - address < STRUCTS[struct] * RECORD_COUNTS.get(address, 1):
             return struct, value - address
     return None
 
@@ -307,7 +321,7 @@ def instance_record(value):
 def record_table_name(value):
     """(name, structure, offset) of the table of records whose first record 'value' is in, or None."""
     for address, (name, struct) in RECORD_TABLES.items():
-        if 0 <= value - address < STRUCTS[struct]:
+        if 0 <= value - address < STRUCTS[struct] * RECORD_COUNTS.get(address, 1):
             return name, struct, value - address
     return None
 
@@ -548,6 +562,8 @@ def kind_of(node, state, zeros):
             instance = instance_of(value)
             if instance is not None:
                 found = instance[1], instance[2]    # a place in a structure at a fixed address (INSTANCES)
+                if instance[0] in INSTANCE_FAMILIES:
+                    found += (INSTANCE_FAMILIES[instance[0]],)
         if found is None and in_work_ram(value):
             found = ("global", value)
         if found is None and rom_address(value):
@@ -786,7 +802,8 @@ def access(address, state, zeros=None):
         return in_field_array(kind[0], kind[1], address, kind[1], family_of(kind))
     if isinstance(address, ir.Const):
         found = instance_of(address.value & ADDRESS_MASK)
-        return (found[1], found[2], ir.Const(found[0], 32), 0, None) if found is not None else None
+        return (found[1], found[2], ir.Const(found[0], POINTER_BITS), 0, INSTANCE_FAMILIES.get(found[0])) \
+            if found is not None else None
     base, displacement = address, 0
     if isinstance(address, ir.Op) and address.name in ("add", "sub") and isinstance(address.args[1], ir.Const):
         base = address.args[0]
@@ -1031,6 +1048,13 @@ def indexed_access(address, state, in_fields=True, zeros=None):
     size = STRUCTS[kind[0]]
     count = scaled_count(rest[0], size, zeros) if rest else None
     if rest and count is None:
+        if REVERSED and ELEMENT_READS and kind[0] in ROM_STRUCTS:
+            # (a record of the program's data the pointer is moved to by a number of bytes no rule shows to be whole
+            # records: the record that many bytes on, STRUCT(p + n)->field, as its copy is made from there)
+            element, offset = divmod(kind[1] + constant, size)
+            moved = ir.op("add", (pointer, rest[0]), POINTER_BITS)
+            index = ir.Const(element & 0xFFFFFFFF, 32) if element else None
+            return kind[0], offset, moved, kind[1], family_of(kind), index
         return None
     element, offset = divmod(kind[1] + constant, size)
     if count is None and element == 0 and not isinstance(pointer, ir.Const):
@@ -1739,7 +1763,7 @@ class Layouts:
         lines = ["#pragma pack(push, 1)"]
         for struct, size in STRUCTS.items():
             if struct in ELEMENTS:
-                if REVERSED:
+                if REVERSED and not ELEMENT_READS:
                     raise ValueError(f"{struct}: an array of values, in a program whose structures run backwards")
                 continue    # (an array of plain values: no structure)
             fields = self.fields.get(struct, {})
@@ -1790,8 +1814,19 @@ class Layouts:
                          f"\"struct {struct} has the size of {what}\");")
         lines.append("")
         for struct in STRUCTS:
+            if REVERSED and struct in ELEMENTS:
+                # (a value at an address, one at a time, as the structures' copies run: NAME(p); one of another
+                # width at that address, NAME_16(p))
+                bits, signed = self.TYPES[ELEMENTS[struct]]
+                kind = f"{'' if signed else 'u'}int{bits}_t"
+                lines.append(f"#define {struct.upper()}(address) (*(const {kind} *){ROM_FUNCTION}((address), {bits // 8}))")
+                for other in (8, 16, 32):
+                    if other != bits:
+                        lines.append(f"#define {struct.upper()}_{other}(address) "
+                                     f"(*(const uint{other}_t *){ROM_FUNCTION}((address), {other // 8}))")
+                continue
             lines.append(f"#define {struct.upper()}(address) {self.pointer_macro(struct)}")
-        if RECORD_TABLES and REVERSED:
+        if RECORD_TABLES and REVERSED and not RECORDS_LOADED_WHOLE:
             raise ValueError("tables of records, in a program whose structures run backwards")
         if RECORD_TABLES:
             lines += ["", "/* the program ROM's tables of records, by name: name[i].field */"]

@@ -4,7 +4,7 @@ Description: makes the statements of a function read as expressions: temporaries
              uses them, constants fold, and register writes that keep bits nobody reads write the value
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 The lifter binds every value an instruction reads or computes to a temporary, in the order MAME's core
@@ -836,6 +836,214 @@ def constants_after(statement, known, call_results, context):
     elif isinstance(statement, ir.Effect):
         # (what an effect writes is not spelled out: none of the registers is known after it)
         known.clear()
+
+
+def table_bases(function, call_results, context, is_table):
+    """A load through a register that holds the same constant on every way to it, an address 'is_table' says is one
+    of the program's tables ("lea table, A6" before a loop that reads "(A6,D7.w)"): the load reads at that constant
+    plus the rest, so that it reads as that table's element (decompiler/memory.py), wherever the register was set.
+    Only the loads change: the register keeps its value for anything else that uses it. Returns how many changed."""
+    blocks = function.blocks
+    predecessors = {}
+    for label, block in blocks.items():
+        for successor in block.successors():
+            predecessors.setdefault(successor, []).append(label)
+    order, seen, stack = [], {function.entry}, [(function.entry, iter(blocks[function.entry].successors()))]
+    while stack:
+        label, children = stack[-1]
+        child = next(children, None)
+        if child is None:
+            order.append(label)
+            stack.pop()
+        elif child not in seen and child in blocks:
+            seen.add(child)
+            stack.append((child, iter(blocks[child].successors())))
+    order.reverse()
+    # (what each block leaves in the registers: None until the block is seen, then {register: constant}; the meet of
+    # its ways in is what all of them agree on, repeated until nothing changes)
+    out = {label: None for label in order}
+
+    def entering(label):
+        if label == function.entry:
+            return {}
+        sources = [out[source] for source in predecessors.get(label, []) if source in out]
+        known = None
+        for found in sources:
+            if found is None:
+                continue
+            known = dict(found) if known is None else {index: value for index, value in known.items()
+                                                       if found.get(index) == value}
+        return known or {}
+    def after(statement, known):
+        constants_after(statement, known, call_results, context)
+        if isinstance(statement, ir.SetReg) and (getattr(statement, "origin", None), statement.index) in KEEP_SITES:
+            known.pop(statement.index, None)    # (a pointer symbols.txt types there: it reads as that structure)
+    changed = True
+    rounds = 0
+    while changed and rounds < 50:
+        changed = False
+        rounds += 1
+        for label in order:
+            known = entering(label)
+            for statement in blocks[label].statements:
+                after(statement, known)
+            if known != out[label]:
+                out[label] = known
+                changed = True
+    count = 0
+    for label in order:
+        known = entering(label)
+
+        def change(node, known=known):
+            if isinstance(node, ir.Load):
+                address = ir.rebuild(node.address, lambda inner: known[inner.index]
+                                     if isinstance(inner, ir.Reg) and inner.index in known
+                                     and is_table(known[inner.index].value & 0xFFFFFF) else None)
+                if address is not node.address and address != node.address:
+                    return ir.Load(ir.rebuild(address, simplify_node), node.bits)
+            return None
+        for statement in blocks[label].statements + [blocks[label].end]:
+            before = repr(statement)
+            ir.map_statement(statement, change)
+            if repr(statement) != before:
+                count += 1
+            if statement is not blocks[label].end:
+                after(statement, known)
+    return count
+
+
+QUIET_EFFECTS = ("z80_block", "z80_cycles", "interrupts_on", "interrupts_off", "port_out")    # (constant_addresses)
+
+
+def constant_addresses(function, call_results, context, is_address):
+    """A memory access through a register that holds the same constant on every way to it, an address 'is_address' says
+    is one of the program's variables ("ld hl,$83DF; dec (hl)" in one block, "ld a,(hl)" in the next one; "inc hl" and
+    the next variable): the access reads or writes that address, as the C names it already, so that the register is no
+    longer set for it. The constants follow what the registers are set to, a constant or one worked out from the known
+    ones ("inc hl"), as table_bases follows them. Only the accesses' addresses change. Returns how many statements
+    changed."""
+    blocks = function.blocks
+    predecessors = {}
+    for label, block in blocks.items():
+        for successor in block.successors():
+            predecessors.setdefault(successor, []).append(label)
+    order, seen, stack = [], {function.entry}, [(function.entry, iter(blocks[function.entry].successors()))]
+    while stack:
+        label, children = stack[-1]
+        child = next(children, None)
+        if child is None:
+            order.append(label)
+            stack.pop()
+        elif child not in seen and child in blocks:
+            seen.add(child)
+            stack.append((child, iter(blocks[child].successors())))
+    order.reverse()
+    out = {label: None for label in order}
+
+    def entering(label):
+        if label == function.entry:
+            return {}
+        known = None
+        for source in predecessors.get(label, []):
+            found = out.get(source)
+            if found is None:
+                continue
+            known = dict(found) if known is None else {index: value for index, value in known.items()
+                                                       if found.get(index) == value}
+        return known or {}
+
+    def substituted(node, known):
+        return ir.rebuild(ir.rebuild(node, lambda inner: known.get(inner.index) if isinstance(inner, ir.Reg) else None),
+                          simplify_node)
+
+    def after(statement, known):
+        if isinstance(statement, ir.Effect) and statement.name in QUIET_EFFECTS:
+            return    # (the timing model's and the interrupts': no register written)
+        worked_out = None
+        if isinstance(statement, ir.SetReg) and not isinstance(statement.value, ir.Const):
+            worked_out = substituted(statement.value, known)
+        constants_after(statement, known, call_results, context)
+        if isinstance(worked_out, ir.Const):
+            known[statement.index] = worked_out
+    changed = True
+    rounds = 0
+    while changed and rounds < 50:
+        changed = False
+        rounds += 1
+        for label in order:
+            known = entering(label)
+            for statement in blocks[label].statements:
+                after(statement, known)
+            if known != out[label]:
+                out[label] = known
+                changed = True
+    count = 0
+    for label in order:
+        known = entering(label)
+
+        def constant(address, known=known):
+            if not any(isinstance(inner, ir.Reg) and inner.index in known for inner in ir.walk(address)):
+                return None
+            value = substituted(address, known)
+            return value if isinstance(value, ir.Const) and is_address(value.value) else None
+
+        def change(node):
+            if isinstance(node, ir.Load):
+                address = constant(node.address)
+                if address is not None:
+                    return ir.Load(address, node.bits)
+            return None
+        for statement in blocks[label].statements + [blocks[label].end]:
+            before = repr(statement)
+            if isinstance(statement, ir.Store):
+                address = constant(statement.address)
+                if address is not None:
+                    statement.address = address
+            ir.map_statement(statement, change)
+            if repr(statement) != before:
+                count += 1
+            if statement is not blocks[label].end:
+                after(statement, known)
+    return count
+
+
+def table_registers(function, flow, is_table):
+    """A load through a register the same block set to a table's address plus an index ("ld hl,$106C; add hl,de;
+    ld e,(hl); inc hl; ld d,(hl)"), where neither the register nor what the index is made of has changed since:
+    the load reads at that sum, so that it reads as that table's element by its name (decompiler/memory.py).
+    'is_table' says whether an expression is a table's address plus the rest. Only the loads change: the
+    register keeps its value for anything else that uses it. Returns how many statements changed."""
+    count = 0
+    for block in function.blocks.values():
+        held = {}    # {register: the table's address plus the rest it holds}
+
+        def substituted(node):
+            return ir.rebuild(node, lambda inner: held[inner.index]
+                              if isinstance(inner, ir.Reg) and inner.index in held else None)
+
+        def change(node):
+            if isinstance(node, ir.Load):
+                address = substituted(node.address)
+                if address is not node.address and address != node.address:
+                    return ir.Load(ir.rebuild(address, simplify_node), node.bits)
+            return None
+        for statement in block.statements + [block.end]:
+            before = repr(statement)
+            ir.map_statement(statement, change)
+            if repr(statement) != before:
+                count += 1
+            if statement is block.end:
+                break
+            written, _ = writes_of(statement, flow)
+            value = ir.rebuild(substituted(statement.value), simplify_node) \
+                if isinstance(statement, ir.SetReg) else None
+            held = {index: kept for index, kept in held.items() if ("r", index) not in written
+                    and not any(("r", node.index) in written for node in ir.walk(kept) if isinstance(node, ir.Reg))}
+            if value is not None and is_table(value) \
+                    and not any(isinstance(node, ir.Load) or isinstance(node, ir.Reg) and node.index == statement.index
+                                for node in ir.walk(value)):
+                held[statement.index] = value
+    return count
 
 
 def fold_kept_constants(function, call_results, context):

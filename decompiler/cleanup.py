@@ -4,7 +4,7 @@ Description: removes the statements whose results nothing reads (flags no branch
              before use), once every function's signature is known
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Liveness runs backwards over each function with the data flow's own rules (demanded bits, what calls
@@ -103,7 +103,7 @@ class Liveness:
                 return True
             if EFFECT_READS is not None and has_effect(statement.value):
                 return True    # (a read of a register that does something, its value unused)
-            parts, _, _ = dataflow.partial_write(statement)
+            parts = self.flow.written_parts(statement)    # (partial_write's, but for those it leaves as they were)
             return any(("r", statement.index, part) in live for part in parts)
         if isinstance(statement, ir.SetFlag):
             return ("f", statement.name) in live

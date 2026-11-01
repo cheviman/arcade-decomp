@@ -436,18 +436,24 @@ def load_names(path, registers=None):
         if len(parts) < 2 or parts[1] not in ("var", "io", "table"):
             continue
         if parts[1] == "table" and len(parts) == 4 and parts[3] not in VALUE_TYPES:
-            # a table of records: checked against the structures once they are all read
-            names.record_tables[int(parts[0], 16)] = (parts[2], parts[3])
+            # a table of records: checked against the structures once they are all read (NAME[COUNT]: how many)
+            name, _, count = parts[2].partition("[")
+            if count:
+                if not count.endswith("]") or not count[:-1].isdigit() or not name.isidentifier():
+                    raise SystemExit(f"{where}: expected 'ADDRESS table NAME[COUNT] STRUCT'")
+                names.counts[int(parts[0], 16)] = int(count[:-1])
+            names.record_tables[int(parts[0], 16)] = (name, parts[3])
             continue
         if len(parts) not in (4, 5) or parts[3] not in VALUE_TYPES or (len(parts) == 5 and parts[1] == "io"):
             raise SystemExit(f"{where}: expected 'ADDRESS {parts[1]} NAME TYPE' with TYPE in {VALUE_TYPES}")
         address = int(parts[0], 16)
         target = {"var": names.variables, "io": names.hardware, "table": names.tables}[parts[1]]
-        if parts[1] == "var" and "[" in parts[2]:
-            # an array: NAME[COUNT], its elements one after another
+        if parts[1] in ("var", "table") and "[" in parts[2]:
+            # an array: NAME[COUNT], its elements one after another (a table's: the code may read one of them by its
+            # own address, which is that element of the table: krang_animations[3])
             name, _, count = parts[2].partition("[")
             if not count.endswith("]") or not count[:-1].isdigit() or not name.isidentifier():
-                raise SystemExit(f"{where}: expected 'ADDRESS var NAME[COUNT] TYPE'")
+                raise SystemExit(f"{where}: expected 'ADDRESS {parts[1]} NAME[COUNT] TYPE'")
             parts[2] = name
             names.counts[address] = int(count[:-1])
         if parts[1] == "var":

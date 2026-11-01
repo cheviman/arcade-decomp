@@ -5,7 +5,7 @@ Name:        analysis.py
 Description: recursive-descent disassembly of a 68000 program without traces, into a listing and a report
 Version:     0.1.0
 Created:     29-10-2026
-Modified:    29-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (the game's shim; default
@@ -36,7 +36,7 @@ nothing, its entries up to the first that is not a code address a trial decode a
 another table already, or a place the code names as data (an absolute or PC-relative operand, a long it
 stores: what a table read on into holds can decode, so the walk starts again with the table stopping there
 once the code that names it is found); a zero entry before one that is not (and first, or after one that is not) is an
-unused one (a state with no handler). A jump or call through a field of a structure, movea.l (d16,An), Am
+unused one (a state with no handler), but where the code names it as data (TABLE_ENDS_BEFORE_UNUSED: the table stops). A jump or call through a field of a structure, movea.l (d16,An), Am
 then jsr (Am), makes that offset a handler slot: an address stored in such a slot (move.l #code, or a
 register holding it) is code. symbols.txt keeps the V60's format (disassemble.load_symbols): func, code and
 data lines.
@@ -75,6 +75,10 @@ FIELD2 = "field of what an entry points at"     # (FIELD2, (table, offset))
 # code stores in one of its fields is what a long read from that field gives, wherever the object is
 OBJECT_REGISTER = getattr(game_profile, "OBJECT_REGISTER", None)
 TABLE_BASES = (CONSTANT, CURSOR)    # what a table is read from: its address, or a place in it
+# whether a table stops at a place the code names as data even where that place holds a zero, which would otherwise
+# be taken for an unused state first (the profile's TABLE_ENDS_BEFORE_UNUSED: TMNT's 049BC8 went on past the arc at
+# 049BD8, whose words 0000FFE0 and 0000FC00 decode, into two states no object has)
+ENDS_BEFORE_UNUSED = getattr(game_profile, "TABLE_ENDS_BEFORE_UNUSED", False)
 ADDRESS_REGISTERS = frozenset(f"A{number}" for number in range(8))
 NO_WRITE = {"cmp", "cmpa", "cmpi", "cmpm", "tst", "btst", "chk"}   # an address register last, and not written
 
@@ -215,6 +219,8 @@ class Analysis:
             for index in range(MAX_TABLE):
                 where = table + 4 * index
                 value = self.mem.r32(where) & 0xFFFFFF
+                if ENDS_BEFORE_UNUSED and self.ends_table(where, table):
+                    break
                 if self.unused(where, index == 0):
                     continue
                 if self.ends_table(where, table) or not self.plausible(value) or not self.clean(value):
@@ -251,6 +257,8 @@ class Analysis:
             for index in range(MAX_TABLE):
                 where = table + 4 * index
                 value = self.mem.r32(where) & 0xFFFFFF
+                if ENDS_BEFORE_UNUSED and self.ends_table(where, table):
+                    break
                 if self.unused(where, index == 0):
                     continue
                 if self.ends_table(where, table) or not self.plausible(value) or value in self.instructions:

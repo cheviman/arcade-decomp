@@ -5,7 +5,7 @@ Name:        emit.py
 Description: writes the sound program's functions as C, through the decompiler's writer
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    29-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 The decompiler's FunctionWriter does the work (decompiler/emit.py); this gives it the Z80's memory and
@@ -19,6 +19,7 @@ SOUND_ROM_AREA (TMNT: the Z80's own RAM at 8000-87FF, its program at 0000-7FFF, 
 the block moves print as calls of that header, the ports by the names sound_symbols.txt gives them.
 """
 from decompiler import cprint
+from decompiler import cpu
 from decompiler import emit
 from v60 import ir
 
@@ -48,6 +49,7 @@ def use_memory_map(names, arrays):
     memory.LOADED_TABLES = getattr(game_profile, "SOUND_LOADED_TABLES", False)
     memory.COUNTED_FROM_ONE = getattr(game_profile, "SOUND_COUNTED_FROM_ONE", False)
     memory.NAMES_BEFORE_TABLES = getattr(game_profile, "SOUND_NAMES_BEFORE_TABLES", 0)
+    memory.UNBOUNDED_READS = getattr(game_profile, "SOUND_TABLE_REGISTERS", False)
     memory.PAGED = False
     memory.PLAYER_FIELDS = None
     memory.CANONICAL = lambda address: address
@@ -86,6 +88,35 @@ def use_memory_map(names, arrays):
     pointers.ROM_FUNCTION = "sound_rom_at"
     pointers.CONSTANTS = True
     pointers.PAGED = True    # the sequence players, one per page from E900
+    # the records of the arrays (array lines) are structures at a fixed address too, whose fields the code reaches by
+    # their own address (the profile's SOUND_INSTANCES, off by default: each such address a variable of its own,
+    # unk_8301), and the records that have a name of their own (SOUND_NAMED_BASES: CHANNEL(SPEECH_CHANNEL)->sound
+    # rather than CHANNEL(CHANNEL_ADDRESS(12))->sound)
+    pointers.INSTANCES = {first + number * names.structs[struct]: (struct, names.structs[struct])
+                          for struct, (first, count) in arrays.items() for number in range(count)} \
+        if getattr(game_profile, "SOUND_INSTANCES", False) else {}
+    memory.NAMED_BASES = dict(getattr(game_profile, "SOUND_NAMED_BASES", {}))
+    # the structure a family of the program's functions names its own way (scoped lines), and the register its
+    # handlers find theirs in, kept on the stack across a call too (PUSH IX ... POP IX): the profile's
+    # SOUND_FAMILY_STRUCT and SOUND_OBJECT_REGISTER, none by default (no families)
+    family = getattr(game_profile, "SOUND_FAMILY_STRUCT", None)
+    if family is not None:
+        registers = {name: index for index, name in cpu.current.register_names.items()}
+        emit.FAMILY_STRUCT = family
+        emit.OWN_OBJECT_REGISTERS = (registers[game_profile.SOUND_OBJECT_REGISTER],)
+        emit.OWN_THROUGH_STACK = True
+    # (the profile's SOUND_NESTED_FAMILIES, off by default: a family whose name starts with another's takes its fields)
+    pointers.NESTED_FAMILIES = getattr(game_profile, "SOUND_NESTED_FAMILIES", False)
+    # the names the 68000's C takes from what the code does (decompiler/emit.py), for the sound program's: the
+    # profile's SOUND_PARAMS_BY_USE, SOUND_NAMES_BY_STORES, SOUND_PARAMS_FROM_CALLERS and SOUND_NAMES_BY_COMPARISONS,
+    # off by default
+    emit.PARAMS_BY_USE = getattr(game_profile, "SOUND_PARAMS_BY_USE", False)
+    emit.NAMES_BY_STORES = getattr(game_profile, "SOUND_NAMES_BY_STORES", False)
+    emit.PARAMS_FROM_CALLERS = getattr(game_profile, "SOUND_PARAMS_FROM_CALLERS", False)
+    emit.NAMES_BY_COMPARISONS = getattr(game_profile, "SOUND_NAMES_BY_COMPARISONS", False)
+    # (the profile's SOUND_NAMES_PAST_STORES, off by default: a value only stored as it is, besides passed on, takes the
+    # name of the calls it is passed to)
+    emit.NAMES_PAST_STORES = getattr(game_profile, "SOUND_NAMES_PAST_STORES", False)
 
 
 class SoundNames(emit.Names):

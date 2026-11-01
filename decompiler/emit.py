@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -61,6 +61,13 @@ PSW_INTERRUPTS = 1 << 18    # the processor status bit that lets interrupts in
 # the registers that hold the object a function of a family runs on when it starts (own_object): the V60 games'
 # object loop keeps it in R20 and R23; a CPU frontend whose games keep it elsewhere sets its own
 OWN_OBJECT_REGISTERS = (20, 23)
+# the structure whose fields a family of functions names its own way (symbols.txt "scoped" lines), and that a function
+# of a family runs on in OWN_OBJECT_REGISTERS: the games' objects; another program's (a sound driver's channels) gives
+# its own
+FAMILY_STRUCT = "object"
+# whether that object, kept on the function's own stack and put back from there into a register, is still the one it
+# runs on (own_object): off, a register is only while copies of it hold it (the V60's and the 68000's)
+OWN_THROUGH_STACK = False
 # words of C and of the runtime (game/support.h) a local variable must not be called
 GLOBAL_WORDS = set("""auto break case char const continue default do double else enum extern float for goto if
 inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void
@@ -82,6 +89,36 @@ REGIONS = [(0x300000, 0x320000, "VIDEO_RAM"), (0x400000, 0x420000, "SPRITE_RAM")
            (0x610000, 0x620000, "MIXER_REGISTERS"), (0x700000, 0x702000, "SOUND_RAM"), (0xC00000, 0xC00080, "IO_PORTS"),
            (0xD00000, 0xD00010, "INTERRUPT_CONTROL"), (0xD80000, 0xD80010, "RANDOM_GENERATOR")]
 BOARD_MEMORIES = {0x200000} | {start for start, _, _ in REGIONS}    # where the board's memories start
+# whether a constant the code stores into a field symbols.txt types as a number, or compares with one, is a number
+# whatever its value (an object's x, 0x13C00, is no address of the program's, though the program has data there):
+# off, only how the code works the constant out says so (numbers()); the 68000's game profile turns it on
+NUMBERS_BY_FIELD = False
+COMPARISONS = ("eq", "ne", "lt", "le", "ult", "ule")
+# whether a parameter or result symbols.txt gives no name takes one from what the function does with it, as a local
+# does (FunctionWriter.entry_hints: the structure its fields are read through, or the name the functions it only
+# passes the value on to give it, when they all agree; the driver works them out before the C is written, the
+# 68000's m68000/decompile.py): off, the register's
+PARAMS_BY_USE = False
+# whether a variable nothing else names takes the name of the one field of a structure its values are stored into
+# (OBJECT(object)->move_time = move_time): off, the register's
+NAMES_BY_STORES = False
+# whether a parameter nothing else names takes the name of the variables every caller passes in it, when they all
+# have one and agree (PARAMS_BY_USE's last way): off, it does not
+PARAMS_FROM_CALLERS = False
+# {(address of a structure at a fixed address, a function's name or the start of its names): the family whose fields
+# those functions read at that address}; none by default
+INSTANCE_FAMILIES_BY_FUNCTION = {}
+# whether a variable nothing else names takes the name of the one field of a structure it is compared with: off, not
+NAMES_BY_COMPARISONS = False
+# the instructions that count a loop down (the 68000's dbcc, from its driver): the variable they write is the loop's
+# count, COUNTER_NAME; none by default
+COUNTER_SITES = frozenset()
+COUNTER_NAME = "count"
+# whether a value the function only stores as it is, besides passing it on, still takes the name the calls it is passed
+# to give it (fm_effect_02_pitch = pitch; set_fm_pitch(pitch, channel)): off, a store is a read of the function's own,
+# which says more than the calls' names (passed_name)
+NAMES_PAST_STORES = False
+CONSTANT_PASSED = ("constant",)    # (passed_names: a constant passed in a register, which says nothing of its name)
 
 
 def value_name(value):
@@ -596,7 +633,7 @@ class FunctionWriter:
         entry_registers = {value[1] for value in self.params + self.results if value[0] == "r"}
         # the object family this function belongs to (symbols.txt scoped fields), and where the registers
         # still point at the object its code runs on
-        self.family = emitter.family_of(function.entry, "object")
+        self.family = emitter.family_of(function.entry, FAMILY_STRUCT)
         self.global_family = emitter.global_family_of(function.entry)
         self.own = self.own_object()
         entry_names = {value[1]: emitter.param_name(function.entry, value)
@@ -745,7 +782,14 @@ class FunctionWriter:
         (family_through), else the family symbols.txt says the pointer leads to (object.eggman_scene); None
         if none."""
         struct, _, base, base_offset, family = field[:5]
-        found = self.family_through(base, statement) if not base_offset and struct == "object" else None
+        found = self.family_through(base, statement) if not base_offset and struct == FAMILY_STRUCT else None
+        if found is None and family is None and INSTANCE_FAMILIES_BY_FUNCTION and isinstance(base, ir.Const):
+            # (a structure at a fixed address that is of a family in some functions only: TMNT's object 12 is the
+            # profile's picture in the attract's profiles, object 40 the van in the car street's exit)
+            name = self.emitter.names.get(self.entry, "")
+            for (address, prefix), named in INSTANCE_FAMILIES_BY_FUNCTION.items():
+                if base.value & 0xFFFFFF == address and (name == prefix or name.startswith(prefix + "_")):
+                    return named
         return found if found is not None else family
 
     def family_through(self, base, statement=None):
@@ -1532,7 +1576,83 @@ class FunctionWriter:
             sources.add(name)
         if sources is not None and len(sources) == 1:
             return self.emitter.local_name(sources.pop())
-        return self.passed_name(variables, root, items)
+        passed = self.passed_name(variables, root, items)
+        if passed is None and NAMES_BY_STORES:
+            stored = self.stored_names(variables).get(root, set())
+            if len(stored) == 1 and None not in stored:
+                return self.emitter.local_name(next(iter(stored)))
+        if passed is None and self.counts_loop(variables, items):
+            return self.emitter.local_name(COUNTER_NAME)
+        if passed is None and NAMES_BY_COMPARISONS:
+            compared = self.compared_names(variables).get(root, set())
+            if len(compared) == 1:
+                return self.emitter.local_name(next(iter(compared)))
+        return passed
+
+    def counts_loop(self, variables, items):
+        """True for a web an instruction of COUNTER_SITES writes (the 68000's dbcc: the count of a loop)."""
+        if not COUNTER_SITES:
+            return False
+        if not hasattr(self, "_counter_defs"):
+            self._counter_defs = {id(statement) for block in self.function.blocks.values()
+                                  for statement in block.statements
+                                  if isinstance(statement, ir.SetReg) and getattr(statement, "origin", None) in COUNTER_SITES}
+        return any(item[0] == "def" and item[1] in self._counter_defs for item in items)
+
+    def compared_names(self, variables):
+        """{web: the names of the fields of structures its values are compared with} (NAMES_BY_COMPARISONS): a
+        value compared with an object's screen x only is a screen x."""
+        if not hasattr(self, "_compared"):
+            self._compared = {}
+            if not hasattr(self, "_temp_values"):
+                self._temp_values = {statement.temp.name: (statement.value, statement)
+                                     for block in self.function.blocks.values()
+                                     for statement in block.statements if isinstance(statement, ir.SetTemp)}
+
+            def stripped(node):
+                while isinstance(node, ir.Op) and node.name in ("zext", "fits", "trunc", "sext"):
+                    node = node.args[0]
+                return node
+
+            for block in self.function.blocks.values():
+                for statement in block.statements + [block.end]:
+                    for expression in ir.statement_expressions(statement):
+                        for node in ir.walk(expression):
+                            if not isinstance(node, ir.Op) or node.name not in COMPARISONS or len(node.args) != 2:
+                                continue
+                            for mine, other in (node.args, node.args[::-1]):
+                                mine, other = stripped(mine), stripped(other)
+                                if not isinstance(mine, ir.Reg):
+                                    continue
+                                where = statement
+                                if isinstance(other, ir.Temp):
+                                    other, where = self._temp_values.get(other.name, (None, None))
+                                    other = stripped(other)
+                                name = self.read_field_name(other, where) if isinstance(other, ir.Load) else None
+                                if name is None:
+                                    continue
+                                for definition in variables.uses.get(id(mine), ()):
+                                    self._compared.setdefault(variables.webs.find(definition), set()).add(name)
+        return self._compared
+
+    def stored_names(self, variables):
+        """{web: the names of the fields its values are stored into} (NAMES_BY_STORES); None for a store of it
+        anywhere else (a variable, a computed address): a web stored into one field only is what that field holds."""
+        if not hasattr(self, "_stored"):
+            self._stored = {}
+            for block in self.function.blocks.values():
+                for statement in block.statements:
+                    if not isinstance(statement, ir.Store):
+                        continue
+                    value = statement.value
+                    while isinstance(value, ir.Op) and value.name in ("zext", "fits", "trunc", "sext"):
+                        value = value.args[0]
+                    if not isinstance(value, ir.Reg):
+                        continue
+                    name = self.read_field_name(statement, statement) if id(statement) in self.fields else None
+                    for definition in variables.uses.get(id(value), ()):
+                        self._stored.setdefault(variables.webs.find(definition), set()).add(name)
+        return self._stored
 
     def passed_name(self, variables, root, items):
         """The name of the parameter or result a web is passed as, or gets back from, in the calls that
@@ -1552,7 +1672,8 @@ class FunctionWriter:
         # what the function itself does with the values says more than what it passes them on as: a web
         # its own expressions read takes no parameter's name (the tens digit build_ranking_display works
         # out is no piece_count because spawn_object_with_pieces finds it in R1 next)
-        read_here = any(reaching & definitions for reaching in variables.uses.values())
+        read_here = any(reaching & definitions for node, reaching in variables.uses.items()
+                        if not NAMES_PAST_STORES or node not in self.stored_registers())
         # and what it puts in the register itself, more than what a call hands back in it
         own_values = any(item[0] == "entry" or not isinstance(self._statement_ids.get(item[1]), (ir.Call, ir.TailCall))
                          for item in items)
@@ -1588,6 +1709,26 @@ class FunctionWriter:
             return None
         return self.emitter.local_name(found.pop())
 
+    def stored_registers(self):
+        """The ids of the register nodes that are what a store writes, whole, and of those an assignment to the same
+        register reads (NAMES_PAST_STORES): the value kept in memory as it is, or moved on from itself (pitch += step),
+        which says nothing of what it is."""
+        if not hasattr(self, "_stored_registers"):
+            found = set()
+            for block in self.function.blocks.values():
+                for statement in block.statements:
+                    if isinstance(statement, ir.Store):
+                        value = statement.value
+                        while isinstance(value, ir.Op) and value.name in ("zext", "fits", "trunc"):
+                            value = value.args[0]
+                        if isinstance(value, ir.Reg):
+                            found.add(id(value))
+                    elif isinstance(statement, ir.SetReg):
+                        found |= {id(node) for node in ir.walk(statement.value)
+                                  if isinstance(node, ir.Reg) and node.index == statement.index}
+            self._stored_registers = found
+        return self._stored_registers
+
     def names_at(self, statement, register):
         """Names symbols.txt gives 'register' where 'statement' passes it on: a call's parameters or
         results, a tail call's, and the function's own result at a return."""
@@ -1603,6 +1744,170 @@ class FunctionWriter:
         else:
             return set()
         return {self.emitter.param_names.get((self.emitter.resolve(target)[0], register)) for target in targets}
+
+    def entry_hints(self):
+        """{register: name} for the parameters and results symbols.txt gives no name (PARAMS_BY_USE), from what
+        the function does with them: the one structure the function reads fields through it, else, for a value
+        the function only passes on (its own code neither reads it nor sets it: what goes into the calls that
+        take it and comes back from them), the name those functions give it, when they all have one and agree.
+        The webs are the one with what the register holds at the start and, for a result, the ones that reach
+        the function's end."""
+        variables = self.vars
+        if not hasattr(self, "_through_entry"):
+            self._through_entry = {}
+            for hit in self.fields.values():
+                if hit[0] in pointers.STRUCTS and hit[0] not in pointers.ELEMENTS and isinstance(hit[2], ir.Reg):
+                    for definition in variables.uses.get(id(hit[2]), ()):
+                        self._through_entry.setdefault(variables.webs.find(definition), set()).add(hit[0])
+        statements = {}
+        returns = []
+        for block in self.function.blocks.values():
+            for statement in block.statements + [block.end]:
+                statements[id(statement)] = statement
+                if isinstance(statement, (ir.Return, ir.TailCall)):
+                    returns.append(statement)
+        members = {}
+        for item in list(variables.webs.parent):
+            members.setdefault(variables.webs.find(item), []).append(item)
+        result_registers = {value[1] for value in self.results if value[0] == "r"}
+        found = {}
+        for value in self.params + self.results:
+            if value[0] != "r" or value[1] in found:
+                continue
+            register = value[1]
+            roots = set()
+            if ("entry", register) in variables.webs.parent:
+                roots.add(variables.webs.find(("entry", register)))
+            if register in result_registers:
+                for statement in returns:
+                    for definition in variables.implicit.get((id(statement), register), ()):
+                        roots.add(variables.webs.find(definition))
+            items = [item for root in roots for item in members.get(root, [root])]
+            if not items:
+                continue
+            # (what "local" lines call its webs, when they agree: every site's name, not the first one found, which
+            # would hang on the order the webs' items come in)
+            chosen = {variables.chosen.get((spot, value)) for spot, value, _ in variables.sites(register, items)} - {None}
+            if len(chosen) > 1 and register in result_registers:
+                # (for a result, the names of what reaches the function's end, when those agree)
+                ends = [definition for statement in returns
+                        for definition in variables.implicit.get((id(statement), register), ())]
+                chosen = {variables.chosen.get((spot, value))
+                          for spot, value, _ in variables.sites(register, ends)} - {None}
+            if len(chosen) == 1:
+                found[register] = next(iter(chosen))
+                continue
+            structs = set()
+            for root in roots:
+                structs |= self._through_entry.get(root, set())
+            if len(structs) == 1:
+                name = self.emitter.local_name(next(iter(structs)))
+                if name is not None:
+                    found[register] = name
+                continue
+            if structs:
+                continue
+            definitions = set(items)
+            if any(reaching & definitions for reaching in variables.uses.values()):
+                # (its own code reads it: what it is there says more than a call's name; the one field it
+                # goes into, with NAMES_BY_STORES)
+                stored = set()
+                for root in roots:
+                    stored |= self.stored_names(variables).get(root, {None}) if NAMES_BY_STORES else {None}
+                name = None
+                if len(stored) == 1 and None not in stored:
+                    name = self.emitter.local_name(next(iter(stored)))
+                elif self.counts_loop(variables, items):
+                    name = self.emitter.local_name(COUNTER_NAME)
+                elif NAMES_BY_COMPARISONS and register not in result_registers:
+                    # (not for a result: what a function hands back in a register it also works with is too
+                    # many things for one comparison to name)
+                    compared = set()
+                    for root in roots:
+                        compared |= self.compared_names(variables).get(root, set())
+                    name = self.emitter.local_name(next(iter(compared))) if len(compared) == 1 else None
+                if name is not None:
+                    found[register] = name
+                continue
+            names = set()
+            plumbing = True
+            for item in items:
+                if item[0] == "entry":
+                    continue
+                statement = statements.get(item[1])
+                if not isinstance(statement, (ir.Call, ir.TailCall)) or statement.target is None and (
+                        isinstance(statement, ir.TailCall) or statement.slot is not None):
+                    plumbing = False    # (its own code sets it, or a call through memory leaves it)
+                    break
+                names |= self.names_at(statement, register)
+            if not plumbing:
+                continue
+            for (statement_id, index), reaching in variables.implicit.items():
+                if index != register or not reaching & definitions:
+                    continue
+                statement = statements.get(statement_id)
+                if isinstance(statement, ir.Return):
+                    continue    # (the function's own result: the name being worked out)
+                if isinstance(statement, (ir.Call, ir.TailCall)) and statement.target is None and (
+                        isinstance(statement, ir.TailCall) or statement.slot is not None):
+                    plumbing = False
+                elif isinstance(statement, ir.TailCall) or (isinstance(statement, ir.Call)
+                                                            and self.really_reads(statement, index)):
+                    names |= self.names_at(statement, register)
+                elif not isinstance(statement, ir.Call):
+                    plumbing = False
+            if plumbing and len(names) == 1 and None not in names:
+                name = self.emitter.local_name(names.pop())
+                if name is not None:
+                    found[register] = name
+        return found
+
+    def passed_names(self):
+        """{(function called, register): the names of this function's variables it passes in the register} for
+        PARAMS_BY_USE's names from the callers: a variable named for what it holds by its name, a constant by
+        CONSTANT_PASSED, anything else (a variable still named after the register) by None."""
+        variables = self.vars
+        members = {}
+        for item in list(variables.webs.parent):
+            members.setdefault(variables.webs.find(item), []).append(item)
+        statements = {}
+        for block in self.function.blocks.values():
+            for statement in block.statements + [block.end]:
+                statements[id(statement)] = statement
+        plain = re.compile(r"(?:p_)?(?:" + "|".join(sorted({cpu.variable_name(index) for index in range(64)}, key=len,
+                                                           reverse=True)) + r")(?:_\d+)?|ignored(?:\d+)?(?:_\d+)?")
+        found = {}
+        for (statement_id, register), reaching in variables.implicit.items():
+            statement = statements.get(statement_id)
+            if isinstance(statement, ir.TailCall) and statement.target is not None:
+                targets = [statement.target & 0xFFFFFF]
+            elif isinstance(statement, ir.Call) and statement.slot is None:
+                targets = [statement.target & 0xFFFFFF] if statement.target is not None else list(statement.choices)
+            else:
+                continue
+            names = set()
+            for definition in reaching:
+                root = variables.webs.find(definition)
+                name = variables.names.get(root)
+                constant = all(item[0] == "def" and isinstance(statements.get(item[1]), ir.SetReg)
+                               and isinstance(statements[item[1]].value, ir.Const)
+                               for item in members.get(root, [root]))
+                names.add(CONSTANT_PASSED if constant else None if name is None or plain.fullmatch(name) else name)
+            for target in targets:
+                found.setdefault((self.emitter.resolve(target)[0], register), set()).update(names)
+        return found
+
+    def callees(self):
+        """The functions this one calls or goes on in."""
+        found = set()
+        for block in self.function.blocks.values():
+            for statement in block.statements + [block.end]:
+                if isinstance(statement, ir.TailCall) and statement.target is not None:
+                    found.add(self.emitter.resolve(statement.target & 0xFFFFFF)[0])
+                elif isinstance(statement, ir.Call) and statement.slot is None:
+                    targets = [statement.target & 0xFFFFFF] if statement.target is not None else list(statement.choices)
+                    found |= {self.emitter.resolve(target)[0] for target in targets}
+        return found
 
     def own_object(self):
         """{id(statement): registers that point at the object the function's code runs on, before it}: the
@@ -1622,8 +1927,16 @@ class FunctionWriter:
                     value = statement.value
                     if isinstance(value, ir.Reg) and value.index in current:
                         current.add(statement.index)
+                    elif OWN_THROUGH_STACK and isinstance(value, ir.Stack) and ("stack", value.offset) in current:
+                        current.add(statement.index)    # (put back from where the function kept it)
                     else:
                         current.discard(statement.index)
+                elif OWN_THROUGH_STACK and isinstance(statement, ir.SetStack):
+                    # (the object kept on the function's stack while a call uses the register: PUSH IX ... POP IX)
+                    if isinstance(statement.value, ir.Reg) and statement.value.index in current:
+                        current.add(("stack", statement.offset))
+                    else:
+                        current.discard(("stack", statement.offset))
                 elif isinstance(statement, (ir.Call, ir.Effect)):
                     before_call = set(current)
                     current -= {variable[1] for variable in self.emitter.flow.statement_writes(statement)
@@ -1652,6 +1965,8 @@ class FunctionWriter:
         struct, offset, base, base_offset, _ = field[:5]
         index = field[5] if len(field) > 5 else None
         element_number = field[6] if len(field) > 6 else None    # (an element of a field that is an array)
+        if pointers.REVERSED and pointers.ELEMENT_READS and struct in pointers.ELEMENTS:
+            return self.element_read(struct, offset, base, base_offset, index, bits)
         family = self.field_family(field)
         layouts = self.emitter.layouts
         if base_offset and isinstance(base, ir.Op) and base.name == "add" and isinstance(base.args[0], ir.Const):
@@ -1747,6 +2062,28 @@ class FunctionWriter:
         self.note_missing(struct, offset, bits, base, base_offset, generic)
         return generic[:2]
 
+    def element_read(self, struct, offset, base, base_offset, index, bits):
+        """(C, signed) for a read of a value a pointer walks (ELEMENTS) where the structures run backwards
+        (pointers.ELEMENT_READS): the value at its address, NAME(p + n), or one of another width there, NAME_16(p)"""
+        element_bits, signed = memory.SIGNED[pointers.ELEMENTS[struct]]
+        width = element_bits // 8
+        start = self.printer.any(base).text
+        moved = offset - base_offset
+        if isinstance(index, ir.Const):
+            moved += pointers.signed(index.value & 0xFFFFFFFF) * width
+            index = None
+        address = start
+        if index is not None:
+            number = self.record_number(index)
+            if not re.fullmatch(r"[\w()]+", number):
+                number = f"({number})"
+            address += f" + {number}" if width == 1 else f" + {number} * 0x{width:X}u"
+        if moved:
+            address += f" {'+' if moved > 0 else '-'} 0x{abs(moved):X}u"
+        if bits == element_bits:
+            return f"{struct.upper()}({address})", signed
+        return f"{struct.upper()}_{bits}({address})", False
+
     def rerolled_statements(self, statements, texts):
         """The C of a block's statements ('texts': each one's lines), with every run of one group of
         statements the code has REPEAT_MINIMUM times or more in a row (the same IR: a copy or a clear
@@ -1830,7 +2167,7 @@ class FunctionWriter:
         no family names: through the function's own object, under its family (or the function's name
         when it has none) (decompile.py --fields)."""
         region = self.emitter.layouts.region(struct)
-        if struct != "object" or base_offset or region is None or offset < region or not isinstance(base, ir.Reg):
+        if struct != FAMILY_STRUCT or base_offset or region is None or offset < region or not isinstance(base, ir.Reg):
             return
         if not generic[0].split("->")[-1].startswith(("var_", "unk_")) and generic[2]:
             return    # a generic field with a name and the access's width
@@ -2300,9 +2637,57 @@ class FunctionWriter:
                                     and self.vars.def_name(statement, statement.index) in pointing:
                                 continue
                             found.add(id(node))
+        if NUMBERS_BY_FIELD:
+            found |= self.field_numbers()
         self._numbers = found
         self._summed = summed
         return found
+
+    def field_numbers(self):
+        """ids of the constants the function stores into a field symbols.txt types as a number, or compares with
+        what one holds (NUMBERS_BY_FIELD): an object's or a layer's x and y are positions, whatever the program
+        has at that address"""
+        def bare(node):
+            while isinstance(node, ir.Op) and node.name in ("zext", "sext", "trunc", "fits"):
+                node = node.args[0]
+            return node
+        found = set()
+        for block in self.function.blocks.values():
+            for statement in block.statements + [block.end]:
+                if isinstance(statement, ir.Store):
+                    value = bare(statement.value)
+                    if isinstance(value, ir.Const) and self.holds_number(statement, statement.bits, statement):
+                        found.add(id(value))
+                for expression in ir.statement_expressions(statement):
+                    for node in ir.walk(expression):
+                        if not (isinstance(node, ir.Op) and node.name in COMPARISONS and len(node.args) == 2):
+                            continue
+                        for constant, other in (node.args, node.args[::-1]):
+                            other = bare(other)
+                            if isinstance(constant, ir.Const) and isinstance(other, ir.Load) \
+                                    and self.holds_number(other, other.bits, statement):
+                                found.add(id(constant))
+        return found
+
+    def holds_number(self, node, bits, statement=None):
+        """True for an access (a load, or a store's statement) of the whole of a field symbols.txt names and types
+        as a number: no structure, region or code after its type, in its family's view or the structure's"""
+        hit = self.fields.get(id(node))
+        if hit is None or hit[0] not in pointers.STRUCTS:
+            return False
+        struct, offset = hit[0], hit[1]
+        layouts = self.emitter.layouts
+        family = self.field_family(hit, statement)
+        scoped = layouts.scoped_field(struct, family, offset) if family is not None else None
+        if scoped is not None:
+            # (a pointer in the family's view, or in the view of a family it is a kind of, is no number)
+            pointed = any(key[0] == struct and key[2] == offset and (family == key[1] or family.startswith(key[1] + "_"))
+                          for key in pointers.SCOPED_TARGETS)
+            return scoped[2] == offset and scoped[3] == bits and not scoped[1].startswith("unk_") and not pointed
+        if layouts.lookup(struct, offset) != (offset, bits):
+            return False
+        name = layouts.names.get(struct, {}).get(offset, "unk_")
+        return not name.startswith("unk_") and (struct, offset) not in pointers.TARGETS
 
     def address_variables(self):
         """The variables the function reads or writes memory through (in the address of a load or a store)."""
@@ -2767,6 +3152,8 @@ class FunctionWriter:
             if not self.vars.entry_live(value[1]):
                 continue    # always written before it is read: an ordinary variable
             name = self.vars.entry_name(value[1])
+            if name is None:
+                continue    # (what the register held at the start, which nothing reads: no variable)
             if name in self.forwarded:
                 continue    # (the caller's pointer goes straight on: forward_results)
             width = self.widths.get(name, 32)

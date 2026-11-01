@@ -5,7 +5,7 @@ Description: the game's variables, tables and hardware registers by name: work R
              named addresses
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    27-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Work RAM (0x200000-0x20FFFF) stays the board's byte array, so the state compares byte for byte with the
@@ -275,6 +275,11 @@ class Memory:
         for address, (name, kind) in names.tables.items():
             bits, signed = SIGNED[kind]
             self.tables[address] = Item(address, name, bits, signed)
+            count = getattr(names, "counts", {}).get(address)
+            if count is not None:
+                # (table NAME[COUNT]: an element read by its own address is that element, NAME[n])
+                self.tables[address].count = count
+                self.tables[address].indexed = True
         for address, (name, kind) in names.hardware.items():
             self.hardware[address] = Item(address, name, SIGNED[kind][0])
 
@@ -341,6 +346,8 @@ class Memory:
             if COUNTED_FROM_ONE and following is not None and following.bits == bits and items is self.tables:
                 following.indexed = True
                 continue    # (the table after it, read from an index that starts at 1: access() names it)
+            if UNBOUNDED_READS and LOADED_TABLES and items is self.tables and self.table_after(address) is not None:
+                continue    # (the base of a table the code indexes from before its start: named_read() names it)
             items[address] = Item(address, name_of(address), bits)
 
     def table_after(self, address):
@@ -436,7 +443,7 @@ class Memory:
         # displacement, and that read stays on the bus
         index = element_index(rest, bits)
         if not indexed and not table_index(rest, bits):
-            return None
+            return self.named_read(own_copy(base), rest, bits, index, index_text)
         ram = work_ram(base)
         board = plain_hardware(base) and base in self.board
         reach = index_limit(rest) * (bits // 8)
@@ -462,7 +469,7 @@ class Memory:
                 before = ir.op("sub", (index, ir.Const(1, index.bits)), index.bits)
                 return self.indexed_text(items, following, index_text(before)), following.signed, lvalue
             if found is None:
-                return None
+                return None if lvalue else self.named_read(base, rest, bits, index, index_text)
             # an index from an element of an array past its first (the scrolls of the second tile layer)
             array, number, byte = found
             if byte == 0 and index is not None and array.bits == bits:
@@ -490,6 +497,32 @@ class Memory:
         start = "GAME_VARIABLES" if base == VARIABLES else f"{item.name}_ADDRESS"
         return f"{macro}({start} + {index_text(rest)})", False, lvalue
 
+    def named_read(self, base, rest, bits, index, index_text):
+        """C for a read of a loaded table at 'base' plus 'rest' that access() finds no element for (UNBOUNDED_READS):
+        an index the analysis cannot bound, a few bytes into a table, or from a few bytes before one (NAMES_BEFORE_
+        TABLES): by the table's name and the bytes into it, or its element where the widths agree; else None."""
+        if not UNBOUNDED_READS or not LOADED_TABLES or not program_rom(base) or base < ROM_NAMES_FROM:
+            return None
+        item = self.tables.get(base)
+        if item is not None:
+            return f"TABLE{bits}({item.name}, {index_text(rest)})", False, False
+        for start in range(base - 1, base - 4, -1):
+            outer = self.tables.get(start)
+            if outer is not None and start + outer.bits // 8 > base:
+                # (a byte into an element: the high byte of pcm_effect_handlers' entry)
+                return f"TABLE{bits}({outer.name}, 0x{base - start:X}u + {index_text(rest)})", False, False
+        after = self.table_after(base)
+        if after is None:
+            return None
+        item, distance = after
+        size = bits // 8
+        if item.indexed and item.bits == bits and index is not None and distance % size == 0:
+            # (a table the code counts from past its start: pcm_note_pitches[pitch - 0xCu])
+            before = ir.op("sub", (index, ir.Const(distance // size, index.bits)), index.bits)
+            return self.indexed_text(self.tables, item, index_text(before)), item.signed, False
+        before = ir.op("sub", (rest, ir.Const(distance, rest.bits)), rest.bits)
+        return f"TABLE{bits}({item.name}, {index_text(before)})", False, False
+
     def register(self, value):
         """Name of a hardware register at 'value' (NAME_ADDRESS for a variable of the board's plain
         memories), or None."""
@@ -511,7 +544,7 @@ class Memory:
         if VARIABLES is not None:
             lines.append(f"#define GAME_VARIABLES 0x{VARIABLES:06X}u")
         for address, name in sorted(NAMED_BASES.items()):
-            lines.append(f"#define {name} 0x{address:06X}u")
+            lines.append(f"#define {name} 0x{address:0{ADDRESS_DIGITS}X}u")
         for address, item in sorted(self.variables.items()):
             lines += self.declare(item, RAM_MACRO, RAM_FUNCTION)
             for (start, bits), overlay in sorted(self.overlays.items()):
@@ -630,6 +663,11 @@ COUNTED_FROM_ONE = False
 # NAME_ADDRESS - k: the base of a table the code indexes from 1 or more ("ld hl,$0C8A" for pcm_note_pitches at
 # 0C96, whose index is at least 12); 0, never (TMNT's sound program: the profile's SOUND_NAMES_BEFORE_TABLES)
 NAMES_BEFORE_TABLES = 0
+
+# whether a read of a loaded table that names no element of it (an index the analysis cannot bound, a few bytes into
+# the table, or from before its start) is still read by the table's name, TABLE16(fm_note_pitches, i - 0x2u), not
+# through ROM_MACRO and its address (TMNT's sound program: the profile's SOUND_TABLE_REGISTERS); off, it stays so
+UNBOUNDED_READS = False
 
 
 def accesses_of(functions):

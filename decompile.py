@@ -3,7 +3,7 @@ Name:        decompile.py
 Description: decompiles the game's V70 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    27-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--checks] [--out DIR] [--symbols FILE]
@@ -723,6 +723,70 @@ def rom_value(program, address, bits):
     if game_profile.rom.canonical_address(address) is None:
         return None
     return {8: program.mem.r8, 16: program.mem.r16, 32: program.mem.r32}[bits](address)
+
+
+def name_params_by_use(emitter, writers, make_writer, rounds=8):
+    """The names of the parameters and results symbols.txt does not name, from what each function does with them
+    (decompiler/emit.py's entry_hints: the structure read through it, or what the functions it only passes it on
+    to call it), into emitter.param_names, and 'writers' made again where they change: the function itself and its
+    callers, whose variables passed as one take its name. A name that comes from the functions called is known once
+    theirs are, so the rounds go on until nothing changes; symbols.txt's names stand. (The 68000's driver and the
+    sound program's use it, with the profile's PARAMS_BY_USE.)"""
+    named = set(emitter.param_names) | set(emitter.result_names)
+    named |= {(entry, int(value[1:])) for entry, spot, value in emitter.local_names
+              if spot == "entry" and re.fullmatch(r"r\d+", value)}
+    given = dict(emitter.param_names)
+    callers = {}
+    for entry, writer in writers.items():
+        for target in writer.callees():
+            callers.setdefault(target, set()).add(entry)
+    inferred = {}
+    for _ in range(rounds):
+        found = {}
+        passed = {}
+        if emit.PARAMS_FROM_CALLERS:
+            for writer in writers.values():
+                for key, names in writer.passed_names().items():
+                    passed.setdefault(key, set()).update(names)
+        for entry, writer in writers.items():
+            # (two of a function's parameters that are the same kind of thing: object, object_2)
+            taken = {emitter.param_name(entry, value) for value in writer.params + writer.results
+                     if value[0] != "r" or (entry, value[1]) in named}
+            hints = writer.entry_hints()
+            # (else what every caller passes in the register, when they all have a name for it and agree:
+            # constants say nothing; a variable still named after the register, that it is anything)
+            for value in writer.params:
+                if value[0] != "r" or value[1] in hints or (entry, value[1]) in named:
+                    continue
+                names = passed.get((entry, value[1]), set()) - {emit.CONSTANT_PASSED}
+                if len(names) == 1 and None not in names:
+                    name = emitter.local_name(next(iter(names)))
+                    if name is not None:
+                        hints[value[1]] = name
+            for register, name in sorted(hints.items()):
+                if (entry, register) in named:
+                    continue
+                number, unique = 1, name
+                while unique in taken:
+                    number += 1
+                    unique = f"{name}_{number}"
+                taken.add(unique)
+                found[(entry, register)] = unique
+        if found == inferred:
+            break
+        changed = {key[0] for key, _ in set(found.items()) ^ set(inferred.items())}
+        inferred = found
+        emitter.param_names = {**inferred, **given}
+        # (the function, its callers, whose variables passed to it take its names, and the functions it calls,
+        # whose parameters take its variables')
+        callees = {entry: writer.callees() for entry, writer in writers.items()} \
+            if emit.PARAMS_FROM_CALLERS else {}
+        for entry in changed | {caller for target in changed for caller in callers.get(target, ())} \
+                | {callee for entry in changed for callee in callees.get(entry, ())}:
+            if entry in writers:
+                writers[entry] = make_writer(entry)
+    print(f"parameters: {len(inferred)} named by what the functions do with them")
+    return inferred
 
 
 def fewer_controls(texts, writers, write_way, notes_of, read=None):

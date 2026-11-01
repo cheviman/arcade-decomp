@@ -5,7 +5,7 @@ Name:        decompile.py
 Description: decompiles a 68000 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     29-10-2026
-Modified:    29-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--checks] [--trace] [--out DIR] [--symbols FILE]
@@ -42,6 +42,7 @@ import disassemble  # noqa: E402
 from decompile import call_results, fewer_controls, fewer_write_backs, grouped_prototypes  # noqa: E402
 from decompile import replaced_functions, source_files, twin, write_sources, write_variables  # noqa: E402
 from decompile import write_backs  # noqa: E402
+from decompile import name_params_by_use  # noqa: E402
 from decompiler import cleanup  # noqa: E402
 from decompiler import conditions  # noqa: E402
 from decompiler import cpu  # noqa: E402
@@ -88,6 +89,12 @@ def configure():
     signatures.INITIAL = {}
     dataflow.HANDLER_SLOTS = ()
     dataflow.WORKLIST = True
+    # (the profile's PASSES_BY_PART, off by default: what a function reads to hand back a register, part by part)
+    dataflow.PASSES_BY_PART = getattr(game_profile, "PASSES_BY_PART", False)
+    # (and UNCHANGED_PARTS: "bset #7, D7" writes D7's low byte only)
+    dataflow.UNCHANGED_PARTS = getattr(game_profile, "UNCHANGED_PARTS", False)
+    # (and NARROW_OUTPUTS: what a function hands back is what its callers read once everything is known)
+    dataflow.NARROW_OUTPUTS = getattr(game_profile, "NARROW_OUTPUTS", False)
     knownbits.SIGN_EXTENSIONS = True
     decompiler_emit.WIDENED_INDEXES = True
 
@@ -266,6 +273,8 @@ def table_registry(named, loaded):
     for address, name in loaded:
         item = named.tables.get(address)
         size = item.bits // 8 if item is not None else 1
+        if item is None and address in pointers.RECORD_TABLES and pointers.RECORDS_LOADED_WHOLE:
+            size = pointers.STRUCTS[pointers.RECORD_TABLES[address][1]]    # (a record at a time)
         lines.append(f"\t{{ \"{name}\", 0x{address:06X}u, &{name}_data, {size} }},")
     lines += ["};", "", f"const size_t game_table_count = {len(loaded)};"]
     return lines
@@ -300,13 +309,22 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     whole = set()
     live_after = {}
     live_at_start = {}
+    # (the profile's CONSTANT_TABLE_BASES, off by default: a load through a register that holds a table's address on
+    # every way to it reads that table, expressions.table_bases)
+    code = program.analysis.owner
+
+    def is_table(value):
+        return analysis.CODE_START <= value < emit.PROGRAM_AREA[1] and value not in code
+    table_bases = getattr(game_profile, "CONSTANT_TABLE_BASES", False)
     for entry, function in built.items():
         expressions.drop_repacks(function, flow)
         after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
         expressions.tidy(function, flow, after, whole)
         results_of_calls = call_results(function, found, flow)
         if expressions.propagate_constants(function, results_of_calls, signatures.CONTEXT) \
-                | expressions.fold_kept_constants(function, results_of_calls, signatures.CONTEXT):
+                | expressions.fold_kept_constants(function, results_of_calls, signatures.CONTEXT) \
+                | (expressions.table_bases(function, results_of_calls, signatures.CONTEXT, is_table)
+                   if table_bases else 0):
             after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
             expressions.tidy(function, flow, after, whole)
         if expressions.inline_registers(function, flow, after, whole):
@@ -415,8 +433,15 @@ def write_c(program, out_dir, variables_path=None, trace=False):
                 joined[entry].append(way)
             structure.split_small_exits(function, notes)
         structure.split_loop_entries(function, notes)
+    if getattr(game_profile, "LOOP_COUNTERS", False):
+        # (the profile's LOOP_COUNTERS: the variable a dbcc counts down is the loop's count)
+        decompiler_emit.COUNTER_SITES = frozenset(address for address, instruction in program.analysis.instructions.items()
+                                                  if instruction.mnemonic == "dbcc")
     writers = {entry: emit.Writer(emitter, function, live_after[entry], fields[entry], live_at_start[entry])
                for entry, function in built.items()}
+    if decompiler_emit.PARAMS_BY_USE:
+        name_params_by_use(emitter, writers, lambda entry: emit.Writer(emitter, built[entry], live_after[entry],
+                                                                        fields[entry], live_at_start[entry]))
     texts = {}
     problems = []
     for entry, writer in writers.items():
