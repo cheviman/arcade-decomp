@@ -2,9 +2,9 @@
 Name:        check_scenarios.py
 Description: runs every control script on the reference and on the translated game, compares them frame by
              frame, and checks that the static analysis alone finds all the code the reference ran
-Version:     0.1.0
+Version:     0.1.1
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    01-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-only] [--translated] [--video]
@@ -64,8 +64,10 @@ SOUND_TIMING = ROOT / "build" / "sound" / "timing.txt"
 
 
 def executable(name):
-    path = BIN / (name + ".exe")
-    return path if path.exists() else BIN / name
+    for path in (BIN / (name + ".exe"), BIN / name):
+        if path.exists():
+            return path
+    raise SystemExit(f"{BIN / name}: no such executable")
 
 
 def run_reference(script, out, video, sound=False, timing=True):
@@ -212,8 +214,13 @@ def main():
     for name in names:
         if not (CONTROLS / f"{name}.txt").exists():
             raise SystemExit(f"{CONTROLS / (name + '.txt')}: no such script")
+    # what the runs start, before the first of them (with --native-only the reference runs only where it
+    # has no results yet)
+    if only_reference or not native_only:
+        executable(REFERENCE)
     if only_reference:
         return reference_only(names, jobs, video, sound)
+    executable(GAMES[game][0])
 
     def check(name):
         script = CONTROLS / f"{name}.txt"
