@@ -100,6 +100,9 @@ def configure():
     dataflow.NARROW_OUTPUTS = getattr(game_profile, "NARROW_OUTPUTS", False)
     # (and CHOSEN_IN_ORDER: a web symbols.txt names twice takes the name of its definition first in the program)
     variables.CHOSEN_IN_ORDER = getattr(game_profile, "CHOSEN_IN_ORDER", False)
+    # (and JOIN_KEPT_PARTS: a part written into a register whose rest is read afterwards is the same variable)
+    variables.JOIN_KEPT_PARTS = getattr(game_profile, "JOIN_KEPT_PARTS", False)
+    expressions.PARTIAL_WRITES_STAY = variables.JOIN_KEPT_PARTS    # (and stays a statement: x = (x & ~0xFFu) | y)
     knownbits.SIGN_EXTENSIONS = True
     decompiler_emit.WIDENED_INDEXES = True
 
@@ -110,6 +113,9 @@ CARRIED = getattr(game_profile, "CARRIED_REGISTERS", False)
 # the virtual registers that hold the carried parts: VIRTUAL_BASE + the register (past the V60's numbers the
 # decompiler knows: R20 and R23 are OutRunners' context registers, R26-R33 its string moves and stack)
 VIRTUAL_BASE = 40
+# and those of what a function hands from routine to routine ("register a5 NAME FUNCTION": the object loop), one after
+# another from here, past the virtual registers of what the frame carries
+SEEDED_BASE = 56
 
 
 def load_program(source):
@@ -196,8 +202,23 @@ def carry(program, built, flow, found):
     """What the registers carry from one function to a later one in the virtual registers, global variables in C
     (decompiler/carried.py), and the data flow and signatures solved again with them: (flow, signatures, {register:
     its virtual register} of those that carry something)"""
-    analysis = carried.Analysis(flow, built, found, by_value(found), range(15))
-    virtual = {index: VIRTUAL_BASE + index for index in range(15)}
+    # (the profile's CARRIED_CUTS, off by default: a parameter a function reads for itself, or a result it works out,
+    # stays its own, the carried value crossing by a copy)
+    carried.CUT_OWN_PORTS = getattr(game_profile, "CARRIED_CUTS", False)
+    # the functions that hand what a register holds from one routine to the next ("register a5 NAME FUNCTION")
+    known = disassemble.load_names(SYMBOLS, REGISTERS)
+    by_name = {name: entry for entry, name in program.names.items()}
+    seeds = []
+    for (function_name, index) in sorted(known.carried_seeds):
+        if function_name not in by_name:
+            raise SystemExit(f"{SYMBOLS.name}: a register line for '{function_name}', which is no function")
+        seeds.append((by_name[function_name], index))
+    analysis = carried.Analysis(flow, built, found, by_value(found), range(15), seeds=seeds)
+    virtual = {(index, None): VIRTUAL_BASE + index for index in range(15)}
+    for number, key in enumerate(sorted(key for key in analysis.carried_groups() if key[1] is not None)):
+        virtual[key] = SEEDED_BASE + number
+    if max(virtual.values()) >= 64:
+        raise SystemExit("more carried registers than the decompiler numbers")
     # a function that puts a register back gives its callers what they had: the virtual register too, which is a
     # global the code it calls in between may change, so none of that may happen (it would be a saved copy in the C)
     carrying = analysis.carried_parts()
@@ -209,26 +230,35 @@ def carry(program, built, flow, found):
     moved = analysis.split(built, virtual)
     if not moved:
         return flow, found, {}
-    used = {index: virtual[index] for index in sorted(moved)}
+    used = {number: key for key, number in virtual.items() if number in moved}
     for function in built.values():
-        function.preserved = set(getattr(function, "preserved", ())) | {used[index] for index in used
-                                                                          if index in getattr(function, "preserved", ())}
+        kept = set(getattr(function, "preserved", ()))
+        function.preserved = kept | {number for number, key in used.items() if key[0] in kept}
     profile = cpu.current
-    cpu.use(dataclasses.replace(profile, registers=profile.registers + tuple(used.values()),
-                                register_bits={**profile.register_bits, **{number: 32 for number in used.values()}}))
-    signatures.CONTEXT = tuple(used.values())
+    # (a value a function keeps a while in a virtual register before the global's is a local named after the global,
+    # screen_x_high_2: the virtual register's number, r41, is no name)
+    globals_named = {}
+    for number, (index, seed) in used.items():
+        name = known.registers.get(index) if seed is None else known.carried_seeds.get((program.names[seed], index))
+        if name is not None:
+            globals_named[number] = name
+    cpu.use(dataclasses.replace(profile, registers=profile.registers + tuple(sorted(used)),
+                                register_bits={**profile.register_bits, **{number: 32 for number in used}},
+                                variable_names={**profile.variable_names, **globals_named}))
+    signatures.CONTEXT = tuple(sorted(used))
     # (no part of them is live where a function ends but what its callers read: decompiler/cleanup.py context_live)
-    signatures.SCRATCH_CONTEXT = {number: 0 for number in used.values()}
+    signatures.SCRATCH_CONTEXT = {number: 0 for number in used}
     recovered = flow.conditions_recovered
     flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
     # (of the virtual registers, only the parts something carries: an interrupt reads those, and a copy of a local
     # into one reads no more of the register than those)
-    flow.context = frozenset(("r", used[index], part) for index, parts in carrying.items() if index in used
-                             for part in parts)
+    flow.context = frozenset(("r", virtual[key], part) for key, parts in analysis.carried_groups().items()
+                             if key in virtual and virtual[key] in used for part in parts)
     flow.declared = declared_results(program, signatures.OPEN)
     flow.solve()
     flow.conditions_recovered = recovered
-    return flow, signatures.compute(flow), used
+    return flow, signatures.compute(flow), {number: (key[0], None if key[1] is None else program.names[key[1]])
+                                            for number, key in sorted(used.items())}
 
 
 def check(program):
@@ -290,6 +320,27 @@ def code_values(program):
             found.add(value)
     for values in program.analysis.object_fields.values():
         found |= {value for kind, value in values if kind == analysis.CONSTANT and value in program.entries}
+    return found
+
+
+def referenced_addresses(program):
+    """The program's addresses below 0x10000 its instructions name as data addresses (lea and pea of an absolute or
+    PC-relative place, an absolute operand, a long immediate the code moves as an address): a number of the C with one
+    of these values is an address, not a count (the profile's ADDRESS_REFERENCES). Code is left out (its addresses
+    are NAME_ADDRESS), and so are the multiples of 0x100, as likely a count as an address"""
+    code = program.analysis.owner
+    found = set()
+    for instruction in program.analysis.instructions.values():
+        for position, operand in enumerate(instruction.operands):
+            if operand.mode in ("abs_short", "abs_long", "pc_disp"):
+                value = operand.value & 0xFFFFFF
+            elif operand.mode == "immediate" and position == 0 and instruction.size == "l" \
+                    and instruction.mnemonic in ("move", "movea"):
+                value = operand.value & 0xFFFFFF
+            else:
+                continue
+            if analysis.CODE_START <= value < 0x10000 and value & 0xFF and value not in code:
+                found.add(value)
     return found
 
 
@@ -436,6 +487,15 @@ def write_c(program, out_dir, variables_path=None, trace=False):
             hints.setdefault(entries_by_name[function_name], {})[int(value[1:])] = hinted_kind(struct)
         elif spot != "entry":
             site_hints[(spot, int(value[1:]))] = hinted_kind(struct)
+    # (what a param or local line says a register points at, the global that carries it there points at too: the
+    # object loop's A5 is the animations a walk's routine reads where an enemy turns)
+    for number, (index, _) in carrying.items():
+        for entry_hints in hints.values():
+            if index in entry_hints:
+                entry_hints.setdefault(number, entry_hints[index])
+        for (spot, register), kind in list(site_hints.items()):
+            if register == index:
+                site_hints.setdefault((spot, number), kind)
     families, global_families, scoped_targets = object_families(known, names)
     typing = pointers.Program(built, flow, found, results_of_calls, signatures.CONTEXT, known.targets, hints,
                               site_hints, scoped_targets, families, global_families)
@@ -453,10 +513,15 @@ def write_c(program, out_dir, variables_path=None, trace=False):
 
     always = {entry: set(summary.always) for entry, summary in flow.summaries.items()}
     emitter = emit.Emitter(built, found, names, signatures.CONTEXT, set(), named, always, program.mem.r32, trace)
-    # what a register carries is the global symbols.txt's register line names for it (register d7 NAME)
-    emitter.register_names = {number: known.registers[index] for index, number in carrying.items()
-                              if index in known.registers}
-    unused = sorted(name for index, name in known.registers.items() if index not in carrying)
+    # what a register carries is the global symbols.txt's register line names for it (register d7 NAME), what one
+    # function hands from routine to routine the one its line names with that function (register a5 NAME FUNCTION)
+    emitter.register_names = {}
+    for number, (index, seed) in carrying.items():
+        name = known.registers.get(index) if seed is None else known.carried_seeds.get((seed, index))
+        if name is not None:
+            emitter.register_names[number] = name
+    unused = sorted(name for index, name in known.registers.items() if (index, None) not in carrying.values())
+    unused += sorted(name for (seed, index), name in known.carried_seeds.items() if (index, seed) not in carrying.values())
     if unused:
         raise SystemExit(f"{SYMBOLS.name} names what registers carry that carry nothing: " + ", ".join(unused))
     emitter.layouts = pointers.Layouts(accesses, known)
@@ -466,6 +531,10 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     emitter.flow = flow
     emitter.result_bits = dict(cleanup.RESULT_BITS)
     emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in code_values(program)}
+    # (the profile's ADDRESS_REFERENCES, off by default: a number below 0x10000 an instruction names as a data address
+    # is that address, named by the data around it or reported as an address printed as a number)
+    if getattr(game_profile, "ADDRESS_REFERENCES", False):
+        emitter.referenced = referenced_addresses(program)
     emitter.data_labels = {address: name for address, name in data_names.items() if address not in named.tables}
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}
     emitter.comments = dict(known.comments)
@@ -553,7 +622,8 @@ def write_c(program, out_dir, variables_path=None, trace=False):
         raise SystemExit(f"{SYMBOLS.name}: a file of the program in sound/, which is the sound program's")
     prototypes = grouped_prototypes(files, lambda entry: emitter.prototype(entry) + (
         ";\n" + emitter.definition(entry) if names[entry] in emitter.replaced else ""))
-    addresses = [f"#define {name} 0x{address:06X}u" for address, name in sorted(emitter.code_addresses.items())]
+    addresses = [f"#define {name} 0x{address:06X}u"
+                 for address, name in sorted({**emitter.case_addresses, **emitter.code_addresses}.items())]
     guard = game_profile.GUARD
     globals_names = [emitter.context_name(number) for number in signatures.CONTEXT]
     carried_text = ""

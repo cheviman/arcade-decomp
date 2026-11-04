@@ -55,6 +55,11 @@ FULL_PARTS = (0, 1, 2)
 # name of the definition first in the program: off by default (the first one found, which hangs on the order the web's
 # definitions were joined in, an order of sets); the 68000's (m68000/decompile.py, the profile's CHOSEN_IN_ORDER)
 CHOSEN_IN_ORDER = False
+# whether a write of a part of a register that keeps the rest, where the rest is read afterwards ("move.b #3, D0" on a
+# counter whose high byte the dbra after it counts with), is the same variable changed in part: off by default (a new
+# value, as a sound number put in the low byte of whatever R0 held, when nothing reads the rest); the 68000's
+# (m68000/decompile.py, the profile's JOIN_KEPT_PARTS)
+JOIN_KEPT_PARTS = False
 
 
 def outside_loads(expression):
@@ -217,10 +222,19 @@ class Variables:
                 if isinstance(statement, ir.SetReg):
                     # worked out from the register itself: the same variable, changed (in a partial write,
                     # the part it writes has to come from the register too)
-                    _, written, _ = dataflow.partial_write(statement)
+                    _, written, keep = dataflow.partial_write(statement)
                     for node in outside_loads(written):
                         if isinstance(node, ir.Reg) and node.index == index:
                             for previous in self.uses.get(id(node), ()):
+                                self.webs.join(previous, definition)
+                    if JOIN_KEPT_PARTS and keep and self.after is not None:
+                        # (the rest it keeps is read afterwards: what the register held goes on in it, changed in
+                        # part, R = (R & keep) | rest in place)
+                        live = self.after.get(id(statement)) or ()
+                        kept = {part for part, bits in dataflow.PARTS if keep & bits}
+                        if any(variable[0] == "r" and variable[1] == index and len(variable) > 2
+                               and variable[2] in kept for variable in live):
+                            for previous in self.uses.get(id(statement.value.args[0].args[0]), ()):
                                 self.webs.join(previous, definition)
                 returned = self.returned_value(statement) if not isinstance(statement, ir.SetReg) else {}
                 if index in returned:

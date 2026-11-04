@@ -68,6 +68,7 @@ from decompiler import preserved  # noqa: E402
 from decompiler import signatures  # noqa: E402
 from decompiler import stack  # noqa: E402
 from decompiler import structure  # noqa: E402
+from decompiler import variables  # noqa: E402
 from v60 import ir  # noqa: E402
 from z80 import analysis  # noqa: E402
 from z80 import emit  # noqa: E402
@@ -84,6 +85,21 @@ INTERRUPT_HANDLER = 0x0038
 CREATED = getattr(game_profile, "SOUND_CREATED", "13-10-2026")
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 REGISTERS = {name: index for index, name in cpu.Z80.register_names.items()}    # param and local lines
+
+
+def code_values(program):
+    """Addresses of the program's functions it loads into a register pair as values (ld hl, nn): the handlers it
+    stores in its channels' records and compares (0, the reset's, is a zero)"""
+    found = set()
+    for body in program.bodies.values():
+        for instruction in body.values():
+            if instruction.mnemonic != "ld" or len(instruction.operands) != 2:
+                continue
+            to, source = instruction.operands
+            if to.mode == "reg" and to.reg in ("bc", "de", "hl", "ix", "iy") and source.mode == "immediate" \
+                    and source.value in program.entries and source.value:
+                found.add(source.value)
+    return found
 
 
 def load_program():
@@ -279,6 +295,12 @@ def write_c(program, out_dir, variables_path=None):
     # the reads of (hl) in the blocks after it no longer keep HL set for the C)
     constant_addresses = getattr(game_profile, "SOUND_CONSTANT_ADDRESSES", False)
     ram = getattr(game_profile, "SOUND_RAM_AREA", emit.SHARED_RAM)
+    # (the profile's SOUND_CARRY_COMPARISONS, off by default: the borrow of "sbc hl,de" reads a < b + borrow,
+    # expressions.py; and SOUND_JOIN_KEPT_PARTS: a byte written into a pair whose other byte is read afterwards is
+    # the pair's value changed in part, decompiler/variables.py)
+    expressions.CARRY_COMPARISONS = getattr(game_profile, "SOUND_CARRY_COMPARISONS", False)
+    expressions.SHIFTED_OUT_PARTS = expressions.CARRY_COMPARISONS
+    variables.JOIN_KEPT_PARTS = getattr(game_profile, "SOUND_JOIN_KEPT_PARTS", False)
 
     def is_variable(value):
         return ram[0] <= value < ram[1]
@@ -363,6 +385,12 @@ def write_c(program, out_dir, variables_path=None):
     emitter.flow = flow
     emitter.data_labels = {address: name for address, name in data_names.items() if address not in named.tables}
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}
+    # (the profile's SOUND_CODE_VALUES, off by default: the handlers the program stores in its channels' records, a
+    # function's address it loads as a value, by name, NAME_ADDRESS, and the switches on them case by case)
+    if getattr(game_profile, "SOUND_CODE_VALUES", False):
+        from decompiler import emit as decompiler_emit
+        emitter.code_addresses = {value: names[value] + "_ADDRESS" for value in code_values(program)}
+        decompiler_emit.NAMED_CODE_CASES = True
     emitter.comments = dict(known.comments)
     emitter.constants = dict(known.constants)    # (sound_symbols.txt's constant lines: a number a function uses, by name)
     emitter.replaced = replaced_functions([(ROOT / "runtime" / "sound_replaced.txt", "BOARD_ORIGINAL")])
@@ -463,6 +491,10 @@ def write_c(program, out_dir, variables_path=None):
         + ("/* the board's I/O ports the program uses */\n" + "\n".join(ports) + "\n\n" if ports else "")
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM sound_symbols.txt labels */\n"
         + "\n".join(f"#define {name}_ADDRESS 0x{address:04X}u" for address, name in sorted(emitter.data_labels.items()))
+        + ("\n\n/* where the code the program holds as values is (the handlers it stores and switches on) */\n"
+           + "\n".join(f"#define {name} 0x{address:04X}u" for address, name
+                       in sorted({**emitter.case_addresses, **emitter.code_addresses}.items()))
+           if emitter.code_addresses or emitter.case_addresses else "")
         + ("\n\n/* numbers the code uses, by name (sound_symbols.txt's constant lines) */\n"
            + "\n".join(f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
                                                                                 in emitter.constants.items()}))

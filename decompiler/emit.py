@@ -66,6 +66,13 @@ OWN_OBJECT_REGISTERS = (20, 23)
 # game/support.h): the compiler would take it for a way out with no value. Off by default; the 68000's (m68000/emit.py,
 # the profile's UNREACHABLE_ENDS)
 UNREACHABLE_ENDS = False
+# whether a switch on the address of the code a table of the program's data holds (a call or a jump through a table of
+# handlers, which the data decides) names each case after the function it runs (case NAME_ADDRESS:) rather than its
+# address: off by default; the 68000's (m68000/emit.py, the profile's NAMED_CODE_CASES)
+NAMED_CODE_CASES = False
+# whether a number widened into a field's address (an index, a signed word, "(A4,D4.w)") leaves its variable no
+# pointer, whatever else the function does with it: off by default; the 68000's (m68000/emit.py, SIGNED_OFFSETS)
+INDEXES_NOT_POINTERS = False
 # the structure whose fields a family of functions names its own way (symbols.txt "scoped" lines), and that a function
 # of a family runs on in OWN_OBJECT_REGISTERS: the games' objects; another program's (a sound driver's channels) gives
 # its own
@@ -685,8 +692,13 @@ class FunctionWriter:
                     others += [node.address for node in ir.walk(expression)
                                if isinstance(node, ir.Load) and id(node) not in self.fields]
                 for address in addresses:
+                    # (with INDEXES_NOT_POINTERS, not a number widened into the address: the player times 8 a
+                    # record of the players is reached by, PLAYER(PLAYER_ADDRESS(0) + (int16_t)offset))
+                    widened = {id(inner) for node in ir.walk(address) if INDEXES_NOT_POINTERS
+                               and isinstance(node, ir.Op) and node.name in ("sext", "zext")
+                               for inner in ir.walk(node.args[0])}
                     for node in ir.walk(address):
-                        if isinstance(node, ir.Reg):
+                        if isinstance(node, ir.Reg) and id(node) not in widened:
                             names.add(self.register_read(node)[0])
                 for address in others:
                     base = address.args if isinstance(address, ir.Op) and address.name == "add" else (address,)
@@ -2932,7 +2944,8 @@ class FunctionWriter:
             target = self.fresh("jump_target")
             lines = [f"{target} = {value};", f"switch ({target})", "{"]
         for choice in statement.choices:
-            lines += [f"case 0x{choice:06X}u:", "\t" + self.call_text(choice, statement.return_address), "\tbreak;"]
+            lines += [f"case {self.emitter.code_case(choice)}:", "\t" + self.call_text(choice, statement.return_address),
+                      "\tbreak;"]
         lines += checked_default("", target) + ["}"]
         return lines
 
@@ -3076,7 +3089,7 @@ class FunctionWriter:
                 lines.append(pad + f"{target} = {value};")
             lines += [pad + f"switch ({target})", pad + "{"]
             for values, body in node.cases:
-                lines += [pad + f"case 0x{value:06X}u:" for value in values]
+                lines += [pad + f"case {self.emitter.code_case(value)}:" for value in values]
                 lines += self.nodes(body, depth + 1)
             lines += checked_default(pad, target) + [pad + "}"]
             return lines
@@ -3213,6 +3226,7 @@ class Emitter:
         self.result_bits = {}       # entry -> bits of the register it returns, where narrower (cleanup.RESULT_BITS)
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
         self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS
+        self.case_addresses = {}    # address of code a switch on a handler's address runs -> NAME_ADDRESS
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
                                     # something else puts its own in its place (decompile.py, replaced_functions)
         self.trampolines = {}       # entry -> (function, way in) of a function that only jumps to another
@@ -3358,6 +3372,18 @@ class Emitter:
             if self.local_name(name) is not None:
                 return name
         return label_name(label)
+
+    def code_case(self, address):
+        """A switch's case for the code at 'address': its function's NAME_ADDRESS (NAMED_CODE_CASES, which the
+        header then defines), or the address"""
+        # (a function's name, or a label's inside one: a jump into the code of a command's handler)
+        name = (self.names.get(address) or getattr(self, "code_labels", {}).get(address)) if NAMED_CODE_CASES else None
+        if name is None:
+            return f"0x{address:06X}u"
+        # (kept apart from code_addresses, which names constants: a constant names the code it is only where the
+        # program holds that code as a value, whatever switches on it)
+        self.case_addresses[address] = name + "_ADDRESS"
+        return self.case_addresses[address]
 
     def address_text(self, value):
         """(C, precedence) for a constant that is an address with a name: a variable or table (its

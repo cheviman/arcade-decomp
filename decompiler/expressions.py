@@ -31,6 +31,27 @@ from . import dataflow
 # type): such a register stays a variable where its one use is the address of a memory access, so that the
 # access reads as the structure's field (decompile.py)
 KEEP_SITES = set()
+# whether the borrow of a subtraction with a borrow in ("sbc hl,de") reads as the comparison it is, a < b + borrow,
+# instead of the CPU's helper: off by default; the sound program's (decompile_sound.py, SOUND_CARRY_COMPARISONS)
+CARRY_COMPARISONS = False
+# whether a right shift drops what is or'd in below the bits it keeps (the sound program's, SOUND_CARRY_COMPARISONS
+# with it: decompile_sound.py)
+SHIFTED_OUT_PARTS = False
+# whether a register with a part written in place ("move.b ($5,A0), D0" over the D0 a word index is made of) stays
+# assigned where it is, not put into the one expression that reads it: the 68000's, with JOIN_KEPT_PARTS
+# (m68000/decompile.py)
+PARTIAL_WRITES_STAY = False
+
+
+def highest_bits(node):
+    """A mask of the bits 'node' can have set: a zero-extended value's width, a mask's constant, else all of them."""
+    if isinstance(node, ir.Const):
+        return node.value
+    if isinstance(node, ir.Op) and node.name == "zext":
+        return mask_of(node.args[0].bits)
+    if isinstance(node, ir.Op) and node.name == "and" and isinstance(node.args[1], ir.Const):
+        return node.args[1].value
+    return mask_of(node.bits)
 
 
 # ---- simplifying one expression ----
@@ -131,6 +152,19 @@ def simplify_one(node):
         inner = args[0]
         if isinstance(inner, ir.Op) and inner.name == "zext":
             return ir.zext(inner.args[0], bits)
+    if SHIFTED_OUT_PARTS and name == "shr" and constants[1] is not None and isinstance(args[0], ir.Op) \
+            and args[0].name in ("or", "and") and args[0].bits == bits:
+        # the bits a right shift drops: a part or'd in below them, a mask that keeps all of the ones it leaves
+        # (((hl & ~0xFF) | l) >> 8 is hl >> 8, the H of a pair whose L was written)
+        count, inner = constants[1], args[0]
+        below = (1 << count) - 1
+        if inner.name == "or":
+            for kept, dropped in ((inner.args[0], inner.args[1]), (inner.args[1], inner.args[0])):
+                if highest_bits(dropped) & ~below == 0 and kept.bits == bits:
+                    return ir.op("shr", (kept, args[1]), bits)
+        elif isinstance(inner.args[1], ir.Const) and inner.args[1].value | below == mask_of(bits) \
+                and inner.args[0].bits == bits:
+            return ir.op("shr", (inner.args[0], args[1]), bits)
     if name in ("helper:shl", "helper:sha") and constants[1] is not None and args[0].bits == bits:
         # SHL / SHA by a constant: the count is a signed byte, negative to the right
         count = signed_count(constants[1])
@@ -165,6 +199,15 @@ def simplify_one(node):
     if name in ("helper:div", "helper:rem") and constants[1] and constants[1] != mask_of(args[1].bits):
         # by a constant that is neither 0 nor -1 (MIN / -1 overflows): C's signed division, which truncates
         return ir.op("sdiv" if name == "helper:div" else "srem", args, bits)
+    if CARRY_COMPARISONS and name == "carry_sub" and constants[2] != 0 and args[0].bits <= 16:
+        # a - b - borrow borrows when a < b + borrow: a sum that cannot wrap in 32 bits; when a and b are numbers,
+        # a > b never borrows, a < b always does, and a == b borrows the borrow in
+        if constants[0] is not None and constants[1] is not None:
+            if constants[0] != constants[1]:
+                return ir.Const(int(constants[0] < constants[1]), 1)
+            return ir.trunc(args[2], 1) if args[2].bits > 1 else args[2]
+        return ir.op("ult", (ir.zext(args[0], 32),
+                             ir.op("add", (ir.zext(args[1], 32), ir.zext(args[2], 32)), 32)), 1)
     if name in ("carry_sub", "carry_add", "overflow_sub", "overflow_add") and constants[2] == 0:
         width = args[0].bits
         if name == "carry_sub":
@@ -589,6 +632,8 @@ def inline_register_block(block, flow, after, context):
         user = everything[use]
         if (getattr(statement, "origin", None), register) in KEEP_SITES and in_address(user, register):
             continue    # (a pointer symbols.txt types, which the access is made through)
+        if PARTIAL_WRITES_STAY and dataflow.partial_write(statement)[2] and not writes_register(user, flow, register):
+            continue    # (a part of the register changed in place stays a statement of its own, x = (x & ~0xFFu) | y)
         # dead after its use: the use writes it again, or nothing reads it later
         if use < len(statements) and not writes_register(user, flow, register):
             live = after.get(id(user))

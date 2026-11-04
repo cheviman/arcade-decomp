@@ -32,6 +32,9 @@ BITWISE = {BIT_AND, BIT_XOR, BIT_OR}
 
 PART = re.compile(r"A([ST])(8|16|32)\((.*?)(?:, (\d+))?\)$")
 INSIDE = set()    # the AS/AT accesses (their C) that lie inside the field or variable they are written over
+# whether (x & ~M) | M, a part of a value set to all ones (st, moveq #-1 to a byte) with the rest kept, reads x | M:
+# off by default; the 68000's (m68000/emit.py, the profile's MASK_FILLS)
+MASK_FILLS = False
 
 
 def part(bits, name, offset, whole):
@@ -79,6 +82,9 @@ def bitwise_merge(node):
     for keep, low in ((node.args[0], node.args[1]), (node.args[1], node.args[0])):
         if not (isinstance(keep, ir.Op) and keep.name == "and" and isinstance(keep.args[1], ir.Const)):
             continue
+        if MASK_FILLS and isinstance(low, ir.Const) and low.value & full == full & ~keep.args[1].value:
+            # (the part it clears, set to all ones: x | M)
+            return ir.op("or", (keep.args[0], ir.Const(low.value & full, bits)), bits)
         operation = low.args[0] if isinstance(low, ir.Op) and low.name == "zext" else None
         if not (isinstance(operation, ir.Op) and operation.name in ("or", "and", "xor")):
             continue

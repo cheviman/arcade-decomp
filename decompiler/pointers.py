@@ -700,6 +700,11 @@ def kind_of(node, state, zeros):
     return None
 
 
+# whether a halfword or byte sign-extended (the 68000's index register as a word, (d8,An,Dn.w)) is a displacement as a
+# constant either way is: off by default; the 68000's (m68000/emit.py, the profile's SIGNED_OFFSETS)
+SIGNED_OFFSETS = False
+
+
 def offset_sized(node, state=None):
     """True for a value that is surely below 0x10000: a constant, a byte or halfword (read, extended or
     cut), one masked to 16 bits, a register that holds one (OFFSET), or such a value times a small
@@ -716,6 +721,8 @@ def offset_sized(node, state=None):
     name, args = node.name, node.args
     if name in ("zext", "fits", "trunc"):
         return (args[0].bits if name == "zext" else node.bits) <= 16 or offset_sized(args[0], state)
+    if SIGNED_OFFSETS and name == "sext" and isinstance(args[1], ir.Const) and args[1].value <= 16:
+        return True    # (-0x8000 to 0x7FFF: a few bytes either way)
     if name == "and":
         return any(isinstance(arg, ir.Const) and arg.value < 0x10000 for arg in args)
     if name in ("mul", "shl") and isinstance(args[1], ir.Const) and args[1].value <= (8 if name == "mul" else 3):
@@ -1048,7 +1055,11 @@ def indexed_access(address, state, in_fields=True, zeros=None):
     size = STRUCTS[kind[0]]
     count = scaled_count(rest[0], size, zeros) if rest else None
     if rest and count is None:
-        if REVERSED and ELEMENT_READS and kind[0] in ROM_STRUCTS:
+        signed_word = SIGNED_OFFSETS and isinstance(rest[0], ir.Op) and rest[0].name == "sext" \
+            and isinstance(rest[0].args[1], ir.Const) and rest[0].args[1].value <= 16
+        if REVERSED and (ELEMENT_READS and kind[0] in ROM_STRUCTS or signed_word):
+            # (or a record of the RAM the pointer is moved to by a signed word, "(A4,D4.w)" on the players' records
+            # with the player times 8: the record there, STRUCT(p + (int16_t)n)->field)
             # (a record of the program's data the pointer is moved to by a number of bytes no rule shows to be whole
             # records: the record that many bytes on, STRUCT(p + n)->field, as its copy is made from there)
             element, offset = divmod(kind[1] + constant, size)

@@ -113,6 +113,14 @@ def use_memory_map(names):
     # (the profile's UNREACHABLE_ENDS, off by default: a function that hands back a value and ends in a block every way
     # out of which returns says its end is never reached)
     emit.UNREACHABLE_ENDS = getattr(game_profile, "UNREACHABLE_ENDS", False)
+    # (the profile's NAMED_CODE_CASES, off by default: a switch on the handler a table holds names each case after its
+    # function)
+    emit.NAMED_CODE_CASES = getattr(game_profile, "NAMED_CODE_CASES", False)
+    # (and MASK_FILLS: a part set to all ones with the rest kept reads x | M)
+    cprint.MASK_FILLS = getattr(game_profile, "MASK_FILLS", False)
+    # (and SIGNED_OFFSETS: a place plus a sign-extended word keeps its type, (d8,An,Dn.w) into the tile RAM)
+    pointers.SIGNED_OFFSETS = getattr(game_profile, "SIGNED_OFFSETS", False)
+    memory.SIGNED_INDEXES = pointers.SIGNED_OFFSETS    # (and an array of the work RAM by a signed word, by its element)    emit.INDEXES_NOT_POINTERS = pointers.SIGNED_OFFSETS    # (and the number such a record is reached by is no pointer)
     # (the profile's INSTANCE_FAMILIES_BY_FUNCTION, none by default: the family a structure at a fixed address is in
     # the functions whose names start so)
     emit.INSTANCE_FAMILIES_BY_FUNCTION = dict(getattr(game_profile, "INSTANCE_FAMILIES_BY_FUNCTION", {}))
@@ -144,7 +152,9 @@ def use_memory_map(names):
     pointers.PAGE_LINK_KINDS = {}
     pointers.NESTED = {}
     pointers.BELOW = {}
-    pointers.OWN_REGISTERS = ()
+    # (the profile's OWN_OBJECT_POINTERS, off by default: the object register is the family's object in the pointer
+    # analysis too, so a family's pointer fields type what is read through them, OBJECT(object)->enemy.definition)
+    pointers.OWN_REGISTERS = emit.OWN_OBJECT_REGISTERS if getattr(game_profile, "OWN_OBJECT_POINTERS", False) else ()
     pointers.STRUCT_FUNCTION = "ram"
     pointers.ROM_STRUCTS = set(names.rom_structs)
     # (records of the program's data and the work RAM's structures alike: past one, the next)

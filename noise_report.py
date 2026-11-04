@@ -46,6 +46,10 @@ MEMORY_ROUTINES = getattr(game_profile, "MEMORY_ROUTINES", {})
 # the names of the main CPU's registers, which its C names its values after until a line names them (rN by
 # default, the V60's; the profile's NOISE_REGISTERS for another CPU: the 68000's d0-d7 and a0-a6)
 CPU_REGISTER = getattr(game_profile, "NOISE_REGISTERS", r"r\d+")
+# whether a switch counts as one on code addresses by its cases, the code's address written as a number (case
+# 0x048F62u:), whatever its variable is called: the profile's CODE_SWITCH_CASES (TMNT's, whose switches on the handler a
+# table holds name their cases after the functions they run); by default, by its variable (jump_target)
+CODE_CASE = re.compile(r"\bcase 0x0[0-9A-F]{5}u:") if getattr(game_profile, "CODE_SWITCH_CASES", False) else None
 BASELINE = ROOT / "tools" / "noise_baseline.txt"
 UNNAMED_ADDRESSES = ROOT / "build" / "decompile" / "unnamed_addresses.txt"
 
@@ -94,7 +98,14 @@ KINDS = {
     "rom_table_reads": ("reads of a table the C names over an address (src/ram.h: rom(...); src/sound/sound.h: "
                         "sound_rom_at(...))", None),
     "board_replaced": ("functions the board puts its own in place of (BOARD_ORIGINAL, runtime/replaced.txt)", None),
+    "address_names": ("functions, data and tables named after their address by the tools, not by what they are "
+                      "(animations_02D8A6, unreached_0046A2; the profile's ADDRESS_NAMES)", None),
 }
+# the names made of an address: a name ending in the six hex digits of a place in the program, or those and _ADDRESS
+# (the game's profile turns the kind on with ADDRESS_NAMES: the V60 games' C has none)
+ADDRESS_NAME = re.compile(r"\b[a-z][a-z0-9_]*?_[0-9A-F]{6}(?:_ADDRESS)?\b")
+if getattr(game_profile, "ADDRESS_NAMES", False):
+    KINDS["address_names"] = (KINDS["address_names"][0], ADDRESS_NAME)
 INFORMATION = {
     "functions": "functions",
     "lines": "lines of C",
@@ -118,6 +129,7 @@ def count(paths):
         lines = path.read_text(encoding="ascii", errors="replace").splitlines()
         counts["lines"] += len(lines)
         in_function = False
+        switch_counted = True
         z80 = "sound" in path.parts    # (the sound program's C: its registers have names of their own)
         for index, line in enumerate(lines):
             if line.startswith(("/*", "   ", " *")):
@@ -144,8 +156,14 @@ def count(paths):
                 in_function = False    # (what follows a function's end, a table of data, is no code of it)
                 continue
             for kind, (_, pattern) in KINDS.items():
-                if pattern is not None:
+                if pattern is not None and not (kind == "code_switches" and CODE_CASE is not None):
                     counts[kind] += len(pattern.findall(line))
+            if CODE_CASE is not None:
+                if line.lstrip().startswith("switch ("):
+                    switch_counted = False
+                elif CODE_CASE.search(line) and not switch_counted:
+                    counts["code_switches"] += 1    # (a switch, by its first case)
+                    switch_counted = True
             if re.match(r"^\t(?:uint\d+_t|int\d+_t) ", line):
                 counts["register_names"] += len(re.findall(rf"\b{CPU_REGISTER}(?:_\d+)? = ", line))
                 counts["flag_variables"] += len(re.findall(r"\b(?:zero|negative|overflow|carry|extend)(?:_\d+)? = ",
@@ -204,7 +222,8 @@ def clean_measure(paths, extra, registers=None, faithful=False):
     early return; a parameter named after a register leaves its function unclean. With 'faithful', the
     FAITHFUL kinds, the registers kept as globals, the partial writes in place and the memory routines'
     memory reached by address (MEMORY_ROUTINES) are no leftovers."""
-    patterns = [pattern for kind, (_, pattern) in KINDS.items()
+    patterns = [CODE_CASE if kind == "code_switches" and CODE_CASE is not None else pattern
+                for kind, (_, pattern) in KINDS.items()
                 if pattern is not None and not (faithful and kind in FAITHFUL)] + list(extra) \
         + ([registers] if registers is not None and not faithful else [])
     by_address = KINDS["mem_access"][1]

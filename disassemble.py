@@ -214,6 +214,8 @@ class Names(NamedTuple):
                         # video RAM, the sprite RAM, the RAM the sound program shares
     scoped_arrays: dict  # (struct, family, offset) -> how many elements a family's field holds when it is an
                          # array ('scoped STRUCT FAMILY OFFSET NAME TYPE[N]'), read ->view.name[i]
+    carried_seeds: dict  # (function name, register number) -> name of what the function hands from one routine it
+                         # runs to the next in that register ('register a5 NAME FUNCTION': the object loop)
 
 
 def load_names(path, registers=None):
@@ -245,6 +247,8 @@ def load_names(path, registers=None):
         register RN     NAME             a register the whole program shares (a global variable in C); on the 68000
                                          (by its name: register d7 NAME) what code leaves in it for later code
                                          to read (decompiler/carried.py), the parts no routine sets first
+        register RN     NAME FUNCTION    what FUNCTION hands in the register from one routine it runs to the next
+                                         (the object loop), a global variable of its own
         scoped   STRUCT FAMILY OFFSET NAME TYPE [STRUCT]  (TYPE[N]: an array of N) a field as the functions whose names start with
                                          FAMILY use it, in the structure their code runs on (a structure or
                                          "rom": what it holds points at one); with "global" for STRUCT and
@@ -278,7 +282,7 @@ def load_names(path, registers=None):
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {}, set(), set(), {})
+                  set(), {}, set(), set(), {}, {})
     registers = registers or {}
 
     def register_number(text):
@@ -409,10 +413,14 @@ def load_names(path, registers=None):
                     names.local_structs[key] = parts[5]
             continue
         if parts[0] == "register":
-            # (RN, or the register's name on a processor whose registers have names: d7)
-            if len(parts) != 3 or register_number(parts[1]) is None or not parts[2].isidentifier():
-                raise SystemExit(f"{where}: expected 'register RN NAME'")
-            names.registers[register_number(parts[1])] = parts[2]
+            # (RN, or the register's name on a processor whose registers have names: d7; with a function, what it
+            # hands from one routine it runs to the next)
+            if len(parts) not in (3, 4) or register_number(parts[1]) is None or not parts[2].isidentifier()                     or len(parts) == 4 and not parts[3].isidentifier():
+                raise SystemExit(f"{where}: expected 'register RN NAME [FUNCTION]'")
+            if len(parts) == 4:
+                names.carried_seeds[(parts[3], register_number(parts[1]))] = parts[2]
+            else:
+                names.registers[register_number(parts[1])] = parts[2]
             continue
         if parts[0] == "field":
             array = re.fullmatch(r"(\w+)\[([0-9A-Fa-f]*)\]", parts[4]) if len(parts) in (5, 6) else None

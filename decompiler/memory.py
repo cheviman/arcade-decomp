@@ -286,8 +286,10 @@ class Memory:
         widths = {"variables": {}, "tables": {}, "hardware": {}}
         indexed = set()
         board_indexed = set()
-        # the tables of records (pointers.py reads them by name and field): no plain table of their own
-        records = [(address, address + names.structs[struct])
+        # the tables of records (pointers.py reads them by name and field): no plain table of their own; loaded a
+        # record at a time (the 68000's RECORD_TABLES), all their records ("table NAME[COUNT] STRUCT"), else the first
+        counts = getattr(names, "counts", {}) if pointers.RECORDS_LOADED_WHOLE else {}
+        records = [(address, address + names.structs[struct] * counts.get(address, 1))
                    for address, (_, struct) in getattr(names, "record_tables", {}).items()]
         for address_expression, bits in accesses:
             if bits not in TYPES:
@@ -442,7 +444,11 @@ class Memory:
         # of the table's elements; a register that may hold anything could be a pointer with a
         # displacement, and that read stays on the bus
         index = element_index(rest, bits)
-        if not indexed and not table_index(rest, bits):
+        # (or a sign-extended word into the work RAM, "(A5,D7.w)" with the array's address in A5: the element that
+        # many on, or before it, as the RAM macro reads it by the address, SIGNED_INDEXES)
+        signed_index = SIGNED_INDEXES and work_ram(base) and isinstance(rest, ir.Op) and rest.name == "sext" \
+            and isinstance(rest.args[1], ir.Const) and rest.args[1].value <= 16
+        if not indexed and not signed_index and not table_index(rest, bits):
             return self.named_read(own_copy(base), rest, bits, index, index_text)
         ram = work_ram(base)
         board = plain_hardware(base) and base in self.board
@@ -630,6 +636,9 @@ BYTE_INDEXES = False    # whether index_limit() looks at the index (the V60's pr
 # whether a table's reach is also bounded by the masks and shifts of the offset the code adds ((x & 3) << 2 reaches
 # 12 bytes past the table's start, whatever x's width): the 68000's (m68000/emit.py)
 BOUNDED_INDEXES = False
+# whether an array of the work RAM read with a sign-extended word ("(A5,D7.w)") reads its element by that number,
+# whatever the number's range: the 68000's, with the profile's SIGNED_OFFSETS (m68000/emit.py)
+SIGNED_INDEXES = False
 
 
 def offset_bound(node):
