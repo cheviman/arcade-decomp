@@ -12,7 +12,7 @@
  *      kref [--timing frames|cycles] [--frames N] [--hashes hashes.txt] [--trace executed.txt] [--calls called.txt]
  *           [--jumps jumps.txt] [--rom-reads reads.txt] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR]
  *           [--video-hashes hashes.txt] [--video-dump FRAME ... --video-dir DIR] [--video-check FILE]
- *           [--sound-hashes hashes.txt]
+ *           [--graphics-uses uses.txt] [--sound-hashes hashes.txt]
  *           [--sound-wav sound.wav] [--sound-trace executed.txt] [--sound-rom-reads reads.txt]
  *           [--sound-commands commands.txt] [--script controls.txt] [--service] [--rom FOLDER]
  *           [--sound-check] [--assets-check FOLDER] [--sound-timing timing.txt]
@@ -48,6 +48,9 @@
  *    takes the board's memories when VBLANK ends (line 16, the scroll) and when it starts (the frame).
  *    --video-check draws every frame with the game's own video too (runtime/src/video.c) and writes "FRAME
  *    REFERENCE OWN" hashes; the first frame that differs goes to DIR/reference_N.bmp and DIR/own_N.bmp.
+ *    --graphics-uses draws every frame with the game's own video and writes the tiles and sprite cells a frame
+ *    shows for the first time (a pixel other than pen 0), with the frame and the game's state, attract step,
+ *    scene and area then: what each scene shows, to put the assets' tiles and sprites in sheets by subject.
  *
  *    --sound-hashes, --sound-wav and --sound-trace run the sound board (sound/ksound.cpp: MAME's Z80, K007232
  *    and uPD7759, ymfm's YM2151, the title music): for each frame the hash of the samples the sources made
@@ -474,7 +477,8 @@ int main(int argc, char **argv)
 		" [--rom-reads FILE] [--text FRAME ...]"
 		" [--dump FRAME ... --dump-dir DIR] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
 		" [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE] [--sound-rom-reads FILE]"
-		" [--sound-commands FILE] [--script FILE] [--service] [--rom FOLDER] [--video-check FILE] [--sound-check]"
+		" [--sound-commands FILE] [--script FILE] [--service] [--rom FOLDER] [--video-check FILE] [--graphics-uses FILE]"
+		" [--sound-check]"
 		" [--assets-check FOLDER] [--sound-timing FILE] [--sound-board-check FILE] [--assets FOLDER]\n";
 	std::string rom_folder = "rom";
 	std::string hashes_path, trace_path, calls_path, dump_folder = ".", video_hashes_path, video_folder = ".";
@@ -482,7 +486,7 @@ int main(int argc, char **argv)
 	std::string sound_timing_path, sound_board_path, own_assets_folder = "assets";
 	bool sound_check = false;
 	std::string sound_hashes_path, sound_wav_path, sound_trace_path, jumps_path, rom_reads_path;
-	std::string sound_rom_reads_path, sound_commands_path;
+	std::string sound_rom_reads_path, sound_commands_path, graphics_uses_path;
 	std::set<uint64_t> text_frames, dump_frames, video_dump_frames;
 	uint64_t frames = 600;
 	bool frames_given = false;
@@ -532,6 +536,8 @@ int main(int argc, char **argv)
 			video_hashes_path = argv[++index];
 		else if (argument == "--video-check" && has_value)
 			video_check_path = argv[++index];
+		else if (argument == "--graphics-uses" && has_value)
+			graphics_uses_path = argv[++index];
 		else if (argument == "--sound-check")
 			sound_check = true;
 		else if (argument == "--assets-check" && has_value)
@@ -644,7 +650,25 @@ int main(int argc, char **argv)
 	const bool video = video_hashes.is_open() || !video_dump_frames.empty() || video_check.is_open();
 	if (video)
 		kv_attach();
-	if (video_check.is_open())
+	// --graphics-uses: the game's own video draws every frame, marking the tiles and sprite cells it shows
+	std::ofstream graphics_uses;
+	static uint8_t tiles_shown[GAME_TILES_SIZE / 32], tiles_written[GAME_TILES_SIZE / 32];
+	static uint8_t sprites_shown[GAME_SPRITES_SIZE / 128], sprites_written[GAME_SPRITES_SIZE / 128];
+	static uint8_t tile_palettes[GAME_TILES_SIZE / 32], sprite_palettes[GAME_SPRITES_SIZE / 128];
+	if (!graphics_uses_path.empty())
+	{
+		graphics_uses.open(graphics_uses_path);
+		graphics_uses << "# the tiles and sprite cells the frames show first (kref --graphics-uses): tile CODE LAYERS"
+			" PALETTE FRAME KEY or sprite CODE PALETTE FRAME KEY; LAYERS bit 0 the fixed layer, 1 layer A, 2 layer B;"
+			" PALETTE the palette RAM's palette (0-63) it showed with; KEY the work RAM's 060001 060003 060005 060120"
+			" (the game's state, the attract mode's step, the scene, the area)\n";
+		tmnt_video_tiles_shown = tiles_shown;
+		tmnt_video_sprites_shown = sprites_shown;
+		tmnt_video_tile_palettes = tile_palettes;
+		tmnt_video_sprite_palettes = sprite_palettes;
+	}
+	const bool own_video = video_check.is_open() || graphics_uses.is_open();
+	if (own_video)
 		tmnt_video_reset();
 	std::ofstream sound_hashes;
 	if (!sound_hashes_path.empty())
@@ -693,7 +717,7 @@ int main(int argc, char **argv)
 	auto vblank_end = [&]() {
 		if (video)
 			kv_vblank_end();
-		if (video_check.is_open())
+		if (own_video)
 			tmnt_video_vblank_end();
 	};
 	// VBLANK begins (line 240): the frame is drawn, the board takes its events and the controls change, and
@@ -714,6 +738,30 @@ int main(int argc, char **argv)
 				write_bmp(video_folder + "/reference_" + std::to_string(frame) + ".bmp");
 				write_bmp(video_folder + "/own_" + std::to_string(frame) + ".bmp", own_frame.pixels);
 			}
+		}
+		else if (graphics_uses.is_open())
+			tmnt_video_vblank_start(&own_frame);
+		if (graphics_uses.is_open())
+		{
+			char key[16], line[64];
+			std::snprintf(key, sizeof(key), "%02X%02X%02X%02X", *tmnt_work_ram_byte(0x060001), *tmnt_work_ram_byte(0x060003),
+				*tmnt_work_ram_byte(0x060005), *tmnt_work_ram_byte(0x060120));
+			for (size_t code = 0; code < std::size(tiles_shown); code++)
+				if (tiles_shown[code] & ~tiles_written[code])
+				{
+					std::snprintf(line, sizeof(line), "tile %04zX %u %u %" PRIu64 " %s\n", code,
+						unsigned(tiles_shown[code] & ~tiles_written[code]), unsigned(tile_palettes[code]), frame, key);
+					graphics_uses << line;
+					tiles_written[code] = tiles_shown[code];
+				}
+			for (size_t code = 0; code < std::size(sprites_shown); code++)
+				if (sprites_shown[code] && !sprites_written[code])
+				{
+					std::snprintf(line, sizeof(line), "sprite %04zX %u %" PRIu64 " %s\n", code,
+						unsigned(sprite_palettes[code]), frame, key);
+					graphics_uses << line;
+					sprites_written[code] = 1;
+				}
 		}
 		tmnt_vblank_start();
 		tmnt_script_apply(script, tmnt_board.frame);
