@@ -110,6 +110,9 @@ def use_memory_map(names):
     emit.PARAMS_FROM_CALLERS = getattr(game_profile, "PARAMS_FROM_CALLERS", False)
     # (the profile's NAMES_BY_COMPARISONS, off by default: a variable compared with one field only takes its name)
     emit.NAMES_BY_COMPARISONS = getattr(game_profile, "NAMES_BY_COMPARISONS", False)
+    # (the profile's UNREACHABLE_ENDS, off by default: a function that hands back a value and ends in a block every way
+    # out of which returns says its end is never reached)
+    emit.UNREACHABLE_ENDS = getattr(game_profile, "UNREACHABLE_ENDS", False)
     # (the profile's INSTANCE_FAMILIES_BY_FUNCTION, none by default: the family a structure at a fixed address is in
     # the functions whose names start so)
     emit.INSTANCE_FAMILIES_BY_FUNCTION = dict(getattr(game_profile, "INSTANCE_FAMILIES_BY_FUNCTION", {}))

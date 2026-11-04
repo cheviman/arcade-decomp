@@ -61,6 +61,11 @@ PSW_INTERRUPTS = 1 << 18    # the processor status bit that lets interrupts in
 # the registers that hold the object a function of a family runs on when it starts (own_object): the V60 games'
 # object loop keeps it in R20 and R23; a CPU frontend whose games keep it elsewhere sets its own
 OWN_OBJECT_REGISTERS = (20, 23)
+# whether a function that hands back a value and ends in a block every way out of which returns (a switch on a state,
+# each case returning, or the ifs around such switches) says that its end is never reached ("unreachable();",
+# game/support.h): the compiler would take it for a way out with no value. Off by default; the 68000's (m68000/emit.py,
+# the profile's UNREACHABLE_ENDS)
+UNREACHABLE_ENDS = False
 # the structure whose fields a family of functions names its own way (symbols.txt "scoped" lines), and that a function
 # of a family runs on in OWN_OBJECT_REGISTERS: the games' objects; another program's (a sound driver's channels) gives
 # its own
@@ -3120,6 +3125,9 @@ class FunctionWriter:
         body = self.forward_results(list(self.written))
         if body and body[-1] == "\treturn;":
             body.pop()    # running off the end returns as well
+        if UNREACHABLE_ENDS and self.returned is not None and body and body[-1] == "\t}":
+            # (nothing follows the block that ends the body: every way out of it returns)
+            body.append("\tunreachable();")
         said = self.emitter.comments.get(self.emitter.names.get(self.entry, self.function.name))
         text = (comment_lines(said) if said else []) + [self.emitter.definition(self.entry), "{"]
         # the names the code mentions, fields (after "->" or ".") aside: an unused variable z is not

@@ -51,6 +51,10 @@ from . import cpu
 from . import dataflow
 
 FULL_PARTS = (0, 1, 2)
+# whether a web that symbols.txt names twice ("local" lines at two of its definitions, with different names) takes the
+# name of the definition first in the program: off by default (the first one found, which hangs on the order the web's
+# definitions were joined in, an order of sets); the 68000's (m68000/decompile.py, the profile's CHOSEN_IN_ORDER)
+CHOSEN_IN_ORDER = False
 
 
 def outside_loads(expression):
@@ -438,7 +442,11 @@ class Variables:
 
     def chosen_name(self, register, items):
         """The name symbols.txt gives the web, by any of its definitions, or None."""
-        for spot, value, _ in self.sites(register, items):
+        sites = self.sites(register, items)
+        if CHOSEN_IN_ORDER:
+            # (the definition first in the program: the function's start, then by address)
+            sites = sorted(sites, key=lambda site: (site[0] != "entry", site[0] if site[0] != "entry" else 0, site[1]))
+        for spot, value, _ in sites:
             name = self.chosen.get((spot, value))
             if name is not None:
                 return name

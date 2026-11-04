@@ -242,7 +242,9 @@ def load_names(path, registers=None):
     it (the game links its structures in the work RAM page by 16-bit addresses); "rom" after a u32 says it
     points into the program ROM. STRUCT.FAMILY (object.eggman_scene) says which family's structure it is:
     what is read through it reads as that family's code reads its own (its scoped fields).
-        register RN     NAME             a register the whole program shares (a global variable in C)
+        register RN     NAME             a register the whole program shares (a global variable in C); on the 68000
+                                         (by its name: register d7 NAME) what code leaves in it for later code
+                                         to read (decompiler/carried.py), the parts no routine sets first
         scoped   STRUCT FAMILY OFFSET NAME TYPE [STRUCT]  (TYPE[N]: an array of N) a field as the functions whose names start with
                                          FAMILY use it, in the structure their code runs on (a structure or
                                          "rom": what it holds points at one); with "global" for STRUCT and
@@ -407,9 +409,10 @@ def load_names(path, registers=None):
                     names.local_structs[key] = parts[5]
             continue
         if parts[0] == "register":
-            if len(parts) != 3 or not parts[1].upper().startswith("R") or not parts[1][1:].isdigit():
+            # (RN, or the register's name on a processor whose registers have names: d7)
+            if len(parts) != 3 or register_number(parts[1]) is None or not parts[2].isidentifier():
                 raise SystemExit(f"{where}: expected 'register RN NAME'")
-            names.registers[int(parts[1][1:])] = parts[2]
+            names.registers[register_number(parts[1])] = parts[2]
             continue
         if parts[0] == "field":
             array = re.fullmatch(r"(\w+)\[([0-9A-Fa-f]*)\]", parts[4]) if len(parts) in (5, 6) else None
