@@ -300,6 +300,18 @@ def write_coverage(analysis, references, classes, path, reads=None, summing=None
         verdict = "all" if decoded == stop - first else str(decoded)
         raw = image[first:min(stop, first + 12)].hex(" ")
         lines.append(f"{first:06X}  {stop - 1:06X}  {stop - first:6} {verdict:>8} {held:>8}  {raw}")
+    if reads is not None:
+        # the bytes the reference read that no table describes, by run, with the instructions that read them
+        read_runs = []
+        for start, end in CODE_CHIPS:
+            read_runs += runs_of(classes, READ, start, end)
+        title = "Read data no table describes, by address"
+        lines += ["", title, "-" * len(title), f"{'first':<7} {'last':<7} {'bytes':>6}  read by  first bytes"]
+        for first, stop in read_runs:
+            readers = sorted({pc for address in range(first, stop) for pc in reads.get(address, ())})
+            raw = image[first:min(stop, first + 12)].hex(" ")
+            lines.append(f"{first:06X}  {stop - 1:06X}  {stop - first:6}  {' '.join(f'{pc:06X}' for pc in readers[:6])}"
+                         f"{' ...' if len(readers) > 6 else ''}  {raw}")
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
     return lines
 

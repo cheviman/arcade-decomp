@@ -35,8 +35,9 @@ A table's length is what symbols.txt says (a data line with record=4 code=0 coun
 nothing, its entries up to the first that is not a code address a trial decode accepts, or that is code or
 another table already, or a place the code names as data (an absolute or PC-relative operand, a long it
 stores: what a table read on into holds can decode, so the walk starts again with the table stopping there
-once the code that names it is found); a zero entry before one that is not (and first, or after one that is not) is an
-unused one (a state with no handler), but where the code names it as data (TABLE_ENDS_BEFORE_UNUSED: the table stops). A jump or call through a field of a structure, movea.l (d16,An), Am
+once the code that names it is found); a zero entry (or one of TABLE_UNUSED_ENTRIES') before one that is not (and
+first, or after one that is not) is an unused one (a state with no handler), but where the code names it as data
+(TABLE_ENDS_BEFORE_UNUSED: the table stops). A jump or call through a field of a structure, movea.l (d16,An), Am
 then jsr (Am), makes that offset a handler slot: an address stored in such a slot (move.l #code, or a
 register holding it) is code. symbols.txt keeps the V60's format (disassemble.load_symbols): func, code and
 data lines.
@@ -79,6 +80,9 @@ TABLE_BASES = (CONSTANT, CURSOR)    # what a table is read from: its address, or
 # be taken for an unused state first (the profile's TABLE_ENDS_BEFORE_UNUSED: TMNT's 049BC8 went on past the arc at
 # 049BD8, whose words 0000FFE0 and 0000FC00 decode, into two states no object has)
 ENDS_BEFORE_UNUSED = getattr(game_profile, "TABLE_ENDS_BEFORE_UNUSED", False)
+# the longs a table of handlers holds for a state with no handler: zero, and the profile's TABLE_UNUSED_ENTRIES
+# (TMNT's Rocksteady bullet, 04BFBE: FFFFFFFF for its state 3, and its state 4 after it)
+UNUSED_ENTRIES = frozenset(getattr(game_profile, "TABLE_UNUSED_ENTRIES", (0,)))
 ADDRESS_REGISTERS = frozenset(f"A{number}" for number in range(8))
 NO_WRITE = {"cmp", "cmpa", "cmpi", "cmpm", "tst", "btst", "chk"}   # an address register last, and not written
 
@@ -204,8 +208,11 @@ class Analysis:
                                      or address in self.table_tables or address in self.data_starts)
 
     def unused(self, where, first):
-        """A zero entry before one that is not, and first or after one that is not: a state with no handler"""
-        return self.mem.r32(where) == 0 and self.mem.r32(where + 4) != 0 and (first or self.mem.r32(where - 4) != 0)
+        """An entry of no handler (zero, UNUSED_ENTRIES) before one that is not, and first or after one that is not: a
+        state with no handler"""
+        held = self.mem.r32
+        return held(where) in UNUSED_ENTRIES and held(where + 4) not in UNUSED_ENTRIES \
+            and (first or held(where - 4) not in UNUSED_ENTRIES)
 
     def read_code_table(self, table):
         if table in self.code_tables:
@@ -592,7 +599,7 @@ class Analysis:
         for table, stop in self.table_ends.items():
             self.described.append((table, stop))
             for where in range(table, stop, 4):
-                if self.mem.r32(where):
+                if self.mem.r32(where) not in UNUSED_ENTRIES:
                     self.data_words[where] = self.mem.r32(where) & 0xFFFFFF
         for address, symbol in self.symbols.items():
             layout = symbol.layout
