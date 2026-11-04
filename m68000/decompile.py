@@ -29,7 +29,8 @@ the reset; the registry of the tables the game loads by name). Beside the build,
 (where each function is, its callers and callees).
 
 The functions the board puts its own in place of (runtime/replaced.txt, a name a line: the boot's ROM test, which
-sums chips the game does not have) are written as BOARD_ORIGINAL(name), and declared both ways in game.h.
+sums chips the game does not have) are written as BOARD_ORIGINAL(name), and declared both ways in game.h; a port's
+console build's (console/replaced.txt, where a port has one) as CONSOLE_ORIGINAL(name), the same way.
 """
 import dataclasses
 import re
@@ -539,7 +540,8 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}
     emitter.comments = dict(known.comments)
     emitter.constants = dict(known.constants)
-    emitter.replaced = replaced_functions([(ROOT / "runtime" / "replaced.txt", "BOARD_ORIGINAL")])
+    emitter.replaced = replaced_functions([(ROOT / "runtime" / "replaced.txt", "BOARD_ORIGINAL"),
+                                           (ROOT / "console" / "replaced.txt", "CONSOLE_ORIGINAL")])
     unknown = sorted({function_name for function_name, _ in known.params if function_name not in entries_by_name}
                      | {function_name for function_name, _, _ in known.locals if function_name not in entries_by_name})
     if unknown:
