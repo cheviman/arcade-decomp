@@ -103,7 +103,22 @@ Nothing here is a game's: no ROM, no names, no data.
   video chips, the K052109 and the K051960; the K007232, the uPD7759 and the YM2151) and ymfm's OPM in
   `ymfm/`; the Z80 core is `system32/reference/mame/z80`'s. `stub/emu.h` stands in for MAME's framework
   around the 68000, `video/emu.h` around the video and `sound/emu.h` around the sound board, which
-  `video/kvideo.cpp` and `sound/ksound.cpp` compile unchanged inside namespaces of their own.
+  `video/kvideo.cpp` and `sound/ksound.cpp` compile unchanged inside namespaces of their own. For a board on
+  Konami's own CPU, the 052001 and the 053248 (a 6809 with Konami's opcodes: The Simpsons, Vendetta...), the
+  game sets `K_CPU 053248` and `reference.cmake` builds MAME's 6809 core with Konami's opcodes (`mame/m6809`,
+  its steps written from `m6809.lst` and `konami.lst` by MAME's `m6809make.py` at build time) on
+  `stub6809/emu.h`, whose bus tells each read as an opcode, an argument or data, and `oracle_konami`, MAME's
+  disassembler of that CPU, against which its frontend is checked. Its `kref` (`kref_053248.cpp`) runs the
+  original program on that core against the game's board model (its runtime's `simpsons/machine.h`: the
+  banks the CPU's SETLN chooses, the palette's and the sprite RAM's views, the K052109's IRQ, the sprite DMA's
+  FIRQ, the ER5911 EEPROM) at MAME's pace, with its sound board (`sound/ksound_053260.cpp`: MAME's Z80 and
+  K053260, ymfm's YM2151, the Z80's NMI from the K053260's SH1), and writes each frame's state and sound
+  hashes, the places executed and called (the program ROM's offsets, the bank resolved), where each computed
+  jump went (`--jumps`), the ROM bytes read as data (`--rom-reads`), the fixed layer as text, the sound as a
+  WAV, and with its video (`video/kvideo_053246.cpp`: MAME's K052109, K053246/K053247 and K053251 as
+  `simpsons.cpp` draws them, after VBLANK) each frame's picture hash and frames as BMP. `mame/` holds MAME
+  0.289's K053246/K053247 (`konami/k053246_k053247_k055673`), K053251, K053260 (`sound/`), serial EEPROMs
+  (`machine/eepromser`) and `simpsons.cpp` driver.
 
 ## A game's profile
 

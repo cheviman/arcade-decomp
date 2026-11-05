@@ -236,6 +236,7 @@ struct attotime
 {
 	double seconds = 0;
 	static attotime from_hz(u32 hz) { return attotime{ hz ? 1.0 / hz : 0 }; }
+	static attotime from_ticks(u64 ticks, u32 hz) { return attotime{ hz ? double(ticks) / hz : 0 }; }
 	attotime operator*(u32 factor) const { return attotime{ seconds * factor }; }
 	static const attotime zero;
 	static const attotime never;
@@ -261,6 +262,7 @@ struct scheduler_stub
 struct running_machine_stub
 {
 	bool side_effects_disabled() const { return false; }
+	const char *describe_context() const { return "sound board"; }
 	scheduler_stub &scheduler() { return m_scheduler; }
 
 private:

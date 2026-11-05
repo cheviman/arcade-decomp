@@ -38,6 +38,7 @@ using indirect_pen_t = uint16_t;
 #define NAME(x) x, #x
 #define FUNC(x) &x, #x
 #define BIT(x, n) (((x) >> (n)) & 1)
+#define COMBINE_DATA(varptr) (*(varptr) = (*(varptr) & ~mem_mask) | (data & mem_mask))
 #define DEVICE_SELF ""
 #define DECLARE_DEVICE_TYPE(Type, Class) extern const device_type Type;
 #define DEFINE_DEVICE_TYPE(Type, Class, ShortName, FullName) const device_type Type = ShortName;
@@ -363,10 +364,13 @@ public:
 	u32 entries() const { return m_entries; }
 	const pen_t *pens() const { return reinterpret_cast<const pen_t *>(m_palette->entry_list_adjusted()); }
 	pen_t pen(int index) const { return pens()[index]; }
-	const pen_t *shadow_table() const { return m_shadow_array.data(); }
+	const pen_t *shadow_table() const { return m_shadow_table ? m_shadow_table : m_shadow_array.data(); }
+	// the shadow table the drawing takes (dipalette's presets: 0 the shadows, 1 the highlights)
+	void set_shadow_mode(int mode) { m_shadow_table = mode == 1 ? m_highlight_array.data() : m_shadow_array.data(); }
 	int shadow_mode() const { return 0; }
 	bool shadows_enabled() const { return true; }
 	bool hilights_enabled() const { return true; }
+	bool highlights_enabled() const { return true; }    // (the name the K053247 uses)
 	void set_shadow_factor(double factor) { m_palette->group_set_contrast(1, float(factor)); }
 	void set_highlight_factor(double factor) { m_palette->group_set_contrast(2, float(factor)); }
 	void set_pen_color(pen_t pen, rgb_t color) { m_palette->entry_set_color(pen, color); }
@@ -383,6 +387,7 @@ private:
 	palette_t *m_palette;
 	std::vector<pen_t> m_shadow_array;
 	std::vector<pen_t> m_highlight_array;
+	const pen_t *m_shadow_table = nullptr;
 };
 
 // MAME's digfx.h: graphics layouts and decoding tables
@@ -485,6 +490,10 @@ public:
 	bool started() const { return true; }
 	int vpos() const { return 0; }
 	attotime time_until_pos(int vpos, int hpos = 0) const { (void)vpos; (void)hpos; return attotime::zero; }
+	// the raw screen's size (the host's priority bitmap's) and its bitmaps' format: indexed, 16 bits
+	int width() const { return m_priority.width(); }
+	int height() const { return m_priority.height(); }
+	bitmap_format format() const { return BITMAP_FORMAT_IND16; }
 
 	// host API
 	void vblank(bool state) { for (auto &callback : m_vblank_callbacks) callback(*this, state); }
