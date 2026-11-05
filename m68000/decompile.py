@@ -856,14 +856,17 @@ def object_families(known, names):
 
 def piece_names():
     """{address: name} of the pieces of the program's data the assets hold (assets/data/layout.txt, which
-    tools/extract_assets.py writes): the names the tables the C reads take"""
+    tools/extract_assets.py writes): the names the tables the C reads take. The pieces of the profile's
+    PIECE_GROUPS_UNNAMED families give no name (a byte of code the program reads as data, which the C reaches only
+    through the pointer that leads there: a number that equals its address is a number)"""
     layout = ROOT / "assets" / "data" / "layout.txt"
+    unnamed = set(getattr(game_profile, "PIECE_GROUPS_UNNAMED", ()))
     found = {}
     if not layout.exists():
         return found
     for line in layout.read_text(encoding="ascii").splitlines():
         parts = line.split()
-        if len(parts) >= 2 and not line.startswith("#"):
+        if len(parts) >= 2 and not line.startswith("#") and not (len(parts) >= 3 and parts[2] in unnamed):
             found[int(parts[1], 16)] = parts[0]
     return found
 
