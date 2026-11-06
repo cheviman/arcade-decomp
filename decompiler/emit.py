@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    30-10-2026
+Modified:    06-11-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -276,9 +276,36 @@ class Names:
             return True
         return isinstance(node, ir.Reg) and self.writer.register_read(node)[0] in self.writer.pointer_names
 
+    def moved_place(self, node, distance):
+        """C for the address 'distance' bytes on from where 'node' points when it reads a pointer that walks
+        its record (FunctionWriter.walk_steps), where a place of the record starts there
+        (address_of(&group->item_list_offset)); None for any other node, or past the record."""
+        writer = self.writer
+        if not isinstance(node, ir.Reg) or not writer.walks:
+            return None
+        found = writer.kept_node(node)
+        if found is None or found[0] not in writer.walks:
+            return None
+        offset = writer.walk_offset(node.index) + distance
+        if offset == 0:
+            return f"address_of({found[0]})"
+        size = pointers.STRUCTS[found[1]]
+        if found[1] in pointers.ELEMENTS:
+            if offset % size:
+                return None
+            count = offset // size    # (another of its values: the address of the pointer moved by values)
+            return f"address_of({found[0]} {'+' if count > 0 else '-'} {abs(count)})"
+        if not 0 < offset < size:
+            return None
+        member = writer.walk_member(found[1], offset)
+        return f"address_of(&{found[0]}->{member})" if member is not None else None
+
     def kept(self, node):
-        """The C name of a pointer the C keeps that 'node' reads, or None."""
+        """The C name of a pointer the C keeps that 'node' reads, or None (one that walks its record, where
+        it points past the start of the record: the address of a place in it)."""
         found = self.writer.kept_node(node)
+        if found is not None and found[0] in self.writer.walks and self.writer.walk_offset(node.index):
+            return None
         return found[0] if found is not None else None
 
     def link(self, load):
@@ -440,9 +467,29 @@ def constant_parts(node):
         node = node.args[0]
 
 
+def element_place(struct, offset, inner, layouts):
+    """(C of the field of 'struct' at 'offset' a pointer to the array of values 'inner' starts at, its values'
+    signedness): the field ("stretch_ends[0]", "settings_magic"), or an element of a field that is an array
+    ("stretch_ends[3]"), whose values are as wide as the array's; None where none starts there."""
+    bits = pointers.STRUCTS[inner] * 8
+    found = layouts.lookup(struct, offset)
+    if found is not None and found[0] == offset and found[1] == bits:
+        name = layouts.names[struct][offset]
+        if name.startswith(("unk_", "var_")):
+            return None
+        return name + ("[0]" if layouts.array_count(struct, offset) is not None else ""), layouts.signed[struct][offset]
+    for (array_struct, start), (element_bits, count) in pointers.FIELD_ARRAYS.items():
+        width = element_bits // 8
+        if array_struct == struct and element_bits == bits and count and start <= offset < start + count * width \
+                and not (offset - start) % width:
+            return f"{layouts.names[struct][start]}[{(offset - start) // width}]", layouts.signed[struct][start]
+    return None
+
+
 def state_place(value, struct, layouts):
     """C for a pointer to the 'struct' at the constant address 'value' when a block of the game's state is
-    one there, or holds one (a structure inside it: &game->screen_2.car); None otherwise."""
+    one there, or holds one (a structure inside it: &game->screen_2.car; for an array of values, a field
+    whose values are as wide: &game->screen_1.stretch_ends[0]); None otherwise."""
     if memory.STATE is None:
         return None
     for address, member, block_struct, count in memory.STATE_BLOCKS:
@@ -456,6 +503,10 @@ def state_place(value, struct, layouts):
         inside = layouts.member_at(block_struct, offset, struct)
         if inside is not None:
             return f"&{place}.{inside}"
+        if struct in pointers.ELEMENTS:
+            found = element_place(block_struct, offset, struct, layouts)
+            if found is not None and found[1] == layouts.TYPES[pointers.ELEMENTS[struct]][1]:
+                return f"&{place}.{found[0]}"
     return None
 
 
@@ -988,6 +1039,15 @@ class FunctionWriter:
             return None
         return self.emitter.pointer_struct(index)
 
+    def own_web(self, node):
+        """True when register read 'node' is one of the function's own variables, not a global of the C: a
+        register like the rest, or a web of a scratch context register that carries nothing between
+        functions (variables.py makes it a local)."""
+        if node.index not in self.context:
+            return True
+        return node.index in self.scratch_context and hasattr(self, "vars") \
+            and self.vars.use_name(node) not in (None, self.emitter.context_name(node.index))
+
     def kept_node(self, node):
         """(C name, structure) when 'node' reads a pointer the C keeps: a register the whole program shares
         (kept_pointer) or one of the function's own variables (pointer_locals); else None."""
@@ -996,7 +1056,7 @@ class FunctionWriter:
         struct = self.kept_pointer(node.index)
         if struct is not None:
             return self.emitter.context_name(node.index), struct
-        if node.index in self.context:
+        if not self.own_web(node):
             return None    # (a global of the C here: its type is the program's)
         name = self.vars.use_name(node) if hasattr(self, "vars") else None
         return (name, self.local_pointers[name]) if name in self.local_pointers else None
@@ -1007,7 +1067,9 @@ class FunctionWriter:
         code reaches a field through them, and that it neither takes, nor hands back, nor lends a call to
         write: C pointers (struct object *object = NULL; object->state; const struct sound_cue *sound_cue,
         read in place). The rest of what they hold is the address the original holds, which address_of()
-        gives where the C needs the number."""
+        gives where the C needs the number. A variable that points into its structure past the start, or
+        along an array of plain values (an "elements" line: uint8_t *race = NULL; race[0]; race++), is one
+        where walk_steps says how it moves."""
         if memory.STATE is None:
             return {}
         found, mixed, walked = {}, set(), set()
@@ -1036,16 +1098,16 @@ class FunctionWriter:
                     if field[0] not in pointers.STRUCTS:
                         continue
                     base = field[2]
-                    if not isinstance(base, ir.Reg) or base.index in self.context:
+                    if not isinstance(base, ir.Reg) or not self.own_web(base):
                         continue    # (a global of the C here: its type is the program's)
                     name = self.vars.use_name(base)
                     if name is None:
                         continue
-                    if field[0] in pointers.ELEMENTS or field[0] in pointers.BOARD_STRUCTS:
+                    if field[0] in pointers.BOARD_STRUCTS or (with_params and field[0] in pointers.ELEMENTS):
                         mixed.add(name)
                         continue
-                    if field[3]:
-                        walked.add(name)    # (into the structure past its start: a pointer that walks it)
+                    if field[3] or field[0] in pointers.ELEMENTS:
+                        walked.add(name)    # (into the structure past its start, or along its values: it walks it)
                     found.setdefault(name, set()).add(field[0])
         self.current = writing
         kinds = {name: next(iter(structs)) for name, structs in found.items()
@@ -1072,10 +1134,12 @@ class FunctionWriter:
         the record it is in: {id(statement): ("step", records moved) for a step it takes, ("set", how far
         into its record the value it gets points) for any other value it gets}. The fields through it are
         that record's (place->width, not SPRITE_PLACE(place - 0x2u)->width); a step within the record goes,
-        one onto another record moves the pointer by records. None when that is not so everywhere: where
-        pointers.py does not know how far into its record it points, where it moves by other than whole
-        records from one record to another, where anything but a field through it or its own step reads
-        it while it points past the start of its record, or where a call sets it."""
+        one onto another record moves the pointer by records; anything else that reads it reads the address
+        of its record, or of the field it points at past the start (walk_place). None when that is not so
+        everywhere: where pointers.py does not know how far into its record it points, where it moves by
+        other than whole records from one record to another, where it points past the start of its record
+        at no field, an instruction reads it there, or a call that takes a pointer, or where a call sets
+        it."""
         moves = getattr(self.fields, "moves", None)
         if not moves:
             return None
@@ -1119,13 +1183,15 @@ class FunctionWriter:
                              if isinstance(node, ir.Reg) and self.vars.use_name(node) == name]
                     if len(reads) > bases + (step is not None):
                         kind = before.get(reads[0].index)
-                        if kind is None or kind[0] != struct or kind[1] != 0:
+                        if kind is None or kind[0] != struct or (kind[1] and self.walk_member(struct, kind[1]) is None):
                             return None
                     for index in self._implicit_reads.get(id(statement), ()):
                         if self.vars.implicit_name(statement, index) == name:
                             kind = before.get(index)
-                            if kind is None or kind[0] != struct or kind[1] != 0:
+                            if kind is None or kind[0] != struct:
                                 return None    # (a call, or the end of the function, that reads it)
+                            if kind[1] and not self.walk_read_here(statement, index, struct, kind[1]):
+                                return None
                     if not defined:
                         if any(self.vars.def_name(statement, index) == name
                                for index in self.vars.statement_defs(statement)):
@@ -1146,6 +1212,66 @@ class FunctionWriter:
         finally:
             self.current = writing
         return steps
+
+    def walk_read_here(self, statement, index, struct, offset):
+        """True when 'statement', a call or a block end that reads register 'index' where a pointer that
+        walks a 'struct' points 'offset' bytes past its start, can take the address of the field there
+        (walk_place): a call that takes the address (not a pointer), the function's end handing back an
+        address; no instruction."""
+        if self.walk_member(struct, offset) is None:
+            return False
+        if isinstance(statement, (ir.Call, ir.TailCall)):
+            if statement.target is None:
+                return False
+            target = self.emitter.resolve(statement.target & 0xFFFFFF, getattr(statement, "entry", None))[0]
+            if self.emitter.param_structs.get(target, {}).get(index) is not None:
+                return False
+            return not isinstance(statement, ir.TailCall) or self.emitter.result_structs.get(self.entry) is None
+        if isinstance(statement, ir.Return):
+            return self.returned != ("r", index) or self.emitter.result_structs.get(self.entry) is None
+        return False
+
+    def walk_offset(self, index):
+        """How far past the start of its record the pointer register 'index' holds points, at the statement
+        being written (pointers.py's notes); 0 where they say nothing."""
+        moves = getattr(self.fields, "moves", None)
+        kind = moves.get(id(self.current), ({}, None))[0].get(index) if moves else None
+        return kind[1] if kind is not None else 0
+
+    def walk_member(self, struct, offset):
+        """C for the place 'offset' bytes into a 'struct' (past its start) where something starts: a
+        structure inside it ("car", "road_segments[3]"), a field ("hit_box_along"), an element of a field
+        that is an array ("names[2]"); None elsewhere (and in an array of values, whose elements are
+        whole)."""
+        if struct in pointers.ELEMENTS:
+            return None
+        layouts = self.emitter.layouts
+        for start, (name, inner, count) in layouts.nested.get(struct, {}).items():
+            size = pointers.STRUCTS.get(inner, 0)
+            if size and start <= offset < start + size * count and not (offset - start) % size:
+                return name + (f"[{(offset - start) // size}]" if count > 1 else "")
+        found = layouts.lookup(struct, offset)
+        if found is not None and found[0] == offset:
+            name = layouts.names[struct][offset]
+            if name.startswith(("unk_", "var_")):
+                return None
+            return f"{name}[0]" if layouts.array_count(struct, offset) is not None else name
+        for (array_struct, start), (element_bits, count) in pointers.FIELD_ARRAYS.items():
+            width = element_bits // 8
+            if array_struct == struct and count and start < offset < start + count * width \
+                    and not (offset - start) % width:
+                return f"{layouts.names[struct][start]}[{(offset - start) // width}]"
+        return None
+
+    def walk_place(self, name, index):
+        """C for the address the original holds in 'name', a pointer that walks its record (walk_steps), read
+        from register 'index' at the statement being written: its record's where it points at the start
+        (address_of(name)), else the address of the place in the record it points at
+        (address_of(&road_row_record->hit_box_along))."""
+        offset = self.walk_offset(index)
+        if not offset:
+            return f"address_of({name})"
+        return f"address_of(&{name}->{self.walk_member(self.local_pointers[name], offset)})"
 
     def walk_text(self, name, struct, statement, walk):
         """The C of 'statement', which sets 'name', a pointer that walks its record (walk_steps): nothing for
@@ -1241,17 +1367,20 @@ class FunctionWriter:
         base, offset = constant_parts(node)
         offset += shift
         kept = self.kept_node(base)
+        if kept is not None and kept[0] in self.walks:
+            offset += self.walk_offset(base.index)    # (one that walks its record: from where it points in it)
         if kept is not None:
             name, own = kept
             size = pointers.STRUCTS[struct]
             if own == struct and offset % size == 0:
                 count = offset // size
                 return name if not count else f"{name} + {count}" if count > 0 else f"{name} - {-count}"
-            inside = self.emitter.layouts.member_at(own, offset, struct) if offset >= 0 else None
+            inside = self.place_in(name, own, base, offset, struct) if offset >= 0 else None
             if inside is not None:
-                return f"&{name}->{inside}"
+                return inside
         if isinstance(node, ir.Const):
-            place = state_place((node.value + shift) & 0xFFFFFF, struct, self.emitter.layouts)
+            place = state_place((node.value + shift) & 0xFFFFFF, struct, self.emitter.layouts) \
+                or self.named_place((node.value + shift) & 0xFFFFFF, struct)
             if place is not None:
                 return place
         if shift:
@@ -1263,6 +1392,52 @@ class FunctionWriter:
                 value = base
         return f"{self.pointer_from(struct)}({self.stored(value, 32)})"
 
+    def place_in(self, name, own, base, offset, struct):
+        """C for a pointer to the 'struct' at 'offset' bytes into the 'own' that pointer 'name' (read from
+        register node 'base') points at: a structure inside it (&screen->car); for an array of values, the
+        field or element there whose values are as wide (&screen->stretch_ends[0], and by the family's names
+        through the function's own object: &current_object->sunset_fade.fade_slots[0]), cast where its values
+        are of the other signedness; None where none is there."""
+        layouts = self.emitter.layouts
+        inside = layouts.member_at(own, offset, struct)
+        if inside is not None:
+            return f"&{name}->{inside}"
+        if struct not in pointers.ELEMENTS:
+            return None
+        bits, signed = layouts.TYPES[pointers.ELEMENTS[struct]]
+        found = None
+        family = self.family_through(base, self.current) if own == "object" else None
+        scoped = layouts.scoped_field(own, family, offset) if family is not None else None
+        if scoped is not None and scoped[2] == offset and scoped[3] == bits:
+            found = f"{scoped[0]}.{scoped[1]}" + (self.scoped_element(own, family, offset, None) or ""), scoped[4]
+            if not found[0].endswith("]") and pointers.SCOPED_ARRAYS.get((own, family, offset)) is not None:
+                found = found[0] + "[0]", found[1]
+        elif scoped is None:
+            found = element_place(own, offset, struct, layouts)
+        if found is None:
+            return None
+        cast = f"({self.emitter.pointer_ctype(struct)})" if found[1] != signed else ""
+        return f"{cast}&{name}->{found[0]}"
+
+    def named_place(self, address, struct):
+        """C for a pointer to a 'struct' at the constant 'address' where a table or a variable has it by
+        name: a table of those records (stage_end_sound_cues, its first), a table of the values of an array
+        of values, or a variable of the game's state that is (or is an element of) an array of them
+        (&game->race_order[2]); None elsewhere."""
+        found = pointers.record_table_name(address)
+        if found is not None and found[1] == struct and found[2] == 0:
+            return found[0]
+        if struct not in pointers.ELEMENTS:
+            return None
+        bits, signed = self.emitter.layouts.TYPES[pointers.ELEMENTS[struct]]
+        item = self.emitter.memory.tables.get(memory.own_copy(address))
+        if struct in pointers.ROM_STRUCTS:
+            if item is None or item.bits != bits or item.signed != signed:
+                return None
+            return item.name if item.indexed else f"&{item.name}"    # (a table read whole is its value)
+        found = self.variable_at(address) if memory.STATE is not None else None
+        return f"&{found[0]}" if found is not None and found[1] == bits and found[2] == signed else None
+
     def register_read(self, node):
         if node.index in self.context and node.index not in self.scratch_context:
             if self.emitter.pointer_struct(node.index) is not None:
@@ -1270,6 +1445,8 @@ class FunctionWriter:
                 return f"address_of({self.emitter.context_name(node.index)})", 32
             return self.emitter.context_name(node.index), 32
         name = self.vars.use_name(node) or cpu.variable_name(node.index)
+        if name in self.walks:
+            return self.walk_place(name, node.index), 32    # (the place in its record it points at)
         if name in self.local_pointers:
             return f"address_of({name})", 32    # (a pointer the C keeps, where the C needs the address)
         return name, self.widths.get(name, 32)
@@ -1613,7 +1790,7 @@ class FunctionWriter:
         for start, item in items.items():
             if start <= address and address + bits // 8 <= start + item.bits // 8 and bits < item.bits:
                 name = f"{item.c}[0]" if item.indexed else item.c
-                return cprint.part(bits, name, address - start, item.bits), False, True
+                return cprint.part(bits, name, address - start, item.bits, item.signed), False, True
         return None
 
     def family_splits(self, statement):
@@ -1652,7 +1829,20 @@ class FunctionWriter:
 
     def tiling(self, address, bits, key):
         """The named fields or variables an access of 'bits' at 'address' covers exactly, one after the
-        other: [(byte in the access, bits, C)], or None."""
+        other, or the elements of an array it runs over (element_run): [(byte in the access, bits, C)], or
+        None."""
+        pieces = self.named_tiling(address, bits, key)
+        if pieces is not None:
+            return pieces
+        run = self.element_run(address, bits, key)
+        if run is None:
+            return None
+        for _, _, text, _, signed, _ in run:
+            self.signed_pieces[text] = signed
+        return [(position, width, text) for position, _, text, width, _, _ in run]
+
+    def named_tiling(self, address, bits, key):
+        """tiling() over the named fields or variables"""
         size = bits // 8
         pieces = []
         field = self.fields.get(key)
@@ -1677,9 +1867,22 @@ class FunctionWriter:
                     piece = scoped[3]
                 else:
                     piece = layouts.fields.get(struct, {}).get(position)
+                start, number = position, None
+                if piece is None and scoped is None:
+                    # (an element of a field that is an array, past its first: name[k])
+                    for array_start, bits in layouts.fields.get(struct, {}).items():
+                        elements = layouts.array_count(struct, array_start)
+                        if elements and array_start < position < array_start + elements * (bits // 8) \
+                                and (position - array_start) % (bits // 8) == 0:
+                            start, number, piece = array_start, (position - array_start) // (bits // 8), bits
+                            break
                 if piece is None or position + piece // 8 > offset + size:
                     return None
-                text, signed = self.field_access((struct, position, base, base_offset, kind_family) + field[5:], piece)
+                text, signed = self.field_access((struct, start, base, base_offset, kind_family) + field[5:], piece)
+                if number is not None:
+                    if not text.endswith("[0]"):
+                        return None
+                    text = f"{text[:-3]}[{number}]"
                 self.signed_pieces[text] = signed
                 pieces.append((position - offset, piece, text))
                 position += piece // 8
@@ -1697,11 +1900,27 @@ class FunctionWriter:
             position += piece[1] // 8
         return pieces
 
+    def element_run(self, address, bits, key):
+        """The elements of an array an access of 'bits' reads or writes when it starts at one and runs on into
+        the next ones (a sprite list's two halfwords at once, four characters of the LCD's text), as
+        covering() gives pieces; None when it is not that. An element whose signedness is not known reads as
+        a signed one, cast to its unsigned type."""
+        found = self.memory(address, bits, key)
+        pieces = cprint.element_run(found[0], bits) if found is not None else None
+        if pieces is None:
+            return None
+        return [piece[:4] + (True if piece[4] is None else piece[4],) + piece[5:] for piece in pieces]
+
     def covering(self, address, bits, key):
         """The named fields or variables an access of 'bits' at 'address' reads or writes bytes of, one after
-        the other, wholly or in part (an access that starts inside one, or runs on into the next):
-        [(byte in the access, bytes, C, the field's bits, its signedness, byte in the field)], or None when
-        some byte has no name."""
+        the other, wholly or in part (an access that starts inside one, or runs on into the next), or the
+        elements of an array it runs over (element_run): [(byte in the access, bytes, C, the field's bits, its
+        signedness, byte in the field)], or None when some byte has no name."""
+        pieces = self.named_covering(address, bits, key)
+        return pieces if pieces is not None else self.element_run(address, bits, key)
+
+    def named_covering(self, address, bits, key):
+        """covering() over the named fields or variables"""
         size = bits // 8
         pieces = []
         field = self.fields.get(key)
@@ -1721,10 +1940,20 @@ class FunctionWriter:
             while position < offset + size:
                 scoped = layouts.scoped_field(struct, family, position) if family else None
                 found = (scoped[2], scoped[3]) if scoped is not None else layouts.lookup(struct, position)
+                number = None
+                if found is None and scoped is None:
+                    # (an element of a field that is an array, past its first: name[k])
+                    for start, bits in layouts.fields.get(struct, {}).items():
+                        elements = layouts.array_count(struct, start)
+                        if elements and start <= position < start + elements * (bits // 8):
+                            number = (position - start) // (bits // 8)
+                            found = (start, bits)
+                            break
                 if found is None:
                     return None
                 start, width = found
-                count = min(start + width // 8, offset + size) - position
+                element_start = start + (number or 0) * (width // 8)
+                count = min(element_start + width // 8, offset + size) - position
                 if position == start and count * 8 < width and (
                         layouts.overlay(struct, start, count * 8) if scoped is None
                         else layouts.scoped_overlay(struct, family, start, count * 8)) is not None:
@@ -1732,7 +1961,11 @@ class FunctionWriter:
                 text, signed = self.field_access((struct, start, base, base_offset, kind_family) + field[5:], width)
                 if text.startswith(("AS", "AT")):
                     return None
-                pieces.append((position - offset, count, text, width, signed, position - start))
+                if number:
+                    if not text.endswith("[0]"):
+                        return None
+                    text = f"{text[:-3]}[{number}]"
+                pieces.append((position - offset, count, text, width, signed, position - element_start))
                 position += count
             return pieces
         first = memory.constant_address(address)
@@ -1786,12 +2019,26 @@ class FunctionWriter:
             text = None
         else:
             text = self.expr(value)
+            narrow = cprint.narrow_cast(text)
+            if narrow is not None and all(not within and (position * 8 >= narrow or (position == 0 and count * 8 == width
+                                                                                       == narrow))
+                                          for position, count, target, width, signed, within in pieces):
+                # a value narrower than the store (its first field's width): that field takes it, the others 0
+                return [f"{target} = {text if position == 0 else '0u'};"
+                        for position, count, target, width, signed, within in pieces]
             if len(pieces) > 1 and not re.fullmatch(r"\w+", text):
                 # (the value once, before its bytes go to their fields: named after the first of them and
                 # the access, bounce_direction_halfword)
                 first = re.split(r"->|\.", pieces[0][2])[-1]
                 # (an array's element by its array's name and number: time_difficulty[2], time_difficulty_2)
                 first = re.sub(r"\[(\w+)\]", r"_\1", first)
+                if not re.fullmatch(r"\w+", first):
+                    # (an element of a view of an address, or of an array by a worked-out number, by the view's
+                    # or the array's name: SPRITE_WORDS(p)[0], sprite_words; NBG0_SCROLL_X[layer * 2u], nbg0_scroll_x)
+                    # (the view first: PAGE_SELECT(current_object->road_surface.page_register)[0], page_select)
+                    view = re.match(r"([A-Za-z_]\w*)[(\[]", pieces[0][2]) or \
+                        re.match(r"([A-Za-z_]\w*)[(\[]", re.split(r"->|\.", pieces[0][2])[-1])
+                    first = view[1].lower() if view else "value"
                 temp = self.fresh(f"{first}_{ {8: 'byte', 16: 'halfword', 32: 'long'}[statement.bits] }")
                 lines.append(f"{temp} = {text};")
                 text = temp
@@ -2013,7 +2260,7 @@ class FunctionWriter:
             if isinstance(base, ir.Const) and not base_offset and table is None else None
         if block is not None and block[1] is None and index is not None:
             block = None    # (records counted on from a block that is one: by its address)
-        walking = isinstance(base, ir.Reg) and base.index not in self.context and self.vars.use_name(base) in self.walks
+        walking = isinstance(base, ir.Reg) and self.own_web(base) and self.vars.use_name(base) in self.walks
         held = self.kept_node(base) if (not base_offset or walking) and table is None and block is None else None
         kept = held is not None and held[1] == struct
         if table is not None:
@@ -2027,9 +2274,19 @@ class FunctionWriter:
             # (game->race_copies[player].model)
             pointer = block[0]
         else:
-            start = self.printer.any(base).text
-            pointer = f"{struct.upper()}({start})" if not base_offset else \
-                f"{struct.upper()}({start} - 0x{base_offset:X}u)"
+            distance = -base_offset
+            if struct in pointers.BOARD_STRUCTS and isinstance(index, ir.Const):
+                # a memory of the board's: the record the whole address the code puts on the bus reaches, as the
+                # bus decodes it (SPRITE_WORDS(sprite_entry + 0x3000u)[0], not SPRITE_WORDS(sprite_entry)[6144],
+                # which would step past the memory's end where the bus goes round)
+                count = index.value & 0xFFFFFFFF
+                distance += (count - (1 << 32) if count & 0x80000000 else count) * pointers.STRUCTS[struct]
+                index = None
+            if distance:
+                start = self.printer.wrap(self.printer.any(base), cprint.ADD)
+                pointer = f"{struct.upper()}({start} {'+' if distance > 0 else '-'} 0x{abs(distance):X}u)"
+            else:
+                pointer = f"{struct.upper()}({self.printer.any(base).text})"
         if element_number is None and offset not in layouts.fields.get(struct, {}):
             for (array_struct, start), (element_bits, count) in pointers.FIELD_ARRAYS.items():
                 width = element_bits // 8
@@ -2044,6 +2301,8 @@ class FunctionWriter:
             if index is not None:
                 pointer = f"{pointer}[{self.record_number(index)}]"
                 member = "."
+            elif element:
+                pointer = f"{pointer}[0]"    # (a pointer to an array of values: the value it points at)
             else:
                 member = "->"
         elif block is not None:
@@ -2069,7 +2328,7 @@ class FunctionWriter:
             text = f"{pointer}{member}{view}.{scoped_name}" + self.scoped_element(struct, family, scoped_offset, element_number)
             if scoped_offset == offset and scoped_bits == bits:
                 return text, scoped_signed
-            return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
+            return cprint.part(bits, text, offset - scoped_offset, scoped_bits, scoped_signed), False
         field_offset, field_bits = found
         name = pointer if element else f"{pointer}{member}{layouts.names[struct][field_offset]}"
         if element_number is not None:
@@ -2082,7 +2341,8 @@ class FunctionWriter:
         elif overlay is not None and field_bits != bits:
             generic = f"{pointer}{member}{overlay[0]}", overlay[1], True
         else:
-            generic = cprint.part(bits, name, offset - field_offset, field_bits), False, False
+            generic = (cprint.part(bits, name, offset - field_offset, field_bits, layouts.signed[struct][field_offset]),
+                       False, False)
         if family is not None:
             scoped = layouts.scoped_field(struct, family, offset)
             if scoped is not None:
@@ -2103,7 +2363,7 @@ class FunctionWriter:
                 if generic[2] and (offset - scoped_offset) * 8 + bits > scoped_bits \
                         and not re.split(r"->|\.", generic[0])[-1].startswith("unk_"):
                     return generic[:2]
-                return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
+                return cprint.part(bits, text, offset - scoped_offset, scoped_bits, scoped_signed), False
         self.note_missing(struct, offset, bits, base, base_offset, generic)
         return generic[:2]
 
@@ -2840,7 +3100,9 @@ class FunctionWriter:
             if wanted is not None:
                 values.append(self.pointer_argument(name, wanted))    # (the callee takes a pointer)
                 continue
-            if name in self.local_pointers or self.kept_pointer(value[1]) is not None:
+            if name in self.walks:
+                name = self.walk_place(name, value[1])    # (the place in its record it points at)
+            elif name in self.local_pointers or self.kept_pointer(value[1]) is not None:
                 name = f"address_of({name})"    # (the callee takes the address the original passes)
             width = widths.get(value[1], 32)
             # a parameter narrower than the variable takes its low bits, and says so
@@ -2969,6 +3231,8 @@ class FunctionWriter:
         if value[0] != "r":
             return self.use(value)
         name = self.register_value(value[1])
+        if name in self.walks and self.walk_offset(value[1]):
+            return self.walk_place(name, value[1])    # (the place in its record it points at)
         if value == self.returned:
             return self.converted(name, self.local_pointers.get(name), self.emitter.result_structs.get(self.entry))
         return f"address_of({name})" if name in self.local_pointers else name
@@ -3270,7 +3534,12 @@ class Emitter:
         return kind[0]
 
     def pointer_ctype(self, struct):
-        """The C type of a pointer the C keeps to a 'struct': const for the program ROM's records."""
+        """The C type of a pointer the C keeps to a 'struct': const for the program ROM's records; to one of
+        an array of plain values ("elements" lines), the values' type."""
+        if struct in pointers.ELEMENTS:
+            bits, signed = self.layouts.TYPES[pointers.ELEMENTS[struct]]
+            value = f"{'' if signed else 'u'}int{bits}_t *"
+            return f"const {value}" if struct in pointers.ROM_STRUCTS else value
         return f"const struct {struct} *" if struct in pointers.ROM_STRUCTS else f"struct {struct} *"
 
     def context_type(self, index):

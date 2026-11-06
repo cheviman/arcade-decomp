@@ -4,7 +4,7 @@ Description: works out which registers point at which of the game's structures, 
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    30-10-2026
+Modified:    06-11-2026
 Author:      Sebastian Toyos
 
 The structures (STRUCTS) are OutRunners': the game objects (0x100 bytes, 124 of them below each screen's
@@ -111,6 +111,7 @@ ROM_FUNCTION = "rom"           # ... and what gives a pointer to one of those (c
 BOARD_STRUCTS = set()          # structures (and arrays of values) in a memory of the board the code uses as
                                # plain memory (the video RAM, the sprite RAM, the sound program's RAM)
 BOARD_FUNCTION = "board"       # ... and what gives a pointer to one of those
+BOARD_BYTE_FUNCTION = "board"  # ... to a byte of those (a game whose board keeps 16-bit words in the host's order: its lane)
 CONSTANTS = False              # registers keep the constants they are set to, so that a pointer moved by one
                                # (the Z80's "ld de,12h ... add iy,de") keeps its kind
 PAGED = False                  # structures a page long, one per page: (p & FF00) | n is field n of p's (page_parts)
@@ -1729,7 +1730,10 @@ class Layouts:
             value = f"{'' if signed else 'u'}int{bits}_t"
             if struct in ROM_STRUCTS:
                 return f"(const {value} *){ROM_FUNCTION}"
-            return f"({value} *){BOARD_FUNCTION if struct in BOARD_STRUCTS else STRUCT_FUNCTION}"
+            if struct in BOARD_STRUCTS:
+                # (a byte of the board's memories is at its lane in a 16-bit word: board_byte)
+                return f"({value} *){BOARD_BYTE_FUNCTION if bits == 8 else BOARD_FUNCTION}"
+            return f"({value} *){STRUCT_FUNCTION}"
         if struct in ROM_STRUCTS:
             return f"(const struct {struct} *){ROM_FUNCTION}"
         if struct in BOARD_STRUCTS:

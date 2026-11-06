@@ -110,7 +110,10 @@ parameters and results that point at one structure of the state or one record of
 object *object`, `const struct sprite_animation *animation`, read in place in the game's data); and in a
 variable that walks its record, reading one field and moving on to the next, as a pointer to the record it
 is in (`place->width` where the original reads 2 bytes past the place it moved to; its steps within the
-record go, `place++` takes it onto the next record).
+record go, `place++` takes it onto the next record), and where the original holds its address while it
+points into the record, the C takes the address of the field there
+(`address_of(&road_row_record->hit_box_along)`); a variable that walks an array of plain values is a pointer
+to its values (`uint8_t *race`, `race[0]`, `race++`), from the table, variable or field it starts at.
 
 The game's runtime gives what that C calls, and takes what it gives:
 

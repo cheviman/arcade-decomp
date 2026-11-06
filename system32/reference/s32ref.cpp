@@ -4,7 +4,7 @@
  *                 runtime's Multi 32 model, to find code, log hardware use and record state per frame
  *    Version:     0.1.0
  *    Created:     11-10-2026
- *    Modified:    30-10-2026
+ *    Modified:    06-11-2026
  *    Author:      Sebastian Toyos
  *
  *    Not part of the game. Usage:
@@ -14,8 +14,8 @@
  *                           [--dump-frame N ... --dump-dir DIR] [--video-hashes hashes.txt]
  *                           [--video-dump N ... --video-dir DIR] [--sound-hashes hashes.txt]
  *                           [--sound-log writes.txt] [--sound-wav sound.wav] [--sound-trace executed.txt]
- *                           [--sound-timing timing.txt] [--rom-reads reads.txt] [--rom FOLDER]
- *                           [--verbose]
+ *                           [--sound-timing timing.txt] [--rom-reads reads.txt]
+ *                           [--access-widths widths.txt] [--rom FOLDER] [--verbose]
  *
  *    It runs the original program, so it reads the player's ROM set when it starts, as MAME does: the
  *    set in --rom's folder or .zip (rom/ by default), into the board's memory (game/data.h,
@@ -43,6 +43,14 @@
  *    the instruction that reads them: "PC FIRST-LAST" ranges, addresses as the ROM's own copy has them
  *    (000000-03FFFF and 100000-1FFFFF). A measure for the coverage of the ROM (tools/coverage.py): what
  *    the static analysis does not describe yet, and where the code that reads it is.
+ *
+ *    --access-widths lists every access the program makes of memory as data: the address it starts at, the
+ *    bytes it takes (1, 2 or 4; a 64-bit one is two of 4), whether it writes, the kind of instruction (a
+ *    string's, which moves, fills, compares or searches memory an element at a time; a bit's, which reads
+ *    the word its bit is in; or any other) and the first instruction that made it. A measure for the C on
+ *    other processors (tools/width_census.py): the places the program reaches at more than one width, which
+ *    a big-endian processor holds the other way round, and the accesses at an address out of line with
+ *    their width.
  */
 #include "emu.h"
 #include "v60.h"
@@ -60,8 +68,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -176,6 +186,184 @@ void write_rom_reads(const std::string &path)
 			<< first << '-' << std::setw(6) << last << '\n';
 }
 
+// --access-widths: the program's accesses of memory as data, each by the address it starts at, the bytes it
+// takes, whether it writes and the kind of instruction that makes it, with the first instruction that made
+// it: (address << 6 | kind << 4 | width << 1 | write)
+std::unordered_map<uint32_t, uint32_t> g_accesses;
+bool g_record_accesses = false;
+enum : uint32_t { kAnyAccess, kStringMove, kBitAccess, kStringSearch };
+uint32_t g_access_kind = kAnyAccess;    // the running instruction's
+
+// The kind of an instruction's accesses: a string move's (MOVC, MOVCF, MOVBS: each element read, then written
+// where it goes, or a fill), a string compare's or search's (CMPC, SCHC, SKPC, SCHBS), a bit's of a word in
+// memory (TEST1, SET1, CLR1, NOT1: the V60 reads the word the bit is in), or any other
+uint32_t access_kind(uint8_t opcode, uint8_t subop)
+{
+	switch (opcode)
+	{
+		case 0x58: case 0x5a: case 0x5b:
+			return (subop & 0x18) == 0x08 ? kStringMove : kStringSearch;
+		case 0x87: case 0x97: case 0xa7: case 0xb7:
+			return kBitAccess;
+		default:
+			return kAnyAccess;
+	}
+}
+
+// The work RAM as a big-endian processor running the C would hold it, the C keeping the V70's places and
+// widths: every value the program writes goes there in that order, a string move takes its bytes along in
+// their order, and a bit instruction changes the byte its bit is in. A read that gives another value there
+// than the V70's is a place the C reads in another way than it was written (a word written, a halfword of it
+// read), which a big-endian processor holds the other way round; so is an element a string move takes out of
+// it into one of the board's memories, which the board reads as it is. Bytes a move brought from the
+// program's data are not followed: how they lie is the loader's, which puts each value at the width its
+// table has
+std::vector<uint8_t> g_big_endian(S32_WORK_RAM_SIZE);
+std::vector<uint8_t> g_from_data(S32_WORK_RAM_SIZE);
+struct differing_read { uint64_t count; uint32_t value, big_endian_value; };
+std::map<uint64_t, differing_read> g_differing;      // (PC << 32 | address << 4 | width) -> how often, first values
+uint64_t g_reads_compared = 0, g_reads_of_data = 0, g_bit_reads = 0;
+uint32_t g_move_source = 0;    // the element a string move read last: its address, or 0 outside the work RAM
+bool g_move_source_ram = false;
+
+inline bool in_work_ram(uint32_t address) { return (address >> 20) == 2; }
+
+uint32_t big_endian_value(uint32_t address, int size)
+{
+	uint32_t value = 0;
+	for (int index = 0; index < size; index++)
+		value = value << 8 | g_big_endian[(address + index) & (S32_WORK_RAM_SIZE - 1)];
+	return value;
+}
+
+void compare_read(uint32_t address, int size, uint32_t value);
+
+void follow_read(uint32_t address, int size, uint32_t value)
+{
+	if (g_access_kind == kStringMove)
+	{
+		g_move_source = address;
+		g_move_source_ram = in_work_ram(address);
+		return;
+	}
+	if (!in_work_ram(address))
+		return;
+	if (g_access_kind == kBitAccess)
+	{
+		g_bit_reads++;    // its bit is in one byte, which the C reads: the word's other bytes say nothing
+		return;
+	}
+	compare_read(address, size, value);
+}
+
+// a value of the work RAM the program takes (a read, or an element a string move takes out of it) against
+// the one a big-endian processor holds there
+void compare_read(uint32_t address, int size, uint32_t value)
+{
+	for (int index = 0; index < size; index++)
+		if (g_from_data[(address + index) & (S32_WORK_RAM_SIZE - 1)])
+		{
+			g_reads_of_data++;
+			return;
+		}
+	g_reads_compared++;
+	const uint32_t other = big_endian_value(address, size);
+	if (other == value)
+		return;
+	differing_read &read = g_differing[uint64_t(s32_board.pc) << 32 | (address & 0xffffff) << 4 | uint32_t(size)];
+	if (read.count++ == 0)
+	{
+		read.value = value;
+		read.big_endian_value = other;
+	}
+}
+
+void follow_write(uint32_t address, int size, uint32_t value)
+{
+	if (!in_work_ram(address))
+	{
+		// a string move out of the work RAM into one of the board's memories (the sprite list, the video RAM):
+		// what it takes there are the values a big-endian processor holds, which the board reads as they are
+		if (g_access_kind == kStringMove && g_move_source && g_move_source_ram)
+		{
+			compare_read(g_move_source, size, value);
+			g_move_source = 0;
+		}
+		return;
+	}
+	const uint32_t mask = S32_WORK_RAM_SIZE - 1;
+	if (g_access_kind == kBitAccess)
+	{
+		// the bytes whose bits change, each where the bit is
+		for (int index = 0; index < size; index++)
+		{
+			const uint8_t changed = uint8_t(s32_board.work_ram[(address + index) & mask] ^ (value >> (8 * index)));
+			g_big_endian[(address + index) & mask] ^= changed;
+		}
+		return;
+	}
+	if (g_access_kind == kStringMove && g_move_source)
+	{
+		for (int index = 0; index < size; index++)
+		{
+			const uint32_t to = (address + index) & mask;
+			if (g_move_source_ram)
+			{
+				const uint32_t from = (g_move_source + index) & mask;
+				g_big_endian[to] = g_big_endian[from];
+				g_from_data[to] = g_from_data[from];
+			}
+			else
+			{
+				g_big_endian[to] = uint8_t(value >> (8 * (size - 1 - index)));
+				g_from_data[to] = g_move_source < 0x200000 || g_move_source >= 0xf00000;
+			}
+		}
+		g_move_source = 0;
+		return;
+	}
+	for (int index = 0; index < size; index++)
+	{
+		g_big_endian[(address + index) & mask] = uint8_t(value >> (8 * (size - 1 - index)));
+		g_from_data[(address + index) & mask] = 0;
+	}
+}
+
+inline void count_access(offs_t address, int size, bool write)
+{
+	if (!g_record_accesses || g_reading_instructions)
+		return;
+	g_accesses.emplace(uint32_t(address & 0xffffff) << 6 | g_access_kind << 4 | uint32_t(size) << 1 | uint32_t(write),
+		s32_board.pc);
+}
+
+void write_accesses(const std::string &path)
+{
+	std::vector<std::pair<uint32_t, uint32_t>> accesses(g_accesses.begin(), g_accesses.end());
+	std::sort(accesses.begin(), accesses.end());
+	std::ofstream output(path);
+	output << "# ADDRESS WIDTH R|W KIND PC: the program's accesses of memory as data (s32ref --access-widths), by the\n"
+		"# address each starts at, the bytes it takes, whether it writes and the instruction's kind (- any, S a\n"
+		"# string move's, C a string compare's or search's, B a bit's of a word), with the first instruction that\n"
+		"# made it. Then ! ADDRESS WIDTH PC COUNT VALUE BIG-ENDIAN: the reads of the work RAM that a big-endian\n"
+		"# processor running the C would give another value (the first time: the V70's and that one)\n";
+	char line[64];
+	for (const auto &[key, pc] : accesses)
+	{
+		std::snprintf(line, sizeof(line), "%06X %u %c %c %06X\n", key >> 6, (key >> 1) & 7u, key & 1u ? 'W' : 'R',
+			"-SBC"[(key >> 4) & 3u], pc);
+		output << line;
+	}
+	for (const auto &[key, read] : g_differing)
+	{
+		std::snprintf(line, sizeof(line), "! %06X %u %06X %" PRIu64 " %X %X\n", uint32_t(key >> 4) & 0xffffff,
+			uint32_t(key & 0xf), uint32_t(key >> 32), read.count, read.value, read.big_endian_value);
+		output << line;
+	}
+	output << "# reads of the work RAM compared: " << g_reads_compared << "; not compared: " << g_reads_of_data
+		<< " of bytes a move brought from the program's data, " << g_bit_reads << " by bit instructions\n";
+}
+
 inline void count_read(offs_t address)
 {
 	if (g_read_counts.empty())
@@ -191,14 +379,55 @@ inline void count_write(offs_t address)
 		g_region_writes[(address >> 20) & 0xf]++;
 }
 
-u8 read8(offs_t address) { count_read(address); count_rom_read(address, 1); return s32_read8(address & 0xffffff); }
-u16 read16(offs_t address) { count_read(address); count_rom_read(address, 2); return s32_read16(address & 0xffffff); }
-u32 read32(offs_t address) { count_read(address); count_rom_read(address, 4); return s32_read32(address & 0xffffff); }
-void write8(offs_t address, u8 data) { count_write(address); s32_write8(address & 0xffffff, data); }
-void write16(offs_t address, u16 data) { count_write(address); s32_write16(address & 0xffffff, data); }
+u8 read8(offs_t address)
+{
+	count_read(address);
+	count_rom_read(address, 1);
+	const u8 value = s32_read8(address & 0xffffff);
+	if (g_record_accesses && !g_reading_instructions)
+	{
+		count_access(address, 1, false);
+		follow_read(address & 0xffffff, 1, value);
+	}
+	return value;
+}
+u16 read16(offs_t address)
+{
+	count_read(address);
+	count_rom_read(address, 2);
+	const u16 value = s32_read16(address & 0xffffff);
+	if (g_record_accesses && !g_reading_instructions)
+	{
+		count_access(address, 2, false);
+		follow_read(address & 0xffffff, 2, value);
+	}
+	return value;
+}
+u32 read32(offs_t address)
+{
+	count_read(address);
+	count_rom_read(address, 4);
+	const u32 value = s32_read32(address & 0xffffff);
+	if (g_record_accesses && !g_reading_instructions)
+	{
+		count_access(address, 4, false);
+		follow_read(address & 0xffffff, 4, value);
+	}
+	return value;
+}
+inline void count_write_access(offs_t address, int size, uint32_t data)
+{
+	if (!g_record_accesses || g_reading_instructions)
+		return;
+	count_access(address, size, true);
+	follow_write(address & 0xffffff, size, data);
+}
+void write8(offs_t address, u8 data) { count_write(address); count_write_access(address, 1, data); s32_write8(address & 0xffffff, data); }
+void write16(offs_t address, u16 data) { count_write(address); count_write_access(address, 2, data); s32_write16(address & 0xffffff, data); }
 void write32(offs_t address, u32 data)
 {
 	count_write(address);
+	count_write_access(address, 4, data);
 	// with --transfers: who stores addresses of the program ROM (code pointers among them)
 	if (g_record_transfers && data < 0x200000)
 		g_code_writes.insert(uint64_t(data) << 24 | s32_board.pc);
@@ -416,6 +645,11 @@ void on_instruction(offs_t pc)
 		g_called[pc >> 3] |= uint8_t(1u << (pc & 7));
 	const uint8_t opcode = s32_read8(pc);
 	g_call_pending = opcode == 0x48 || opcode == 0x49 || opcode == 0xe8 || opcode == 0xe9;
+	if (g_record_accesses)
+	{
+		g_access_kind = access_kind(opcode, s32_read8(pc + 1));
+		g_move_source = 0;
+	}
 	if (g_record_transfers)
 	{
 		if (g_transfer_pending && !g_interrupt_entry)
@@ -548,6 +782,7 @@ int main(int argc, char **argv)
 	std::string sound_timing_path;
 	std::string profile_path;
 	std::string rom_reads_path;
+	std::string accesses_path;
 	std::string script_path;
 	std::string transfers_path;
 	bool frames_given = false;
@@ -556,7 +791,7 @@ int main(int argc, char **argv)
 		" [--hashes FILE] [--trace FILE] [--calls FILE] [--transfers FILE] [--watch ADDRESS ...] [--profile FILE]"
 		" [--dump-frame N ... --dump-dir DIR] [--video-hashes FILE] [--video-dump N ... --video-dir DIR]"
 		" [--sound-hashes FILE] [--sound-log FILE] [--sound-wav FILE] [--sound-trace FILE] [--sound-timing FILE]"
-		" [--rom-reads FILE] [--rom FOLDER] [--verbose]\n";
+		" [--rom-reads FILE] [--access-widths FILE] [--rom FOLDER] [--verbose]\n";
 	std::string rom_folder = "rom";
 
 	for (int index = 1; index < argc; index++)
@@ -594,6 +829,8 @@ int main(int argc, char **argv)
 			profile_path = argv[++index];
 		else if (argument == "--rom-reads" && has_value)
 			rom_reads_path = argv[++index];
+		else if (argument == "--access-widths" && has_value)
+			accesses_path = argv[++index];
 		else if (argument == "--hashes" && has_value)
 			hashes_path = argv[++index];
 		else if (argument == "--dump-frame" && has_value)
@@ -639,6 +876,7 @@ int main(int argc, char **argv)
 
 	g_record_transfers = !transfers_path.empty();
 	g_record_rom_reads = !rom_reads_path.empty();
+	g_record_accesses = !accesses_path.empty();
 	if (!profile_path.empty())
 	{
 		g_pc_counts.assign(1u << 24, 0);
@@ -769,6 +1007,8 @@ int main(int argc, char **argv)
 		write_profile(profile_path);
 	if (!rom_reads_path.empty())
 		write_rom_reads(rom_reads_path);
+	if (!accesses_path.empty())
+		write_accesses(accesses_path);
 	if (!transfers_path.empty())
 		write_transfers(transfers_path);
 	s32_script_free(g_script);

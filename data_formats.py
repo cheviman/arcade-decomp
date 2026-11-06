@@ -4,7 +4,7 @@ Description: the program ROM's and the sound program's data as readable files by
              for byte
 Version:     0.1.0
 Created:     14-10-2026
-Modified:    25-10-2026
+Modified:    06-11-2026
 Author:      Sebastian Toyos
 
 The data of the program ROM (the data area, 0x100000-0x17FFFF, and what the code chips hold besides the
@@ -268,7 +268,8 @@ def _wrap(text, prefix="# ", width=110):
     return lines + [line.rstrip()]
 
 
-def export(region, base, places, formats_path, folder, kept=(), movable=None, default_group=None, choose=None):
+def export(region, base, places, formats_path, folder, kept=(), movable=None, default_group=None, choose=None,
+           segments=None):
     """Every piece of 'region' (which starts at address 'base') into 'folder', and layout.json, the pieces in
     order. 'places' are [(address, name)] where pieces start (pieces() for the program ROM); 'kept' are (start,
     end) ranges the asset does not hold (code): pieces of their own that build() takes from the ROM; 'movable',
@@ -277,7 +278,9 @@ def export(region, base, places, formats_path, folder, kept=(), movable=None, de
     in a binary format is a file of its own in the folder of its subject; a run of one byte (padding) is
     written in layout.json. 'default_group' (an address -> a file's name) groups the pieces no file of the
     formats file takes; 'choose' (a piece's name -> a format of FORMATS or None), the format of a piece the
-    formats file gives none. Returns how many files."""
+    formats file gives none; 'segments' ({address: [(offset, type, bytes)]}, typed.pointed_segments), the parts
+    of a piece in a typed format, or in none, that the typed pointers lay out as their own types. Returns how
+    many files."""
     chosen, groups, descriptions = load_formats(formats_path)
     cuts = dict(places)
     if base not in cuts:
@@ -317,6 +320,12 @@ def export(region, base, places, formats_path, folder, kept=(), movable=None, de
             kind = plain_format(data)
         suffix, to_text, from_text = FORMATS[kind][:3]
         text = to_text(data)
+        if segments and address in segments and (kind.startswith("typed ") or kind in ("words", "bytes")):
+            from formats import typed
+            own = kind[len("typed "):] if kind.startswith("typed ") else "u8" if kind == "bytes" else "u16"
+            kind = kind if kind.startswith("typed ") else "typed u8"
+            suffix, _, from_text = FORMATS[kind][:3]
+            text = typed.segmented_text(data, own, segments[address])
         if from_text(text) != data:    # a format that does not fit this piece: keep it as bytes
             kind = "bytes"
             suffix, to_text, _ = FORMATS[kind]

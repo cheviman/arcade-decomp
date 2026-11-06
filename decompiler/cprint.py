@@ -3,7 +3,7 @@ Name:        cprint.py
 Description: prints IR expressions as plain C, with casts and parentheses only where the value needs them
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    30-10-2026
+Modified:    06-11-2026
 Author:      Sebastian Toyos
 
 An IR value has a width; C has its integer types and promotions. Every printed value says whether it
@@ -32,17 +32,78 @@ BITWISE = {BIT_AND, BIT_XOR, BIT_OR}
 
 PART = re.compile(r"A([ST])(8|16|32)\((.*?)(?:, (\d+))?\)$")
 INSIDE = set()    # the AS/AT accesses (their C) that lie inside the field or variable they are written over
+# the ones that reach past the end of it: C -> (name, offset, its bits, signed or None when not known)
+WIDE = {}
 
 
-def part(bits, name, offset, whole):
+def part(bits, name, offset, whole, signed=None):
     """C of an access of 'bits' at byte 'offset' of 'name', a field or variable of 'whole' bits that has no
     name for that part of it: AS8(x) for the first byte, AT8(x, 1) for the second. An access that reaches
     past the end of it (the 32 bits from a halfword on, two fields copied at once) is written the same way,
-    but only the ones inside it read as a part of its value (part_read)."""
+    but only the ones inside it read as a part of its value (part_read); the others are kept in WIDE, for the
+    elements of an array they run on into (element_run)."""
     text = f"AS{bits}({name})" if offset == 0 else f"AT{bits}({name}, {offset})"
     if offset * 8 + bits <= whole and bits < whole:
         INSIDE.add(text)
+    elif offset * 8 + bits > whole:
+        WIDE[text] = (name, offset, whole, signed)
     return text
+
+
+ELEMENT = re.compile(r"(.*)\[([^\[\]]+)\]")
+NARROW_CAST = re.compile(r"\(uint(8|16)_t\)(.*)")
+
+
+def narrow_cast(text):
+    """The bits of a value whose C is all one cast to a narrower unsigned type ((uint16_t)(x + 0x300u),
+    (uint8_t)y), or None"""
+    match = NARROW_CAST.fullmatch(text)
+    if match is None:
+        return None
+    rest = match[2]
+    if re.fullmatch(r"\w+", rest):
+        return int(match[1])
+    if not rest.startswith("("):
+        return None
+    depth = 0
+    for position, character in enumerate(rest):
+        depth += character == "("
+        depth -= character == ")"
+        if depth == 0:
+            return int(match[1]) if position == len(rest) - 1 else None
+    return None
+
+
+def index_plus(index, more):
+    """The C of an array's index 'more' elements on: 4 -> 5, -2 -> -1, 8 + layer * 2u -> 9 + layer * 2u,
+    i -> i + 1 (a number with no u, which keeps a signed index signed)"""
+    if more == 0:
+        return index
+    number = re.fullmatch(r"(-?)(0x[0-9A-Fa-f]+|\d+)u?", index)
+    if number:
+        return str(int(number[1] + number[2], 0) + more)
+    leading = re.fullmatch(r"(0x[0-9A-Fa-f]+|\d+)u? \+ (.*)", index)
+    if leading:
+        return f"{int(leading[1], 0) + more} + {leading[2]}"
+    return f"{index} + {more}"
+
+
+def element_run(text, bits):
+    """The elements of an array an access of 'bits' reads or writes when it starts at one of them and runs on
+    into the next ones (WIDE: a sprite list's two halfwords at once, four characters of the LCD's text):
+    [(byte in the access, bytes, C, the element's bits, signed or None, 0)], or None when it is not that"""
+    wide = WIDE.get(text)
+    if wide is None:
+        return None
+    name, offset, whole, signed = wide
+    element = ELEMENT.fullmatch(name)
+    if element is None or whole not in (8, 16) or bits % whole or (offset * 8) % whole:
+        return None
+    base, index = element.groups()
+    step = whole // 8
+    first = offset // step
+    return [(number * step, step, f"{base}[{index_plus(index, first + number)}]", whole, signed, 0)
+            for number in range(bits // whole)]
 
 
 def part_read(text):
@@ -421,6 +482,14 @@ class Printer:
 
     def arithmetic(self, node):
         name, (left_node, right_node), bits = node.name, node.args, node.bits
+        moved = getattr(self.names, "moved_place", None)
+        if moved is not None and name in ("add", "sub") and isinstance(right_node, ir.Const) and bits == 32:
+            # a pointer the C keeps to the record it walks, plus a constant: the place in the record there
+            distance = right_node.value & 0xFFFFFFFF
+            distance = distance - (1 << 32) if distance & 0x80000000 else distance
+            text = moved(left_node, distance if name == "add" else -distance)
+            if text is not None:
+                return Value(text, PRIMARY, True, "u32")
         left, right = self.any(left_node), self.any(right_node)
         ctype = self.joined(left, right)
         small = name == "mul" and isinstance(right_node, ir.Const) and right_node.value < 0x8000 \
