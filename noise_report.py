@@ -72,9 +72,9 @@ KINDS = {
     "register_names": ("parameters and locals named after a register (r1, p_r4, r0_2; the Z80's a, hl)", None),
     "temp_names": ("values the decompiler works out once, named by a number (t1)", None),
     "stack_names": ("stack slots named after their offset (stack_4)", None),
-    "flag_variables": ("locals that hold a flag of the CPU (zero, negative, overflow, carry, extend)", None),
+    "flag_variables": ("locals that hold a flag of the CPU (zero, negative, overflow, carry, extend, half_carry)", None),
     "flag_helpers": ("flags worked out as the CPU sets them (m68k_carry_add16...)",
-                     re.compile(r"\b(?:m68k|m68000|v60|z80)_(?:carry|overflow)_(?:add|sub)\d+\(")),
+                     re.compile(r"\b(?:m68k|m68000|v60|z80|konami)_(?:carry|overflow)_(?:add|sub)\d+\(")),
     "lost_stack": ("code no path reaches that keeps a stack the C does not have (lost_stack)",
                    re.compile(r"\blost_stack\(")),
     "code_switches": ("switches on the address of the code a table holds, not on the index the table is read with "
@@ -166,8 +166,8 @@ def count(paths):
                     switch_counted = True
             if re.match(r"^\t(?:uint\d+_t|int\d+_t) ", line):
                 counts["register_names"] += len(re.findall(rf"\b{CPU_REGISTER}(?:_\d+)? = ", line))
-                counts["flag_variables"] += len(re.findall(r"\b(?:zero|negative|overflow|carry|extend)(?:_\d+)? = ",
-                                                           line))
+                counts["flag_variables"] += len(re.findall(r"\b(?:zero|negative|overflow|carry|extend|half_carry)"
+                                                           r"(?:_\d+)? = ", line))
                 if z80:
                     counts["register_names"] += len(re.findall(rf"\b{Z80_REGISTER} = ", line))
                 counts["temp_names"] += len(re.findall(r"\bt\d+ = ", line))

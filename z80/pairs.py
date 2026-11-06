@@ -523,6 +523,10 @@ def next_address(first, second):
     return False
 
 
+# whether the pairs' words lie in memory high byte first (konami_cpu/decompile.py sets it for the Konami CPU's D: a
+# word read or written a byte at a time is one access only in that order); off, low byte first, as the Z80's
+BIG_ENDIAN = False
+
 # whether two addresses made of the same terms, whatever their order, with constants one apart are a byte and the next
 # (the profile's SOUND_TABLE_REGISTERS: decompile_sound.py sets it); off, only (x) and (x + 1), (ix+n) and (ix+n+1)
 SUMS = False
@@ -564,9 +568,12 @@ def tidy_change(node):
         return None
     name, args = node.name, node.args
     found = halves(node)
-    if found is not None and all(isinstance(byte, ir.Load) for byte in found) \
-            and next_address(found[1].address, found[0].address):
-        return ir.Load(found[1].address, 16)
+    if found is not None and all(isinstance(byte, ir.Load) for byte in found):
+        # (a word read as it lies in memory: its low byte first, or its high byte first on a big-endian CPU)
+        if not BIG_ENDIAN and next_address(found[1].address, found[0].address):
+            return ir.Load(found[1].address, 16)
+        if BIG_ENDIAN and next_address(found[0].address, found[1].address):
+            return ir.Load(found[0].address, 16)
     if name == "or" and node.bits == 16:
         # the high byte and the low byte of one word put together again: the word
         sources = [word_part(arg) for arg in args]
@@ -650,8 +657,8 @@ def joined_stores(statements):
         if isinstance(statement, ir.Store) and statement.bits == 8 and isinstance(previous, ir.Store) \
                 and previous.bits == 8 and not isinstance(previous.address, ir.Const) \
                 and next_address(previous.address, statement.address):
-            word = word_of_byte(previous.value, 0)
-            if word is not None and word == word_of_byte(statement.value, 1):
+            word = word_of_byte(previous.value, 1 if BIG_ENDIAN else 0)
+            if word is not None and word == word_of_byte(statement.value, 0 if BIG_ENDIAN else 1):
                 joined = ir.Store(previous.address, word, 16)
                 if hasattr(previous, "origin"):
                     joined.origin = previous.origin

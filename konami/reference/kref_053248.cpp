@@ -117,6 +117,7 @@ public:
 	reference_cpu() : konami_cpu_device(m_config, "maincpu", nullptr, SIMPSONS_CPU_CLOCK * 4) {}
 
 	u8 cc() const { return m_cc; }
+	u16 s() const { return m_s.w; }
 
 private:
 	static inline machine_config m_config;
@@ -133,6 +134,7 @@ uint32_t g_current = kOutside;      // the instruction running: its place
 uint32_t g_previous = kOutside;     // the one before it, unless an interrupt came between
 uint16_t g_previous_pc = 0;
 uint64_t g_instructions = 0;
+uint32_t g_lowest_s = 0x10000;     // --stack: the lowest S an instruction starts with, once the boot has set it
 uint64_t g_irq_frames = 0, g_firq_frames = 0;
 
 // An instruction's place: its program ROM's offset, or 080000 plus its address below 6000
@@ -220,7 +222,7 @@ uint8_t kind_of(uint16_t pc, uint32_t place)
 	{
 		const int32_t offset = simpsons_program_offset(at);
 		g_view[at] = offset >= 0 ? game_program[offset]
-			: at >= 0x4000 ? simpsons_board.work_ram[at - 0x4000]
+			: at >= 0x4000 ? *simpsons_work_ram_byte(at)
 			: (at >= 0x3000 && (simpsons_board.video_bank & 2)) ? simpsons_board.extra_ram[at - 0x3000] : 0;
 	}
 	const util::disasm_interface::data_buffer buffer(g_view.data(), 0x10000);
@@ -273,6 +275,8 @@ void on_instruction(offs_t pc)
 	}
 	const uint32_t place = place_of(uint16_t(pc));
 	g_instructions++;
+	if (g_cpu->s() >= SIMPSONS_WORK_RAM && g_cpu->s() < g_lowest_s)
+		g_lowest_s = g_cpu->s();
 	g_executed[place] = 1;
 	if (g_previous != kOutside)
 	{
@@ -356,8 +360,12 @@ void run_until(reference_cpu &cpu, uint64_t cycle)
 // The board's memories at the end of a frame, a file each: DIR/FRAME_work_ram.bin...
 void dump_frame(const std::string &folder, uint64_t frame)
 {
+	// (the work RAM in the order of its addresses: the board keeps it the other way round)
+	uint8_t work_ram[SIMPSONS_WORK_RAM_SIZE];
+	for (uint32_t offset = 0; offset < SIMPSONS_WORK_RAM_SIZE; offset++)
+		work_ram[offset] = *simpsons_work_ram_byte(uint16_t(SIMPSONS_WORK_RAM + offset));
 	const struct { const char *name; const uint8_t *data; size_t size; } memories[] = {
-		{ "work_ram", simpsons_board.work_ram, sizeof(simpsons_board.work_ram) },
+		{ "work_ram", work_ram, sizeof(work_ram) },
 		{ "extra_ram", simpsons_board.extra_ram, sizeof(simpsons_board.extra_ram) },
 		{ "palette", simpsons_board.palette, sizeof(simpsons_board.palette) },
 		{ "tile_ram", simpsons_board.tile_ram, sizeof(simpsons_board.tile_ram) },
@@ -516,13 +524,14 @@ int check_assets(const std::string &folder)
 
 int main(int argc, char **argv)
 {
-	const char *usage = "Usage: kref [--timing cycles|frames] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--interrupts FILE]"
+	const char *usage = "Usage: kref [--timing cycles|frames] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--interrupts FILE] [--stack FILE]"
 		" [--jumps FILE] [--rom-reads FILE] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR] [--script FILE]"
 		" [--service] [--rom FOLDER] [--no-sound] [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE]"
 		" [--sound-rom-reads FILE] [--sound-check] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
 		" [--video-check FILE] [--assets-check FOLDER] [--sound-timing FILE] [--sound-board-check FILE]\n";
 	std::string rom_folder = "rom";
 	std::string hashes_path, trace_path, calls_path, jumps_path, rom_reads_path, dump_folder = ".", script_path;
+	std::string stack_path;
 	std::set<uint64_t> text_frames, dump_frames;
 	uint64_t frames = 600;
 	bool frames_given = false, service = false, sound = true, sound_check = false;
@@ -561,6 +570,8 @@ int main(int argc, char **argv)
 			calls_path = argv[++index];
 		else if (argument == "--interrupts" && has_value)
 			g_interrupts.open(argv[++index]);
+		else if (argument == "--stack" && has_value)
+			stack_path = argv[++index];
 		else if (argument == "--jumps" && has_value)
 			jumps_path = argv[++index];
 		else if (argument == "--rom-reads" && has_value)
@@ -885,6 +896,13 @@ int main(int argc, char **argv)
 		<< "final place:       " << final_place << '\n';
 	if (!trace_path.empty())
 		write_places(trace_path, g_executed, "053248 instructions executed by kref");
+	if (!stack_path.empty())
+	{
+		std::ofstream out(stack_path);
+		char line[16];
+		std::snprintf(line, sizeof(line), "%04X\n", g_lowest_s & 0xFFFFu);
+		out << "# the lowest S an instruction started with (the 053248's stack, in the work RAM), by kref\n" << line;
+	}
 	if (!calls_path.empty())
 		write_places(calls_path, g_called, "053248 places reached by JSR, BSR or LBSR");
 	if (!jumps_path.empty())
