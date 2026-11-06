@@ -52,7 +52,7 @@ Operand modes (Operand.mode and the fields it uses):
                 'extended', 'direct', 'accumulator', 'invalid'; 'reg' the index register, '?' where MAME prints
                 it so; 'disp' the signed offset; 'accumulator' 'A', 'B' or 'D'; 'value' the address of an extended
                 or direct form (direct: the low byte); 'indirect' for the bracketed forms; 'target' the address a
-                PC-relative offset reaches)
+                PC-relative offset reaches: the offset's first byte's address plus the offset, as the CPU takes it)
     reglist     PUSHS, PUSHU, PULLS, PULLU ('registers': the names in MAME's order)
     registers   EXG and TFR ('source', 'destination' as the CPU takes them; 'exchange' True when bit 7 is clear)
     reg         a register MAME writes into the name (DIV X,B, BMOVE Y,X,U...) ('reg')
@@ -244,7 +244,9 @@ def _indexed(mem, mode, p):
             operand.kind, operand.value, operand.reg, inner = "extended", value, "", f"${value:04X}"
     operand.text = f"[{inner}]" if indirect else inner
     if operand.kind == "offset" and reg == "PC":
-        operand.target = (p + operand.disp) & 0xFFFF
+        # (the CPU adds the offset to the PC as it stands at the offset's first byte, konami.lst INDEXED: not to the
+        # instruction's end, as the 6809 does)
+        operand.target = (p - (1 if kind == 4 else 2) + operand.disp) & 0xFFFF
     return operand, p
 
 

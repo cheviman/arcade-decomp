@@ -67,6 +67,10 @@ if(K_CPU STREQUAL "053248")
 	add_executable(oracle_konami ${K_REFERENCE}/oracle_konami.cpp)
 	target_link_libraries(oracle_konami PRIVATE konami_cpu_reference)
 
+	# The lift's oracle: one instruction at a time on the core, from given states (compare_konami_lift_with_mame.py)
+	add_executable(oracle_konami_step ${K_REFERENCE}/oracle_konami_step.cpp)
+	target_link_libraries(oracle_konami_step PRIVATE konami_cpu_reference)
+
 	# The sound board: MAME's Z80 and K053260, ymfm's YM2151 (sound/ksound_053260.cpp)
 	add_library(ksound_053260_reference STATIC
 		${K_REFERENCE}/sound/ksound_053260.cpp

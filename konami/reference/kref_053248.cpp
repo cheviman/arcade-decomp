@@ -9,7 +9,7 @@
  *    Author:      Sebastian Toyos
  *
  *    Not part of the game. Usage:
- *      kref [--timing cycles] [--frames N] [--hashes hashes.txt] [--trace executed.txt] [--calls called.txt]
+ *      kref [--timing cycles|frames] [--frames N] [--hashes hashes.txt] [--trace executed.txt] [--calls called.txt]
  *           [--jumps jumps.txt] [--rom-reads reads.txt] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR]
  *           [--script controls.txt] [--service] [--rom FOLDER] [--no-sound] [--sound-hashes hashes.txt]
  *           [--sound-wav sound.wav] [--sound-trace executed.txt] [--sound-rom-reads reads.txt]
@@ -18,10 +18,14 @@
  *    It runs the original program, so it reads the player's ROM set when it starts, as MAME does: the set in
  *    --rom's folder or .zip (rom/ by default), into the board's memory (game/data.h, runtime/src/rom_set.c).
  *
- *    --timing cycles, the only one yet, keeps MAME's pace: the 053248 runs its cycles a line at a time (192 of
- *    them, 64 us), VBLANK ends at line 16 and begins at line 240, where the board takes its events (the
- *    K052109's IRQ, the sprite DMA, whose FIRQ the CPU sees from 128 to 1152 cycles later) and the frame's state
- *    hash is taken.
+ *    --timing frames (the default) or cycles. Cycles keeps MAME's pace: the 053248 runs its cycles a line at a
+ *    time (192 of them, 64 us), VBLANK ends at line 16 and begins at line 240, where the board takes its events
+ *    (the K052109's IRQ, the sprite DMA, whose FIRQ the CPU sees from 128 to 1152 cycles later) and the frame's
+ *    state hash is taken. Frames is the translated program's (runtime/include/simpsons/frame.h): instructions
+ *    take no time, a frame's events come where the program waits for its next one (the main loop with no job,
+ *    the boot waiting for the FIRQ or for the test switch to be let go), the DMA's FIRQ after 078F7A in the IRQ
+ *    handler, and the reads of the ports the program polls and the EEPROM's lines cost the board some cycles
+ *    (machine.h: the Z80 and the EEPROM go on meanwhile).
  *
  *    The sound board runs with it (sound/ksound_053260.cpp: MAME's Z80 and K053260, ymfm's YM2151): the
  *    053248's RAM and ROM test asks the Z80 for its own, through the K053260's ports, and reports the sound
@@ -53,11 +57,13 @@
  *    instructions), by the instruction that reads them: "PC FIRST-LAST" ranges (FFFFFF for the CPU's own reads
  *    of its vectors), a measure for the coverage of the ROM; --text prints the K052109's fixed layer of those
  *    frames as text; --dump writes the board's memories at the end of those frames, a file each; --service
- *    turns the test switch on.
+ *    turns the test switch on; --interrupts writes a line per interrupt the CPU takes: "FRAME IRQ|FIRQ PLACE",
+ *    the place of the instruction it came after.
  */
 #include "emu.h"
 #include "konami.h"
 #include "6x09dasm.h"
+#include "simpsons/frame.h"
 
 #include "game/data.h"
 #include "game/extract.h"
@@ -72,7 +78,9 @@
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <functional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -82,6 +90,8 @@ class reference_cpu : public konami_cpu_device
 {
 public:
 	reference_cpu() : konami_cpu_device(m_config, "maincpu", nullptr, SIMPSONS_CPU_CLOCK * 4) {}
+
+	u8 cc() const { return m_cc; }
 
 private:
 	static inline machine_config m_config;
@@ -211,8 +221,31 @@ std::set<std::pair<uint32_t, uint32_t>> g_jumps;    // --jumps: where each compu
 
 uint8_t g_previous_kind = 0;
 
+// --timing frames (simpsons/frame.h): the frame's events where the program waits for its next one
+bool g_frame_timing = true;     // (by default: --timing cycles for MAME's pace)
+std::function<void()> g_frame_wait;
+uint64_t g_since_frame = 0;
+constexpr uint64_t kHang = 200000000;    // instructions with no frame wait: a wait frame.h does not know
+struct frames_done {};
+
 void on_instruction(offs_t pc)
 {
+	if (g_frame_timing)
+	{
+		if (pc == SIMPSONS_FIRQ_POINT)
+		{
+			simpsons_firq_point();
+			sync_lines();
+		}
+		if (simpsons_frame_idle(uint16_t(pc)))
+			g_frame_wait();
+		else if (++g_since_frame > kHang)
+		{
+			char where[64];
+			std::snprintf(where, sizeof(where), "no frame wait in %" PRIu64 " instructions", kHang);
+			throw std::runtime_error(where);
+		}
+	}
 	const uint32_t place = place_of(uint16_t(pc));
 	g_instructions++;
 	g_executed[place] = 1;
@@ -229,10 +262,15 @@ void on_instruction(offs_t pc)
 	g_previous_pc = uint16_t(pc);
 }
 
+// --interrupts: a line per interrupt the CPU takes
+std::ofstream g_interrupts;
+
 // The CPU takes an interrupt: what follows is the handler, not where the last instruction went
 void on_interrupt(int line)
 {
-	(void)line;
+	if (g_interrupts.is_open())
+		g_interrupts << simpsons_board.frame << ' ' << (line == KONAMI_FIRQ_LINE ? "FIRQ" : "IRQ") << ' ' << std::hex
+			<< std::uppercase << g_current << std::dec << '\n';
 	g_previous = g_current = kOutside;
 }
 
@@ -391,7 +429,7 @@ void sound_sync()
 
 int main(int argc, char **argv)
 {
-	const char *usage = "Usage: kref [--timing cycles] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE]"
+	const char *usage = "Usage: kref [--timing cycles|frames] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--interrupts FILE]"
 		" [--jumps FILE] [--rom-reads FILE] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR] [--script FILE]"
 		" [--service] [--rom FOLDER] [--no-sound] [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE]"
 		" [--sound-rom-reads FILE] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]\n";
@@ -415,11 +453,13 @@ int main(int argc, char **argv)
 		}
 		else if (argument == "--timing" && has_value)
 		{
-			if (std::string(argv[++index]) != "cycles")
+			const std::string timing = argv[++index];
+			if (timing != "cycles" && timing != "frames")
 			{
-				std::cerr << "Only --timing cycles yet: the frame-wait loop is not known\n" << usage;
+				std::cerr << "--timing is cycles or frames\n" << usage;
 				return 1;
 			}
+			g_frame_timing = timing == "frames";
 		}
 		else if (argument == "--script" && has_value)
 			script_path = argv[++index];
@@ -429,6 +469,8 @@ int main(int argc, char **argv)
 			trace_path = argv[++index];
 		else if (argument == "--calls" && has_value)
 			calls_path = argv[++index];
+		else if (argument == "--interrupts" && has_value)
+			g_interrupts.open(argv[++index]);
 		else if (argument == "--jumps" && has_value)
 			jumps_path = argv[++index];
 		else if (argument == "--rom-reads" && has_value)
@@ -524,62 +566,96 @@ int main(int argc, char **argv)
 			sound_hashes.open(sound_hashes_path);
 	}
 
+	// The frame's events: where its VBLANK ends, and where it begins (the controls change, the hashes are taken)
+	auto vblank_end = [&](uint64_t number) {
+		// the K052109 takes its scroll, and the screen updates (after VBLANK, as simpsons.cpp's)
+		if (video)
+			kv_vblank_end(video_hashes.is_open() || video_dump_frames.count(number) != 0);
+	};
+	auto vblank_start = [&](uint64_t number) {
+		if (video)
+			kv_vblank_start();
+		if (g_frame_timing)
+			simpsons_frame_vblank((g_cpu->cc() & 0x10) != 0);
+		else
+			simpsons_vblank_start();
+		simpsons_script_apply(script, simpsons_board.frame);
+		sync_lines();
+		if (sound)
+		{
+			ks_end_frame(simpsons_board.cycles);
+			if (sound_hashes.is_open())
+			{
+				char line[64];
+				std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", number,
+					ks_frame_samples_hash(), ks_state_hash());
+				sound_hashes << line;
+			}
+			if (!sound_wav_path.empty())
+			{
+				size_t count = 0;
+				const int16_t *mix = ks_frame_mix(&count);
+				sound_mix.insert(sound_mix.end(), mix, mix + count);
+			}
+		}
+		g_irq_frames += g_irq;
+		g_firq_frames += g_frame_timing ? simpsons_board.firq || simpsons_board.firq_due
+			: simpsons_board.dma_start_at && simpsons_board.firq_enabled;
+		if (hashes.is_open())
+		{
+			char line[48];
+			std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 "\n", number, simpsons_state_hash());
+			hashes << line;
+		}
+		if (video_hashes.is_open())
+		{
+			char line[48];
+			std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 "\n", number, kv_frame_hash());
+			video_hashes << line;
+		}
+		if (video_dump_frames.count(number))
+			write_bmp(video_folder + "/frame_" + std::to_string(number) + ".bmp");
+		if (text_frames.count(number))
+			print_text(number);
+		if (dump_frames.count(number))
+			dump_frame(dump_folder, number);
+	};
+
 	int status = 0;
 	uint64_t frame = 0;
 	try
 	{
-		for (frame = 1; frame <= frames; frame++)
+		if (g_frame_timing)
 		{
-			const uint64_t start = (frame - 1) * SIMPSONS_FRAME_CYCLES;
-			run_until(cpu, start + uint64_t(SIMPSONS_VBLANK_END) * SIMPSONS_LINE_CYCLES);
-			// VBLANK ends: the K052109 takes its scroll, and the screen updates (after VBLANK, as simpsons.cpp's)
-			if (video)
-				kv_vblank_end(video_hashes.is_open() || video_dump_frames.count(frame) != 0);
-			run_until(cpu, start + uint64_t(SIMPSONS_VBLANK_START) * SIMPSONS_LINE_CYCLES);
-			// VBLANK begins: the board takes its events, the controls change, and the frame's hash is taken
-			if (video)
-				kv_vblank_start();
-			simpsons_vblank_start();
-			simpsons_script_apply(script, simpsons_board.frame);
-			sync_lines();
-			if (sound)
+			// instructions take no time: the frame's events at each of the program's waits, until the last one
+			simpsons_board.frame_timing = true;
+			g_frame_wait = [&]() {
+				frame++;
+				vblank_end(frame);
+				vblank_start(frame);
+				g_since_frame = 0;
+				if (frame >= frames)
+					throw frames_done();
+			};
+			try
 			{
-				ks_end_frame(simpsons_board.cycles);
-				if (sound_hashes.is_open())
-				{
-					char line[64];
-					std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", frame,
-						ks_frame_samples_hash(), ks_state_hash());
-					sound_hashes << line;
-				}
-				if (!sound_wav_path.empty())
-				{
-					size_t count = 0;
-					const int16_t *mix = ks_frame_mix(&count);
-					sound_mix.insert(sound_mix.end(), mix, mix + count);
-				}
+				for (;;)
+					cpu.run(1 << 24);
 			}
-			g_irq_frames += g_irq;
-			g_firq_frames += simpsons_board.dma_start_at && simpsons_board.firq_enabled;
-			if (hashes.is_open())
+			catch (const frames_done &)
 			{
-				char line[48];
-				std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 "\n", frame, simpsons_state_hash());
-				hashes << line;
 			}
-			if (video_hashes.is_open())
-			{
-				char line[48];
-				std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 "\n", frame, kv_frame_hash());
-				video_hashes << line;
-			}
-			if (video_dump_frames.count(frame))
-				write_bmp(video_folder + "/frame_" + std::to_string(frame) + ".bmp");
-			if (text_frames.count(frame))
-				print_text(frame);
-			if (dump_frames.count(frame))
-				dump_frame(dump_folder, frame);
+			frame++;
 		}
+		else
+			for (frame = 1; frame <= frames; frame++)
+			{
+				const uint64_t start = (frame - 1) * SIMPSONS_FRAME_CYCLES;
+				run_until(cpu, start + uint64_t(SIMPSONS_VBLANK_END) * SIMPSONS_LINE_CYCLES);
+				vblank_end(frame);
+				run_until(cpu, start + uint64_t(SIMPSONS_VBLANK_START) * SIMPSONS_LINE_CYCLES);
+				vblank_start(frame);
+			}
 		frame--;
 	}
 	catch (const std::exception &error)

@@ -50,7 +50,10 @@ compares them with, an absolute operand, a PC-relative one: what a table read on
 walk starts again with
 the table stopping there once the code that names it is found), or that a walk found to start an instruction
 inside one the code reaches without tables; read backwards (a negative index), at an entry with a byte of any code
-in it, an operand too; a zero or FFFF entry (TABLE_UNUSED_ENTRIES) before one that is not is an unused one.
+in it, an operand too; a zero or FFFF entry (TABLE_UNUSED_ENTRIES) before one that is not is an unused one. A word
+read at a constant offset (an index the state knows) is an address only if what it leads to decodes, as an entry's.
+A code line with calls=TABLE at a jump or call through memory says where it goes instead: the described table's
+entries, none for count=0 (code nothing reaches whose tables hold no code addresses).
 """
 import sys
 from bisect import bisect_left, bisect_right
@@ -365,7 +368,8 @@ class Analysis:
                     if (index and self.ends_table(record_place, table)) \
                             or (index < 0 and any(place in self.code_behind
                                                   for place in range(record_place, record_place + length))) \
-                            or target is None or target >= place_of(None, VECTOR_AREA) or target in self.bad_entries                             or not self.clean(target, strict=index < 0):
+                            or target is None or target >= place_of(None, VECTOR_AREA) or target in self.bad_entries \
+                            or not self.clean(target, strict=index < 0):
                         break
                     low, high = self.table_spans.get(table, (table, table))
                     self.table_spans[table] = (min(low, record_place), max(high, record_place + length))
@@ -639,6 +643,20 @@ class Analysis:
         operand = instruction.operands[0]
         targets = []    # (cpu, bank)
         banks = banks_in(state)
+        told = self.symbols.get(place)
+        if told is not None and told.calls is not None:
+            # (symbols.txt says where: "code NAME calls=TABLE", the table's described entries; none, a jump that goes
+            # nowhere, as in code nothing reaches whose tables hold no code addresses)
+            table = next((address for address, symbol in self.symbols.items() if symbol.name == told.calls), None)
+            described = self.layout_of(table) if table is not None else None
+            if described is None:
+                raise SystemExit(f"symbols.txt: {told.name} calls {told.calls}, which is no described table")
+            count, length, offset = described
+            view = self.view(bank_of(table))
+            for index in range(count):
+                target = view.r16((cpu_of(table) + length * index + offset) & 0xFFFF)
+                self.go(target, dict(state, bank=constant(bank_of(table))), kind, "table")
+            return
         if operand.mode == "registers":
             register = operand.source if operand.destination == "PC" else operand.destination
             for held, value in known(state.get(register)):
@@ -655,8 +673,12 @@ class Analysis:
                     continue
                 for option, amount in self.index_options(operand.accumulator, state):
                     if option == "offset":
+                        # (only words that lead to code that decodes, as a table's entries: an index the state
+                        # merges from ways that do not go here is no entry, 0205C7 "JSR [A,U]" with A from 44,X
+                        # where X is still a table of handlers' address, which would take 7C28's 7CD8, a record)
                         targets += [(word, bank) for bank in banks
-                                    if (word := self.word_at((base + amount) & 0xFFFF, bank)) is not None]
+                                    if (word := self.word_at((base + amount) & 0xFFFF, bank)) is not None
+                                    and (place_of(bank, word) is None or self.clean(place_of(bank, word)))]
                     else:
                         targets += self.table_targets(base, max(amount, 2), 0, state)
         elif operand.indirect and operand.kind in ("register", "offset") and operand.reg in REGISTERS:
