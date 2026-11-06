@@ -4,7 +4,7 @@ Description: the program ROM's tables as symbols.txt types them: one record a li
              names the columns, numbers as numbers and addresses as the names of what they reach
 Version:     0.1.0
 Created:     27-10-2026
-Modified:    27-10-2026
+Modified:    06-11-2026
 Author:      Sebastian Toyos
 
 A piece symbols.txt gives a type (a 'table NAME TYPE' line, or a table of records the code reads by index)
@@ -44,6 +44,9 @@ PER_LINE = {1: 8, 2: 8, 4: 4}
 _TYPES = {}     # piece name -> its element type (a value type or a structure's name)
 _LAYOUTS = {}   # structure name -> (size, [(column name, offset, value type)])
 _CODE = []      # sorted addresses of the program's functions, for names inside their code
+_TARGETS = {}   # what a 32-bit value points at, as symbols.txt says: (structure, offset) of a field, or
+                # ("global", address) of a table, -> the structure (or array of values) there
+_FLEXIBLE = {}  # structure -> the value type of the array that goes on past its record (field NAME TYPE[])
 
 
 def _load():
@@ -59,6 +62,12 @@ def _load():
         columns = _columns(names, structure, size)
         if columns is not None:
             _LAYOUTS[structure] = (size, columns)
+    for (owner, offset), (pointed, bits) in names.targets.items():
+        if bits == 32:
+            _TARGETS[(owner, offset)] = pointed
+    for (structure, offset), count in names.field_arrays.items():
+        if count is None and offset == names.structs.get(structure) and (structure, offset) in names.fields:
+            _FLEXIBLE[structure] = names.fields[(structure, offset)][1]
     _CODE.extend(sorted(address for address, symbol in disassemble.load_symbols(common.ROOT / "symbols.txt").items()
                         if symbol.kind == "func"))
 
@@ -261,6 +270,9 @@ def values_to_text(data, kind):
 
 def records_to_text(data, structure):
     size, columns = _LAYOUTS[structure]
+    if structure in _FLEXIBLE and len(data) > size:
+        # (a record whose array goes on past it: the record, then the array's values to the piece's end)
+        return records_to_text(data[:size], structure) + values_to_text(data[size:], _FLEXIBLE[structure])
     count = len(data) // size
     named = {}
     for name, offset, kind in columns:
@@ -479,7 +491,7 @@ def inner_places(places, crossings=()):
     ordered = sorted(places)
     for index, (address, name) in enumerate(ordered):
         kind = _TYPES.get(name)
-        if kind not in _LAYOUTS:
+        if kind not in _LAYOUTS or kind in _FLEXIBLE:
             continue
         size = _LAYOUTS[kind][0]
         for other, other_name in ordered[index + 1:]:
@@ -507,6 +519,162 @@ def inner_places(places, crossings=()):
                 inner.add((other, other_name))
                 changed = True
     return inner
+
+
+def _pointed(kind, address):
+    """[(offset in an element, what it points at)] of the 32-bit values of an element of 'kind' (at 'address',
+    for a table of values) that point at a structure or an array of values, and the element's size"""
+    if kind in VALUE_TYPES:
+        pointed = _TARGETS.get(("global", address)) if kind in ("u32", "s32") else None
+        return ([(0, pointed)] if pointed else []), struct.calcsize(VALUE_TYPES[kind])
+    if kind not in _LAYOUTS:
+        return [], None
+    size, columns = _LAYOUTS[kind]
+    found = [(offset, _TARGETS[(kind, offset)]) for _, offset, column_kind in columns
+             if column_kind in ("u32", "s32") and (kind, offset) in _TARGETS]
+    return found, size
+
+
+def _open_ended(kind):
+    """True for what has no length of its own: an array of values, or a record whose array goes on past it"""
+    return kind in VALUE_TYPES or kind in _FLEXIBLE or (kind in _LAYOUTS and len(_LAYOUTS[kind][1]) == 1
+                                                         and _LAYOUTS[kind][1][0][0] == "element")
+
+
+def pointed_segments(places, region, base, kept=()):
+    """Where the typed pointers of the pieces at 'places' ([(address, name)]) point, in 'region' (the program's
+    bytes from address 'base'; 'kept', (start, end) ranges of code, holds none): a table of addresses
+    symbols.txt says point at a structure (ADDRESS table NAME u32 STRUCT), an array of them (elements NAME u32
+    STRUCT), a record's field that holds one (field STRUCT OFFSET NAME u32 STRUCT). What each one points at is
+    laid out in its piece as that structure (or array of values), as the code reads it: {piece's address:
+    [(offset, type, bytes)]}, the rest of the piece as its own type. A record takes its size; an array of
+    values, and a record whose array goes on past it, up to what comes next. A table of addresses ends where
+    the first of the records it points at in its own piece starts (the records after a table of their
+    addresses: sprite_list_switches'), and what a record points at is followed the same way."""
+    _load()
+    known = dict(places)
+    boundaries = sorted(set(known) | {start for start, _ in kept} | {base + len(region)})
+
+    def piece_of(address):
+        """(start, end, name) of the place whose piece holds 'address', or None"""
+        index = bisect_right(boundaries, address) - 1
+        if index < 0 or boundaries[index] not in known or index + 1 >= len(boundaries):
+            return None
+        return boundaries[index], boundaries[index + 1], known[boundaries[index]]
+
+    def in_data(address):
+        return base <= address < base + len(region) and not any(start <= address < end for start, end in kept)
+
+    laid = {}        # address -> (type, bytes or None up to what comes next)
+
+    def covered(address):
+        for start, (kind, length) in laid.items():
+            if start <= address < start + (length or 1):
+                return True
+        return False
+
+    def target_of(value):
+        if value in SENTINELS or (value & 0xFFFFFF) < LOWEST_ADDRESS:
+            return None
+        target = common.game_profile.rom.canonical_address(value & 0xFFFFFF)
+        return target if target is not None and in_data(target) else None
+
+    queue = [(address, _TYPES.get(name), None) for address, name in sorted(known.items())]
+    while queue:
+        address, kind, count = queue.pop(0)
+        pointers, size = _pointed(kind, address)
+        if not pointers or not size:
+            continue
+        holder = piece_of(address)
+        if holder is None:
+            continue
+        end = holder[1] if count is None else address + count * size
+        # (the table stops where the first record it points at in its own piece starts)
+        number = 0
+        while address + (number + 1) * size <= end:
+            for offset, pointed in pointers:
+                at = address + number * size + offset
+                target = target_of(struct.unpack_from("<I", region, at - base)[0])
+                if target is None or (pointed not in _LAYOUTS and pointed not in VALUE_TYPES):
+                    continue
+                if address < target < end and count is None:
+                    end = min(end, target)
+                piece = piece_of(target)
+                if piece is None or target == piece[0] and _TYPES.get(piece[2]) == pointed:
+                    continue    # (a piece of its own type)
+                own = _TYPES.get(piece[2])
+                if own == pointed and pointed in _LAYOUTS and pointed not in _FLEXIBLE \
+                        and (target - piece[0]) % _LAYOUTS[pointed][0] == 0:
+                    continue    # (a record of a table of its kind)
+                if covered(target):
+                    continue
+                length = None if _open_ended(pointed) else min(_LAYOUTS[pointed][0], piece[1] - target)
+                laid[target] = (pointed, length)
+                if pointed in _LAYOUTS and not _open_ended(pointed):
+                    queue.append((target, pointed, 1))
+            number += 1
+    # each open-ended one up to what comes next in its piece; one that runs into the next is cut there
+    segments = {}
+    starts = sorted(laid)
+    for index, start in enumerate(starts):
+        kind, length = laid[start]
+        piece = piece_of(start)
+        following = starts[index + 1] if index + 1 < len(starts) and starts[index + 1] < piece[1] else piece[1]
+        length = following - start if length is None else min(length, following - start)
+        if length > 0:
+            segments.setdefault(piece[0], []).append((start - piece[0], kind, length))
+    return segments
+
+
+def _short_record_text(data, structure):
+    """A record cut short by the piece's end (the last of a table whose last bytes are the next piece's): the
+    columns that fit, the rest as bytes"""
+    _, columns = _LAYOUTS[structure]
+    fit = [(name, offset, kind) for name, offset, kind in columns if offset + SIZES[kind] <= len(data)]
+    size = max((offset + SIZES[kind] for _, offset, kind in fit), default=0)
+    if not fit or [offset for _, offset, _ in fit] != sorted(offset for _, offset, _ in fit) or \
+            sum(SIZES[kind] for _, _, kind in fit) != size:
+        return "\n".join(_rest(data)) + ("\n" if data else "")
+    header = f"layout {structure} {size} " + " ".join(f"{name}:{kind}" for name, _, kind in fit)
+    row = [f"[0]"] + [_value_text(struct.unpack_from("<" + VALUE_TYPES[kind], data, offset)[0], kind, False)
+                      for _, offset, kind in fit]
+    return "\n".join([header] + _aligned([row]) + _rest(data[size:])) + "\n"
+
+
+def _part_text(data, kind, at=0):
+    """A part of a piece as its type: values, records, or 16-bit words for none; the part starts 'at' bytes into
+    the piece, whose values of its own type keep their places from its start (the bytes before the first whole
+    one as bytes)"""
+    if kind is None:
+        kind = "u16"
+    width = element_size(kind) or 1
+    lead = min((-at) % width, len(data)) if kind in VALUE_TYPES or _open_ended(kind) else 0
+    text = "\n".join(_rest(data[:lead])) + "\n" if lead else ""
+    data = data[lead:]
+    if not data:
+        return text
+    if kind in VALUE_TYPES:
+        return text + values_to_text(data, kind)
+    if kind in _LAYOUTS and len(data) < _LAYOUTS[kind][0]:
+        return text + _short_record_text(data, kind)
+    if kind in _LAYOUTS:
+        return text + records_to_text(data, kind)
+    return text + values_to_text(data, "u16" if len(data) % 2 == 0 else "u8")
+
+
+def segmented_text(data, own, segments):
+    """A piece whose parts the typed pointers lay out as their own types (pointed_segments: [(offset, type,
+    bytes)]), the rest as the piece's own type 'own' (None: 16-bit words), whose values keep their places
+    from the piece's start: a layout line for each part"""
+    parts, at = [], 0
+    for offset, kind, length in sorted(segments):
+        if offset > at:
+            parts.append(_part_text(data[at:offset], own, at))
+        parts.append(_part_text(data[offset:offset + length], kind))
+        at = offset + length
+    if at < len(data):
+        parts.append(_part_text(data[at:], own, at))
+    return "".join(parts)
 
 
 def format_for(name):
