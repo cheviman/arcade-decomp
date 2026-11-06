@@ -26,9 +26,14 @@ jump: slots}), analysis.slots ({(IX or IY, offset): handlers}) and analysis.hand
 handlers}, tables of handlers the program stores in a slot).
 
 sound_symbols.txt's lines here: func, code, loop (function entries and labels), data, and
-    ADDRESS  jumps  NAME COUNT [first=K]   a table of COUNT 16-bit code addresses at ADDRESS, the one the code
+    ADDRESS  jumps  NAME COUNT [first=K] [slot=OO]
+                                           a table of COUNT 16-bit code addresses at ADDRESS, the one the code
                                            indexes; with first=K, the code never reads its first K entries
-                                           (the table starts K entries on)
+                                           (the table starts K entries on); with slot=OO, its entries are
+                                           handlers the program stores in the word at offset OO (hex) of the
+                                           records a register points at, through a pointer the walk does not
+                                           follow (The Simpsons' instruments: a channel's table of 16, 4607
+                                           "LD L,(IX+$28)...")
     ADDRESS  via    TABLE                  the JP (HL), JP (IX) or JP (IY) at ADDRESS goes to an entry of TABLE
 
 Program has the attributes the decompiler takes from tools/recompile.py's: entries, bodies, names,
@@ -64,6 +69,7 @@ class Symbol:
     count: int = 0          # jumps: entries in the table
     table: str = ""         # via: the table the jump uses
     first: int = 0          # jumps: the first entry the code reads
+    slot: int | None = None # jumps: the offset of the records' word its entries are stored in
 
 
 def load_symbols(path):
@@ -82,10 +88,16 @@ def load_symbols(path):
         except ValueError:
             raise SystemExit(f"{where}: '{parts[0]}' is not an address") from None
         if parts[1] == "jumps":
-            first = parts[4].partition("=")[2] if len(parts) == 5 and parts[4].startswith("first=") else None
-            if len(parts) not in (4, 5) or not parts[3].isdigit() or (len(parts) == 5 and not (first or "").isdigit()):
-                raise SystemExit(f"{where}: expected 'ADDRESS jumps NAME COUNT [first=K]'")
-            symbols[address] = Symbol("jumps", parts[2], count=int(parts[3]), first=int(first or 0))
+            options = dict(part.partition("=")[::2] for part in parts[4:])
+            if len(parts) < 4 or not parts[3].isdigit() or set(options) - {"first", "slot"} \
+                    or not options.get("first", "0").isdigit():
+                raise SystemExit(f"{where}: expected 'ADDRESS jumps NAME COUNT [first=K] [slot=OO]'")
+            try:
+                slot = int(options["slot"], 16) if "slot" in options else None
+            except ValueError:
+                raise SystemExit(f"{where}: slot= takes a hex offset") from None
+            symbols[address] = Symbol("jumps", parts[2], count=int(parts[3]), first=int(options.get("first", "0")),
+                                      slot=slot)
         elif parts[1] == "via":
             symbols[address] = Symbol("via", f"via_{address:04X}", table=parts[2])
         else:
@@ -246,6 +258,10 @@ class Program:
                     new |= switch
             for slot in {slot for slots in analysis.slot_jumps.values() for slot in slots}:
                 handlers = set(analysis.slots.get(slot, []))
+                for table, symbol in self.symbols.items():
+                    if symbol.kind == "jumps" and symbol.slot == slot[1]:
+                        analysis.handler_tables[table] = self.table_entries(table)
+                        handlers.update(analysis.handler_tables[table])
                 for word in walk.slot_words(*slot):
                     if word[0] == "w":
                         handlers.add(word[1])

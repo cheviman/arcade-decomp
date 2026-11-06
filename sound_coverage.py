@@ -334,7 +334,9 @@ def load_reads(folders, end):
                     continue
                 pc, span = line.split()
                 first, last = (int(value, 16) for value in span.split("-"))
-                by_reader[int(pc, 16)].update(range(first, last + 1))
+                # (a banked board's reads of its banks, past the program, are the banks' data: not this map's)
+                by_reader[int(pc, 16)].update(range(first, min(last + 1, end)))
+    by_reader = {pc: read for pc, read in by_reader.items() if read}
     summing = {pc: len(read) for pc, read in by_reader.items() if len(read) >= end}
     return {pc: read for pc, read in by_reader.items() if pc not in summing}, summing
 

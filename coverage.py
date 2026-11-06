@@ -3,7 +3,7 @@ Name:        coverage.py
 Description: byte map of the program ROM: decoded code, data the code points at, fill, and what is still unknown
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    05-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/coverage.py [rom folder or .zip] [--trace executed.txt ...] [--reads FOLDER ...]
@@ -28,10 +28,15 @@ every byte of the program image one class:
                    0xFF that end an area even after referenced data (a table read on into them keeps the
                    bytes it was read as: an end mark); the zeros that take
                    the code after a function to the next word it starts on; up to three padding bytes
-                   (zeros, or the V60's nops, CD) between two known things (before data, on a 16-bit word)
+                   (zeros, or the V60's nops, CD) between two known things (before data, on a 16-bit word); in a
+                   banked program (the ROM set's RESIDUE_BANK_SIZE), unknown bytes at a bank's end or in a gap
+                   between its pieces the same as the bytes at their offsets in another bank where they are known,
+                   and not next to bytes the game reads: what the assembler's buffer kept from that bank (The
+                   Simpsons' banks end so: bank 26's 04DE76-04DFDF is bank 2C's)
   unknown          everything else
 Unknown runs are listed largest first, with two hints about what they are: how much of the run decodes
-as instructions from its start, and how many 32-bit words elsewhere in the ROM hold its address.
+as instructions from its start, and how many words elsewhere in the ROM hold its address (32-bit ones, or
+what the CPU's analysis module counts: its pointers_to).
 """
 import importlib
 import sys
@@ -61,13 +66,15 @@ FILL_MINIMUM = 16
 BYTE_ORDER = getattr(disassemble, "BYTE_ORDER", "little")
 ALIGNMENT = getattr(disassemble, "FUNCTION_ALIGNMENT", 4)
 PADDING_BYTES = getattr(disassemble, "PADDING_BYTES", (0x00, 0xCD))
+POINTER_SIZE = getattr(disassemble, "POINTER_SIZE", 4)     # the bytes of a code address a table holds
 # Operand modes whose Operand.value is a fixed place in memory
 FIXED_MODES = {"pc_disp", "pc_disp_indexed", "pc_disp_indirect", "pc_disp_indirect_indexed", "pc_double_disp",
                "direct", "direct_indexed", "direct_deferred", "direct_deferred_indexed"}
 # ... and the ones among them where a jump or call reads its target from that place
 INDIRECT_MODES = {"pc_disp_indirect", "pc_disp_indirect_indexed", "pc_double_disp",
                   "direct_deferred", "direct_deferred_indexed"}
-CODE_CHIPS = game_profile.rom.PROGRAM_AREAS[:2]
+# the chips that hold code (the ROM set's CODE_AREAS; the first two by default: System 32's and TMNT's)
+CODE_CHIPS = getattr(game_profile.rom, "CODE_AREAS", game_profile.rom.PROGRAM_AREAS[:2])
 
 
 def v60_data_places(instruction):
@@ -112,11 +119,19 @@ def data_references(analysis, reads=None):
     for field, target in analysis.data_fields.items():
         if target not in analysis.owner:
             references[target].append(field)
-    for instruction in analysis.instructions.values():
-        for value in data_places(instruction):
-            place = game_profile.rom.canonical_address(value)
-            if place is not None and place not in analysis.owner:
-                references[place].append(instruction.address)
+    named_by = getattr(analysis, "named_by", None)
+    if named_by is not None:
+        # (a CPU whose addresses depend on a bank names places per instruction: its analysis tells them)
+        for at, places in named_by.items():
+            for place in places:
+                if place not in analysis.owner:
+                    references[place].append(at)
+    else:
+        for instruction in analysis.instructions.values():
+            for value in data_places(instruction):
+                place = game_profile.rom.canonical_address(value)
+                if place is not None and place not in analysis.owner:
+                    references[place].append(instruction.address)
     # data symbols count as references made by symbols.txt (no instruction address)
     for address, symbol in analysis.symbols.items():
         if symbol.kind == "data":
@@ -131,7 +146,7 @@ def classify(analysis, references, reads=None):
     """One class per byte of the program image: {address: class}, areas in PROGRAM_AREAS only"""
     image = analysis.image
     reads = reads or {}
-    described = {entry + offset for entry in analysis.data_words for offset in range(4)}
+    described = {entry + offset for entry in analysis.data_words for offset in range(POINTER_SIZE)}
     for first, stop in analysis.described:
         described.update(range(first, stop))
     fill = {address for first, stop in getattr(analysis, "fill", ()) for address in range(first, stop)}
@@ -194,7 +209,55 @@ def classify(analysis, references, reads=None):
                     and (classes[stop] == CODE or stop % 2 == 0):
                 for byte_address in range(address, stop):
                     classes[byte_address] = FILL
+    residue(image, classes)
     return classes
+
+
+def residue(image, classes):
+    """What the assembler's buffer kept from another bank, in a banked program: a run of unknown bytes (or of
+    referenced data that runs on to the next known thing), at a bank's end or in a gap between its pieces, the same,
+    piece after piece back from its end, as the bytes at their offsets in another bank where they are known (code or
+    data), is fill. A run next to bytes the game reads is not, unless only fill follows it to its bank's end: a table
+    the same as another bank's (kept on purpose, the game reads some of it) is that table"""
+    size = getattr(game_profile.rom, "RESIDUE_BANK_SIZE", None)
+    if not size:
+        return
+    banks = len(image) // size
+    loose = (UNKNOWN, DATA)
+    runs = []
+    for start, end in game_profile.rom.PROGRAM_AREAS:
+        runs += runs_of(classes, UNKNOWN, start, end) + runs_of(classes, DATA, start, end)
+    # (joined: an unknown run and the referenced data before it are one run)
+    joined = []
+    for first, stop in sorted(runs):
+        if joined and joined[-1][1] == first:
+            joined[-1] = (joined[-1][0], stop)
+        else:
+            joined.append((first, stop))
+    # (back from the end: a run with only fill after it to its bank's end is the bank's end, whatever comes before it)
+    for first, stop in reversed(joined):
+        tail = all(classes.get(byte) == FILL for byte in range(stop, ((stop - 1) // size + 1) * size))
+        if classes.get(stop) == READ or classes.get(first - 1) == READ and not tail:
+            continue
+        bank = (stop - 1) // size
+        low = max(first, bank * size)
+        place = stop
+        while place > low:
+            piece = None
+            for begin in range(low, place):
+                offset = begin % size
+                if offset + place - begin > size:
+                    continue
+                if any(image[other:other + place - begin] == image[begin:place]
+                       and any(classes.get(byte, UNKNOWN) not in loose for byte in range(other, other + place - begin))
+                       for other in (each * size + offset for each in range(banks) if each != bank)):
+                    piece = begin
+                    break
+            if piece is None:
+                break
+            for byte in range(piece, place):
+                classes[byte] = FILL
+            place = piece
 
 
 def runs_of(classes, wanted, start, end):
@@ -225,7 +288,10 @@ def sweep(analysis, start, end):
 
 
 def pointers_to(analysis, targets):
-    """32-bit words outside code (any alignment) whose value is one of 'targets', through any mirror"""
+    """32-bit words outside code (any alignment) whose value is one of 'targets', through any mirror (or what the
+    CPU's analysis module counts)"""
+    if hasattr(disassemble, "pointers_to"):
+        return disassemble.pointers_to(analysis, targets)
     image = analysis.image
     found = defaultdict(list)
     for start, end in game_profile.rom.PROGRAM_AREAS:

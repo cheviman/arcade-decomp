@@ -45,6 +45,21 @@ Nothing here is a game's: no ROM, no names, no data.
   the game keeps the other way round so that a big-endian value is a plain C lvalue of a little-endian host
   (the profile's `WORK_RAM_AREA`, `PROGRAM_AREA`, `HARDWARE`, `EFFECT_READ_AREAS`, `INTERRUPT_STACK_SWITCH`,
   `SUPERVISOR_CODE`).
+- `konami_cpu/`: Konami's own CPU (the 052001 and the 053248, a 6809 with Konami's opcodes: The Simpsons,
+  Vendetta...): its decoder and disassembler, ported from MAME's (`6x09dasm.cpp`, konami_disassembler) and
+  checked against it (`konami/reference/compare_konami_with_mame.py`: every offset of every program bank as
+  the CPU sees it, in its window with the fixed program above, and of an image of every opcode with every
+  postbyte), with each instruction's operands (the indexed postbyte's forms, which cover the 6809's direct and
+  extended modes too) and control flow (EXG and TFR as the CPU takes them, by the postbyte's bit 7). Its
+  addresses are the CPU's 16-bit ones: the program's banks are the caller's. And its static analysis
+  (`konami_cpu/analysis.py`, `ANALYSIS = "konami_cpu.analysis"`): the program's code from its vectors and
+  `symbols.txt`, without traces, by places (the program region's offsets: a bank's window resolved), following
+  the bank the code chooses (SETLN with an immediate, or the byte the program keeps it in, the profile's
+  `BANK_SHADOW`) and what A, B, X, Y and U can hold into the tables it jumps through: an index scaled by ASLA,
+  added signed as the CPU does (tables run back from their address for a negative index), cursors in tables
+  of records, and a table of banks beside a table of code addresses by the same index (each handler in its own
+  bank); a value some way into a block leaves unknown stays unknown when the ways meet, and few values are
+  followed a register (a loop's pointer would walk its code again for each).
 - `decompiler/`: the decompiler, from the IR to C with no CPU left in it: data flow, signatures, the
   structuring of loops and branches (no goto), variables, the types of pointers (structures, families of
   objects, records of the program ROM, fixed instances), the program's memory by name, and the C writer.
@@ -59,11 +74,19 @@ Nothing here is a game's: no ROM, no names, no data.
 - `coverage.py`: every byte of the program ROM classified as code, data or fill, with the profile's
   `ANALYSIS`; with `--reads`, the bytes the reference read as data in the scenarios (`--rom-reads` of
   `s32ref` and `kref`) too, and the code it read as data; with the profile's `DATA_WALK` (a module of the
-  game's tools), what the game's engines read, walked from the code, counts as described data.
+  game's tools), what the game's engines read, walked from the code, counts as described data. A CPU whose
+  addresses depend on a bank says, through its analysis module, which places each instruction names
+  (`named_by`), how long its pointers are (`POINTER_SIZE`) and which words point at a place (`pointers_to`);
+  a ROM set with `CODE_AREAS` says which chips hold code, and with `RESIDUE_BANK_SIZE` what a bank kept of
+  another (the assembler's buffer, never cleared: the same bytes at the same offsets as known code or data,
+  at a bank's end or in a gap between its pieces, and not next to bytes the game reads) is fill.
 - `sound_coverage.py`: every byte of the sound program classified as code, described data (the tables,
   records and pointers `sound_symbols.txt` describes, and what the profile's `SOUND_DATA_WALK` reads from
   them: the music) or fill; with `--trace` and `--reads` (`kref --sound-trace` and `--sound-rom-reads`), the
-  executed code the analysis finds without traces, and the bytes read as data that nothing describes.
+  executed code the analysis finds without traces, and the bytes read as data that nothing describes (a
+  banked board's reads of its banks, past the program, are left to the game's sound data walk). A `jumps`
+  line with `slot=OO` (`z80/analysis.py`) gives a table of routines the program stores in that word of its
+  records through a pointer the walk does not follow (The Simpsons' instruments).
 - `data_formats.py`, `asset_formats.py`: the program's data as text, and the graphics and samples as PNG and
   WAV files, and back, byte for byte. `formats/common.py` holds the data formats' helpers; `formats` is a
   namespace package (no `__init__.py`), so the game's `tools/formats/` adds its own formats to it.
