@@ -46,7 +46,9 @@ _LAYOUTS = {}   # structure name -> (size, [(column name, offset, value type)])
 _CODE = []      # sorted addresses of the program's functions, for names inside their code
 _TARGETS = {}   # what a 32-bit value points at, as symbols.txt says: (structure, offset) of a field, or
                 # ("global", address) of a table, -> the structure (or array of values) there
-_FLEXIBLE = {}  # structure -> the value type of the array that goes on past its record (field NAME TYPE[])
+_FLEXIBLE = {}  # structure -> the value type of the array that goes on past its record (field NAME TYPE[]),
+                # or the structure of the records that follow it (field NAME STRUCT[])
+_ARRAYS = set()  # the keys of _TARGETS that point at an array of their structure's records (u32 STRUCT[])
 
 
 def _load():
@@ -65,9 +67,13 @@ def _load():
     for (owner, offset), (pointed, bits) in names.targets.items():
         if bits == 32:
             _TARGETS[(owner, offset)] = pointed
+    _ARRAYS.update(key for key in (names.target_arrays or ()) if key in _TARGETS)
     for (structure, offset), count in names.field_arrays.items():
         if count is None and offset == names.structs.get(structure) and (structure, offset) in names.fields:
             _FLEXIBLE[structure] = names.fields[(structure, offset)][1]
+    for (structure, offset), records in (names.record_arrays or {}).items():
+        if records in _LAYOUTS:
+            _FLEXIBLE[structure] = records
     _CODE.extend(sorted(address for address, symbol in disassemble.load_symbols(common.ROOT / "symbols.txt").items()
                         if symbol.kind == "func"))
 
@@ -272,7 +278,9 @@ def records_to_text(data, structure):
     size, columns = _LAYOUTS[structure]
     if structure in _FLEXIBLE and len(data) > size:
         # (a record whose array goes on past it: the record, then the array's values to the piece's end)
-        return records_to_text(data[:size], structure) + values_to_text(data[size:], _FLEXIBLE[structure])
+        rest = _FLEXIBLE[structure]
+        return records_to_text(data[:size], structure) + (values_to_text(data[size:], rest) if rest in VALUE_TYPES
+                                                          else records_to_text(data[size:], rest))
     count = len(data) // size
     named = {}
     for name, offset, kind in columns:
@@ -523,14 +531,18 @@ def inner_places(places, crossings=()):
 
 def _pointed(kind, address):
     """[(offset in an element, what it points at)] of the 32-bit values of an element of 'kind' (at 'address',
-    for a table of values) that point at a structure or an array of values, and the element's size"""
+    for a table of values) that point at a structure or an array of values, and the element's size; an array
+    of a structure's records is STRUCT[]"""
+    def target(key):
+        return _TARGETS[key] + ("[]" if key in _ARRAYS else "")
     if kind in VALUE_TYPES:
-        pointed = _TARGETS.get(("global", address)) if kind in ("u32", "s32") else None
+        key = ("global", address)
+        pointed = target(key) if kind in ("u32", "s32") and address is not None and key in _TARGETS else None
         return ([(0, pointed)] if pointed else []), struct.calcsize(VALUE_TYPES[kind])
     if kind not in _LAYOUTS:
         return [], None
     size, columns = _LAYOUTS[kind]
-    found = [(offset, _TARGETS[(kind, offset)]) for _, offset, column_kind in columns
+    found = [(offset, target((kind, offset))) for _, offset, column_kind in columns
              if column_kind in ("u32", "s32") and (kind, offset) in _TARGETS]
     return found, size
 
@@ -541,7 +553,7 @@ def _open_ended(kind):
                                                          and _LAYOUTS[kind][1][0][0] == "element")
 
 
-def pointed_segments(places, region, base, kept=()):
+def pointed_segments(places, region, base, kept=(), records=()):
     """Where the typed pointers of the pieces at 'places' ([(address, name)]) point, in 'region' (the program's
     bytes from address 'base'; 'kept', (start, end) ranges of code, holds none): a table of addresses
     symbols.txt says point at a structure (ADDRESS table NAME u32 STRUCT), an array of them (elements NAME u32
@@ -550,7 +562,9 @@ def pointed_segments(places, region, base, kept=()):
     [(offset, type, bytes)]}, the rest of the piece as its own type. A record takes its size; an array of
     values, and a record whose array goes on past it, up to what comes next. A table of addresses ends where
     the first of the records it points at in its own piece starts (the records after a table of their
-    addresses: sprite_list_switches'), and what a record points at is followed the same way."""
+    addresses: sprite_list_switches'), and what a record points at is followed the same way; 'records' ([(address,
+    structure)]) are records a piece of another format holds (a format's own walk read them), whose pointers
+    are followed too."""
     _load()
     known = dict(places)
     boundaries = sorted(set(known) | {start for start, _ in kept} | {base + len(region)})
@@ -574,45 +588,106 @@ def pointed_segments(places, region, base, kept=()):
         return False
 
     def target_of(value):
-        if value in SENTINELS or (value & 0xFFFFFF) < LOWEST_ADDRESS:
+        # (an address of the program: its top byte 0; 0, FFFFFFFF and the like are none: an end, a mark)
+        if value in SENTINELS or value >> 24 or value < LOWEST_ADDRESS:
             return None
-        target = common.game_profile.rom.canonical_address(value & 0xFFFFFF)
+        target = common.game_profile.rom.canonical_address(value)
         return target if target is not None and in_data(target) else None
 
-    queue = [(address, _TYPES.get(name), None) for address, name in sorted(known.items())]
+    def array_of(kind):
+        """(what they point at, their width) of the values of the array that goes on past a record of 'kind',
+        when they point at something; else None"""
+        if kind not in _FLEXIBLE or _FLEXIBLE[kind] not in VALUE_TYPES:
+            return None
+        pointed = _TARGETS.get((kind, _LAYOUTS[kind][0]))
+        return (pointed, SIZES[_FLEXIBLE[kind]]) if pointed and _FLEXIBLE[kind] in ("u32", "s32") else None
+
+    def has_pointers(kind):
+        records = _FLEXIBLE.get(kind)
+        return bool(_pointed(kind, None)[0]) or array_of(kind) is not None or \
+            (records in _LAYOUTS and bool(_pointed(records, None)[0]))
+
+    def lay(target, pointed, array=False):
+        """Lays 'pointed' out at 'target' (an array of its records, up to what comes next, for 'array'),
+        unless a piece of its own type starts there, it is a record of a table of its kind, or something is
+        laid out there already: True when it did"""
+        if pointed not in _LAYOUTS and pointed not in VALUE_TYPES:
+            return False
+        piece = piece_of(target)
+        if piece is None or target == piece[0] and _TYPES.get(piece[2]) == pointed:
+            return False
+        if _TYPES.get(piece[2]) == pointed and pointed in _LAYOUTS and pointed not in _FLEXIBLE \
+                and (target - piece[0]) % _LAYOUTS[pointed][0] == 0:
+            return False
+        if covered(target):
+            return False
+        length = None if array or _open_ended(pointed) else min(_LAYOUTS[pointed][0], piece[1] - target)
+        laid[target] = (pointed, length)
+        return True
+
+    def follow(target, pointed):
+        """Lays out what a pointer points at (STRUCT[]: an array of its records), and queues it to follow its
+        own pointers when it has some"""
+        array = pointed.endswith("[]")
+        kind = pointed[:-2] if array else pointed
+        if lay(target, kind, array) and has_pointers(kind):
+            open_ended = array or _open_ended(kind)
+            queue.append((target, kind, None if open_ended else 1, open_ended))
+
+    # (address, type, how many of its elements: None up to its piece's end, or for an array a walk reached,
+    # up to its first value that points nowhere)
+    queue = [(address, _TYPES.get(name), None, False) for address, name in sorted(known.items())]
+    queue += [(address, structure, 1, False) for address, structure in sorted(set(records)) if structure in _LAYOUTS]
     while queue:
-        address, kind, count = queue.pop(0)
-        pointers, size = _pointed(kind, address)
-        if not pointers or not size:
-            continue
+        address, kind, count, reached = queue.pop(0)
         holder = piece_of(address)
-        if holder is None:
+        if holder is None or kind is None:
             continue
-        end = holder[1] if count is None else address + count * size
-        # (the table stops where the first record it points at in its own piece starts)
-        number = 0
-        while address + (number + 1) * size <= end:
-            for offset, pointed in pointers:
-                at = address + number * size + offset
+        pointers, size = _pointed(kind, address)
+        if pointers and size:
+            end = holder[1] if count is None else min(holder[1], address + count * size)
+            number = 0
+            # (a table stops where the first record it points at in its own piece starts)
+            while address + (number + 1) * size <= end:
+                for offset, pointed in pointers:
+                    at = address + number * size + offset
+                    target = target_of(struct.unpack_from("<I", region, at - base)[0])
+                    if target is None:
+                        if reached and len(pointers) == 1:
+                            end = address    # (an array a walk reached ends at its first value that points nowhere)
+                        continue
+                    if address < target < end and count is None:
+                        end = min(end, target)
+                    follow(target, pointed)
+                number += 1
+        records = _FLEXIBLE.get(kind) if kind in _FLEXIBLE and _FLEXIBLE[kind] in _LAYOUTS else None
+        if records is not None and _pointed(records, None)[0]:
+            # the records that follow it, each one's pointers, up to the first that points nowhere
+            record_size = _LAYOUTS[records][0]
+            at = address + _LAYOUTS[kind][0]
+            while at + record_size <= holder[1]:
+                found = False
+                for offset, pointed in _pointed(records, None)[0]:
+                    target = target_of(struct.unpack_from("<I", region, at + offset - base)[0])
+                    if target is None:
+                        continue
+                    found = True
+                    follow(target, pointed)
+                if not found:
+                    break
+                at += record_size
+        array = array_of(kind)
+        if array is not None:
+            # the values of the array past the record, up to the first that points nowhere (a mark: 0 hold, -1
+            # back to the start, -2 on to the animation the next one names)
+            pointed, width = array
+            at = address + _LAYOUTS[kind][0]
+            while at + width <= holder[1]:
                 target = target_of(struct.unpack_from("<I", region, at - base)[0])
-                if target is None or (pointed not in _LAYOUTS and pointed not in VALUE_TYPES):
-                    continue
-                if address < target < end and count is None:
-                    end = min(end, target)
-                piece = piece_of(target)
-                if piece is None or target == piece[0] and _TYPES.get(piece[2]) == pointed:
-                    continue    # (a piece of its own type)
-                own = _TYPES.get(piece[2])
-                if own == pointed and pointed in _LAYOUTS and pointed not in _FLEXIBLE \
-                        and (target - piece[0]) % _LAYOUTS[pointed][0] == 0:
-                    continue    # (a record of a table of its kind)
-                if covered(target):
-                    continue
-                length = None if _open_ended(pointed) else min(_LAYOUTS[pointed][0], piece[1] - target)
-                laid[target] = (pointed, length)
-                if pointed in _LAYOUTS and not _open_ended(pointed):
-                    queue.append((target, pointed, 1))
-            number += 1
+                if target is None:
+                    break
+                follow(target, pointed)
+                at += width
     # each open-ended one up to what comes next in its piece; one that runs into the next is cut there
     segments = {}
     starts = sorted(laid)

@@ -130,7 +130,14 @@ class SoundWriter(emit.FunctionWriter):
         if isinstance(statement, ir.Store):
             target = self.memory(statement.address, statement.bits, id(statement))
             if target is not None and target[2]:
-                return [self.assignment(target[0], statement, target[1])]
+                assigned = self.assignment(target[0], statement, target[1])
+                if assigned.startswith(("AS", "AT")):
+                    # (no name covers what it writes: the fields it writes bytes of, each by its name, as the
+                    # V60's writer does)
+                    composed = self.composed_store(statement)
+                    if composed is not None:
+                        return composed
+                return [assigned]
             if target is not None:
                 raise emit.EmitError(f"{self.function.name}: writes the program ROM")
             return [f"z80_write{statement.bits}({self.address(statement.address)}, {self.stored(statement.value, statement.bits)});"]

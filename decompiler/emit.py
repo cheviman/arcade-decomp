@@ -1867,9 +1867,22 @@ class FunctionWriter:
                     piece = scoped[3]
                 else:
                     piece = layouts.fields.get(struct, {}).get(position)
+                start, number = position, None
+                if piece is None and scoped is None:
+                    # (an element of a field that is an array, past its first: name[k])
+                    for array_start, bits in layouts.fields.get(struct, {}).items():
+                        elements = layouts.array_count(struct, array_start)
+                        if elements and array_start < position < array_start + elements * (bits // 8) \
+                                and (position - array_start) % (bits // 8) == 0:
+                            start, number, piece = array_start, (position - array_start) // (bits // 8), bits
+                            break
                 if piece is None or position + piece // 8 > offset + size:
                     return None
-                text, signed = self.field_access((struct, position, base, base_offset, kind_family) + field[5:], piece)
+                text, signed = self.field_access((struct, start, base, base_offset, kind_family) + field[5:], piece)
+                if number is not None:
+                    if not text.endswith("[0]"):
+                        return None
+                    text = f"{text[:-3]}[{number}]"
                 self.signed_pieces[text] = signed
                 pieces.append((position - offset, piece, text))
                 position += piece // 8
@@ -1927,10 +1940,20 @@ class FunctionWriter:
             while position < offset + size:
                 scoped = layouts.scoped_field(struct, family, position) if family else None
                 found = (scoped[2], scoped[3]) if scoped is not None else layouts.lookup(struct, position)
+                number = None
+                if found is None and scoped is None:
+                    # (an element of a field that is an array, past its first: name[k])
+                    for start, bits in layouts.fields.get(struct, {}).items():
+                        elements = layouts.array_count(struct, start)
+                        if elements and start <= position < start + elements * (bits // 8):
+                            number = (position - start) // (bits // 8)
+                            found = (start, bits)
+                            break
                 if found is None:
                     return None
                 start, width = found
-                count = min(start + width // 8, offset + size) - position
+                element_start = start + (number or 0) * (width // 8)
+                count = min(element_start + width // 8, offset + size) - position
                 if position == start and count * 8 < width and (
                         layouts.overlay(struct, start, count * 8) if scoped is None
                         else layouts.scoped_overlay(struct, family, start, count * 8)) is not None:
@@ -1938,7 +1961,11 @@ class FunctionWriter:
                 text, signed = self.field_access((struct, start, base, base_offset, kind_family) + field[5:], width)
                 if text.startswith(("AS", "AT")):
                     return None
-                pieces.append((position - offset, count, text, width, signed, position - start))
+                if number:
+                    if not text.endswith("[0]"):
+                        return None
+                    text = f"{text[:-3]}[{number}]"
+                pieces.append((position - offset, count, text, width, signed, position - element_start))
                 position += count
             return pieces
         first = memory.constant_address(address)
@@ -2008,7 +2035,9 @@ class FunctionWriter:
                 if not re.fullmatch(r"\w+", first):
                     # (an element of a view of an address, or of an array by a worked-out number, by the view's
                     # or the array's name: SPRITE_WORDS(p)[0], sprite_words; NBG0_SCROLL_X[layer * 2u], nbg0_scroll_x)
-                    view = re.match(r"([A-Za-z_]\w*)[(\[]", re.split(r"->|\.", pieces[0][2])[-1])
+                    # (the view first: PAGE_SELECT(current_object->road_surface.page_register)[0], page_select)
+                    view = re.match(r"([A-Za-z_]\w*)[(\[]", pieces[0][2]) or \
+                        re.match(r"([A-Za-z_]\w*)[(\[]", re.split(r"->|\.", pieces[0][2])[-1])
                     first = view[1].lower() if view else "value"
                 temp = self.fresh(f"{first}_{ {8: 'byte', 16: 'halfword', 32: 'long'}[statement.bits] }")
                 lines.append(f"{temp} = {text};")

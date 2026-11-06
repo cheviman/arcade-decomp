@@ -216,6 +216,13 @@ class Names(NamedTuple):
                          # array ('scoped STRUCT FAMILY OFFSET NAME TYPE[N]'), read ->view.name[i]
     members: dict = None  # (struct, offset) -> (name, structure, count): structures inside another one, which
                           # its declaration holds as its member ('member' lines)
+    record_arrays: dict = None  # (struct, offset) -> the structure of the records that follow a record of the
+                                # program ROM's at its end ('field STRUCT OFFSET NAME STRUCT2[]': a palette list's
+                                # entries after its length), which its assets lay out; the C reads them by their
+                                # own pointers
+    target_arrays: set = None   # the (struct, offset) or ("global", address) of targets that point at an array of
+                                # their structure's records ('... u32 STRUCT[]': a car's torque curve, its points up
+                                # to the one that closes it), which its assets lay out; the C reads them as STRUCT
 
 
 def load_names(path, registers=None):
@@ -285,7 +292,7 @@ def load_names(path, registers=None):
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {}, set(), set(), {}, {})
+                  set(), {}, set(), set(), {}, {}, {}, set())
     registers = registers or {}
 
     def register_number(text):
@@ -433,6 +440,10 @@ def load_names(path, registers=None):
             continue
         if parts[0] == "field":
             array = re.fullmatch(r"(\w+)\[([0-9A-Fa-f]*)\]", parts[4]) if len(parts) in (5, 6) else None
+            if array is not None and array.group(1) not in VALUE_TYPES and not array.group(2) and len(parts) == 5:
+                # (records of another structure that follow the record, as many as it says)
+                names.record_arrays[(parts[1], int(parts[2], 16))] = array.group(1)
+                continue
             if array is not None and array.group(1) in VALUE_TYPES:
                 parts[4] = array.group(1)
                 names.field_arrays[(parts[1], int(parts[2], 16))] = int(array.group(2), 16) if array.group(2) else None
@@ -441,6 +452,10 @@ def load_names(path, registers=None):
             declare(names.fields, (parts[1], int(parts[2], 16)), (parts[1], int(parts[2], 16)), parts[3], parts[4],
                     where)
             if len(parts) == 6:
+                if parts[5].endswith("[]"):
+                    # (an array of its records: up to what comes next, as its assets lay it out)
+                    parts[5] = parts[5][:-2]
+                    names.target_arrays.add((parts[1], int(parts[2], 16)))
                 names.targets[(parts[1], int(parts[2], 16))] = (parts[5], int(parts[4][1:]))
             continue
         if len(parts) >= 2 and parts[1] == "anchor":
@@ -476,6 +491,9 @@ def load_names(path, registers=None):
         else:
             target[address] = (parts[2], parts[3])
         if len(parts) == 5:
+            if parts[4].endswith("[]"):
+                parts[4] = parts[4][:-2]
+                names.target_arrays.add(("global", address))
             names.targets[("global", address)] = (parts[4], int(parts[3][1:]))
     def structure(pointed):
         """True for STRUCT or STRUCT.FAMILY, STRUCT+OFFSET or STRUCT@BASE (a byte offset from BASE to one)."""
@@ -491,6 +509,10 @@ def load_names(path, registers=None):
         if count is None and (struct not in names.rom_structs or offset != names.structs.get(struct)):
             raise SystemExit(f"{path.name}: {struct}'s array at {offset:X} goes on past the record: it has to be a "
                              "record of the program ROM's, and start at its end")
+    for (struct, offset), records in names.record_arrays.items():
+        if struct not in names.rom_structs or records not in names.rom_structs or offset != names.structs.get(struct):
+            raise SystemExit(f"{path.name}: the records {records}[] of {struct} at {offset:X} have to follow a record of "
+                             "the program ROM's at its end, and be records of the program ROM's")
     for address, (name, record) in names.record_tables.items():
         if record not in names.rom_structs:
             raise SystemExit(f"{path.name}: the table {name} holds '{record}', which is no record of the program ROM "
