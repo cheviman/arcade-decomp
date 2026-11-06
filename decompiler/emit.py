@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    30-10-2026
+Modified:    06-11-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -1790,7 +1790,7 @@ class FunctionWriter:
         for start, item in items.items():
             if start <= address and address + bits // 8 <= start + item.bits // 8 and bits < item.bits:
                 name = f"{item.c}[0]" if item.indexed else item.c
-                return cprint.part(bits, name, address - start, item.bits), False, True
+                return cprint.part(bits, name, address - start, item.bits, item.signed), False, True
         return None
 
     def family_splits(self, statement):
@@ -1829,7 +1829,20 @@ class FunctionWriter:
 
     def tiling(self, address, bits, key):
         """The named fields or variables an access of 'bits' at 'address' covers exactly, one after the
-        other: [(byte in the access, bits, C)], or None."""
+        other, or the elements of an array it runs over (element_run): [(byte in the access, bits, C)], or
+        None."""
+        pieces = self.named_tiling(address, bits, key)
+        if pieces is not None:
+            return pieces
+        run = self.element_run(address, bits, key)
+        if run is None:
+            return None
+        for _, _, text, _, signed, _ in run:
+            self.signed_pieces[text] = signed
+        return [(position, width, text) for position, _, text, width, _, _ in run]
+
+    def named_tiling(self, address, bits, key):
+        """tiling() over the named fields or variables"""
         size = bits // 8
         pieces = []
         field = self.fields.get(key)
@@ -1874,11 +1887,27 @@ class FunctionWriter:
             position += piece[1] // 8
         return pieces
 
+    def element_run(self, address, bits, key):
+        """The elements of an array an access of 'bits' reads or writes when it starts at one and runs on into
+        the next ones (a sprite list's two halfwords at once, four characters of the LCD's text), as
+        covering() gives pieces; None when it is not that. An element whose signedness is not known reads as
+        a signed one, cast to its unsigned type."""
+        found = self.memory(address, bits, key)
+        pieces = cprint.element_run(found[0], bits) if found is not None else None
+        if pieces is None:
+            return None
+        return [piece[:4] + (True if piece[4] is None else piece[4],) + piece[5:] for piece in pieces]
+
     def covering(self, address, bits, key):
         """The named fields or variables an access of 'bits' at 'address' reads or writes bytes of, one after
-        the other, wholly or in part (an access that starts inside one, or runs on into the next):
-        [(byte in the access, bytes, C, the field's bits, its signedness, byte in the field)], or None when
-        some byte has no name."""
+        the other, wholly or in part (an access that starts inside one, or runs on into the next), or the
+        elements of an array it runs over (element_run): [(byte in the access, bytes, C, the field's bits, its
+        signedness, byte in the field)], or None when some byte has no name."""
+        pieces = self.named_covering(address, bits, key)
+        return pieces if pieces is not None else self.element_run(address, bits, key)
+
+    def named_covering(self, address, bits, key):
+        """covering() over the named fields or variables"""
         size = bits // 8
         pieces = []
         field = self.fields.get(key)
@@ -1963,12 +1992,24 @@ class FunctionWriter:
             text = None
         else:
             text = self.expr(value)
+            narrow = cprint.narrow_cast(text)
+            if narrow is not None and all(not within and (position * 8 >= narrow or (position == 0 and count * 8 == width
+                                                                                       == narrow))
+                                          for position, count, target, width, signed, within in pieces):
+                # a value narrower than the store (its first field's width): that field takes it, the others 0
+                return [f"{target} = {text if position == 0 else '0u'};"
+                        for position, count, target, width, signed, within in pieces]
             if len(pieces) > 1 and not re.fullmatch(r"\w+", text):
                 # (the value once, before its bytes go to their fields: named after the first of them and
                 # the access, bounce_direction_halfword)
                 first = re.split(r"->|\.", pieces[0][2])[-1]
                 # (an array's element by its array's name and number: time_difficulty[2], time_difficulty_2)
                 first = re.sub(r"\[(\w+)\]", r"_\1", first)
+                if not re.fullmatch(r"\w+", first):
+                    # (an element of a view of an address, or of an array by a worked-out number, by the view's
+                    # or the array's name: SPRITE_WORDS(p)[0], sprite_words; NBG0_SCROLL_X[layer * 2u], nbg0_scroll_x)
+                    view = re.match(r"([A-Za-z_]\w*)[(\[]", re.split(r"->|\.", pieces[0][2])[-1])
+                    first = view[1].lower() if view else "value"
                 temp = self.fresh(f"{first}_{ {8: 'byte', 16: 'halfword', 32: 'long'}[statement.bits] }")
                 lines.append(f"{temp} = {text};")
                 text = temp
@@ -2258,7 +2299,7 @@ class FunctionWriter:
             text = f"{pointer}{member}{view}.{scoped_name}" + self.scoped_element(struct, family, scoped_offset, element_number)
             if scoped_offset == offset and scoped_bits == bits:
                 return text, scoped_signed
-            return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
+            return cprint.part(bits, text, offset - scoped_offset, scoped_bits, scoped_signed), False
         field_offset, field_bits = found
         name = pointer if element else f"{pointer}{member}{layouts.names[struct][field_offset]}"
         if element_number is not None:
@@ -2271,7 +2312,8 @@ class FunctionWriter:
         elif overlay is not None and field_bits != bits:
             generic = f"{pointer}{member}{overlay[0]}", overlay[1], True
         else:
-            generic = cprint.part(bits, name, offset - field_offset, field_bits), False, False
+            generic = (cprint.part(bits, name, offset - field_offset, field_bits, layouts.signed[struct][field_offset]),
+                       False, False)
         if family is not None:
             scoped = layouts.scoped_field(struct, family, offset)
             if scoped is not None:
@@ -2292,7 +2334,7 @@ class FunctionWriter:
                 if generic[2] and (offset - scoped_offset) * 8 + bits > scoped_bits \
                         and not re.split(r"->|\.", generic[0])[-1].startswith("unk_"):
                     return generic[:2]
-                return cprint.part(bits, text, offset - scoped_offset, scoped_bits), False
+                return cprint.part(bits, text, offset - scoped_offset, scoped_bits, scoped_signed), False
         self.note_missing(struct, offset, bits, base, base_offset, generic)
         return generic[:2]
 

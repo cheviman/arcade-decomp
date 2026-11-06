@@ -5,7 +5,7 @@ Description: the game's variables, tables and hardware registers by name: work R
              named addresses
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    30-10-2026
+Modified:    06-11-2026
 Author:      Sebastian Toyos
 
 Work RAM (0x200000-0x20FFFF) keeps the layout the board gives it, so the state compares byte for byte with
@@ -48,6 +48,7 @@ ADDRESS_DIGITS = 6
 RAM_MACRO, ROM_MACRO = "RAM", "ROM"          # the lvalue and rvalue macros (game/support.h) ...
 RAM_FUNCTION, ROM_FUNCTION = "ram", "rom"    # ... and what gives a pointer into either
 BOARD_MACRO, BOARD_FUNCTION = "BOARD", "board"    # ... and into the board's plain memories (PLAIN_HARDWARE)
+BOARD_BYTE_FUNCTION = "board"                     # ... a byte of those (a game whose board keeps 16-bit words in the host's order: its lane)
 # the areas of HARDWARE the code uses as plain memory (the video RAM, the sprite RAM, the RAM the sound
 # program shares): what symbols.txt names there is a variable of the board, an lvalue through board();
 # a name anywhere else is a register of a device, which the bus hands every read and write (io_read8...)
@@ -415,15 +416,15 @@ class Memory:
             overlay = self.overlays.get((address, bits)) if items is self.variables else None
             if item.bits != bits and overlay is not None:
                 return overlay.c
-            return name if item.bits == bits else cprint.part(bits, name, 0, item.bits)
+            return name if item.bits == bits else cprint.part(bits, name, 0, item.bits, item.signed)
         outer = self.inside(items, address)
         if outer is not None:
-            return cprint.part(bits, outer.c, address - outer.address, outer.bits)
+            return cprint.part(bits, outer.c, address - outer.address, outer.bits, outer.signed)
         found = self.element(items, address)
         if found is not None:
             array, number, byte = found
             name = f"{array.c}[{number}]"
-            return name if byte == 0 and bits == array.bits else cprint.part(bits, name, byte, array.bits)
+            return name if byte == 0 and bits == array.bits else cprint.part(bits, name, byte, array.bits, array.signed)
         return None
 
     def access(self, address, bits, index_text, indexed=False, signed_text=None):
@@ -502,7 +503,8 @@ class Memory:
             if narrow is not None:
                 # several elements at once, as the original's one wider access (AS32(video_registers[32 +
                 # index * 2u]): two halfword registers cleared together)
-                return cprint.part(bits, f"{array.c}[{number} + {index_text(narrow)}]", 0, array.bits), False, lvalue
+                return (cprint.part(bits, f"{array.c}[{number} + {index_text(narrow)}]", 0, array.bits, array.signed),
+                        False, lvalue)
             if LOADED_TABLES and not lvalue:
                 return f"TABLE{bits}({array.name}, 0x{base - array.address:X}u + {index_text(rest)})", False, False
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
@@ -513,6 +515,11 @@ class Memory:
             return f"{macro}(GAME_VARIABLES + {index_text(rest)})", False, lvalue
         if index is not None and item.bits == bits:
             return f"{item.c}[{index_text(index)}]", item.signed, lvalue
+        narrow = element_index(rest, item.bits) if item.bits < bits and lvalue else None
+        if narrow is not None:
+            # several elements at once from its first on, as the original's one wider access (a layer's 16.16
+            # scroll into the video's two halfword registers, NBG0_SCROLL_X[layer * 2u] and the next)
+            return cprint.part(bits, f"{item.c}[{index_text(narrow)}]", 0, item.bits, item.signed), False, lvalue
         if LOADED_TABLES and not lvalue:
             # a loaded table read at another width than its elements': by its name and the offset in bytes
             return f"TABLE{bits}({item.name}, {index_text(rest)})", False, False
@@ -584,6 +591,8 @@ class Memory:
                 lines.append(f"#define {item.name} (*(const {kind} *){item.name}_data)")
             return lines
         if item.indexed:
+            if function == BOARD_FUNCTION and item.bits == 8:
+                function = BOARD_BYTE_FUNCTION    # (a byte of the board's memories: at its lane in a 16-bit word)
             lines.append(f"#define {item.name} (({constness}{kind} *){function}({item.name}_ADDRESS))")
         else:
             suffix = "S" if item.signed else ""
