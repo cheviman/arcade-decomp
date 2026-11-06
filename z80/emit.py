@@ -194,6 +194,8 @@ class SoundWriter(emit.FunctionWriter):
             return [f"{self.register_set(args[1].value)} = refresh_read({args[0].value});"]
         if name == "z80_cycles":
             return [f"z80_cycles({args[0].value});"]
+        if name == "z80_halt":
+            return ["z80_halt();"]
         if name == "interrupts_off":
             return ["interrupts_off();"]
         if name == "interrupts_on":
@@ -211,8 +213,9 @@ class SoundEmitter(emit.Emitter):
     """emit.Emitter with nothing of the V60 program's: no context registers; the sound program's
     structures (pointers.Layouts) and ports."""
 
-    def __init__(self, functions, signatures, names, memory_, always, layouts, ports):
-        super().__init__(functions, signatures, names, (), set(), memory_, always, lambda address: 0)
+    def __init__(self, functions, signatures, names, memory_, always, layouts, ports, context=()):
+        # (context: the registers the whole program keeps, global variables; none by default)
+        super().__init__(functions, signatures, names, tuple(context), set(), memory_, always, lambda address: 0)
         self.layouts = layouts
         self.ports = dict(ports)
         self.saved_locals = True

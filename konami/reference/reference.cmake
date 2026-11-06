@@ -102,6 +102,12 @@ if(K_CPU STREQUAL "053248")
 	target_include_directories(kref PRIVATE ${K_RUNTIME_INCLUDE})
 	target_link_libraries(kref PRIVATE konami_cpu_reference ksound_053260_reference kvideo_053246_reference
 		${K_GAME_RUNTIME})
+	# the game's own sound board, when it has one (K_GAME_SOUND: the decompiled sound program on the board's own
+	# chips), which kref --sound-board-check runs beside MAME's
+	if(K_GAME_SOUND)
+		target_link_libraries(kref PRIVATE ${K_GAME_SOUND})
+		target_compile_definitions(kref PRIVATE K_GAME_SOUND_BOARD=1)
+	endif()
 	if(MSVC)
 		target_compile_options(kref PRIVATE /wd4244 /wd4267)
 	endif()

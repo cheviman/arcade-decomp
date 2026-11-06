@@ -117,7 +117,11 @@ def configure():
         areas = [(start, end) for start, end, _ in game_profile.SOUND_HARDWARE]
         cleanup.EFFECT_READS = lambda address: any(start <= (address & 0xFFFF) < end for start, end in areas)
     conditions.DIRECT_FLAGS = True
-    signatures.CONTEXT = ()
+    # (the profile's SOUND_STACK_RESTARTS, off by default: a loop back to an LD SP takes any SP in, decompiler/stack.py)
+    stack.RESTARTS = getattr(game_profile, "SOUND_STACK_RESTARTS", False)
+    # (the profile's SOUND_CONTEXT, none by default: registers the whole program keeps, global variables in C by the
+    # names of sound_symbols.txt's register lines; The Simpsons' self test leaves its results in the other bank's)
+    signatures.CONTEXT = tuple(sorted(REGISTERS[name] for name in getattr(game_profile, "SOUND_CONTEXT", ())))
     signatures.SCRATCH_CONTEXT = {}
     signatures.CONSTANT = {}
 
@@ -162,6 +166,19 @@ def declared_results(program, open_entries):
     return found
 
 
+def declared_unread(program):
+    """The registers functions read before setting them only on paths the program never takes, from the "unread"
+    lines of sound_symbols.txt: {entry: {register number}}."""
+    entries = {name: entry for entry, name in program.names.items()}
+    found = {}
+    for function_name, register in disassemble.load_names(SYMBOLS, REGISTERS).unread:
+        entry = entries.get(function_name)
+        if entry is None:
+            raise SystemExit(f"{SYMBOLS.name}: an unread register of {function_name}, which is no function")
+        found.setdefault(entry, set()).add(register)
+    return found
+
+
 def analyse(program, built):
     """Stack slots, preserved registers and the data flow summaries, in place."""
     for function in built.values():
@@ -169,6 +186,11 @@ def analyse(program, built):
     flow = dataflow.Program(built, program.analysis, [INTERRUPT_HANDLER], signatures.CONTEXT)
     signatures.OPEN = open_entries(program, built)
     flow.declared = declared_results(program, signatures.OPEN)
+    # (sound_symbols.txt's unread lines, none by default: a register a function reads before setting it only on a
+    # path the program never takes is no parameter, it starts at 0 there, as decompile.py's)
+    signatures.UNREAD = declared_unread(program)
+    for entry, registers in signatures.UNREAD.items():
+        flow.zeroed[entry] = {("r", register) for register in registers}
     flow.solve()
     while sum(len(preserved.analyse(function, flow.call_writes, context=signatures.CONTEXT))
               for function in built.values()):
@@ -379,7 +401,9 @@ def write_c(program, out_dir, variables_path=None):
     cprint.PORT_NAMES = dict(known.ports)
 
     always = {entry: set(summary.always) for entry, summary in flow.summaries.items()}
-    emitter = emit.SoundEmitter(built, found, names, named, always, pointers.Layouts(accesses, known), known.ports)
+    emitter = emit.SoundEmitter(built, found, names, named, always, pointers.Layouts(accesses, known), known.ports,
+                                signatures.CONTEXT)
+    emitter.register_names = dict(known.registers)    # (the context registers' names: register lines)
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
     emitter.param_pointers = {entry: set(kinds) for entry, kinds in hints.items()}
     emitter.flow = flow
@@ -488,6 +512,9 @@ def write_c(program, out_dir, variables_path=None):
         file_header("sound.h", "the sound program's ports, variables, tables, structures and functions")
         + f"#ifndef {game_profile.GUARD}_SOUND_H\n#define {game_profile.GUARD}_SOUND_H\n\n"
         + "#include \"sound/support.h\"\n\n"
+        + ("/* registers the whole program keeps (sound_symbols.txt's register lines; defined in tables.c) */\n"
+           + "\n".join(f"extern {context_type(index)} {emitter.context_name(index)};" for index in signatures.CONTEXT)
+           + "\n\n" if signatures.CONTEXT else "")
         + ("/* the board's I/O ports the program uses */\n" + "\n".join(ports) + "\n\n" if ports else "")
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM sound_symbols.txt labels */\n"
         + "\n".join(f"#define {name}_ADDRESS 0x{address:04X}u" for address, name in sorted(emitter.data_labels.items()))
@@ -504,10 +531,15 @@ def write_c(program, out_dir, variables_path=None):
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
     write_sources(out_dir, files, texts, "sound.h", header=file_header)
     loaded = named.loaded_tables()
-    if loaded:
+    if loaded or signatures.CONTEXT:
         (out_dir / "tables.c").write_text(
-            file_header("tables.c", "the tables the sound program reads by name, which the board sets")
-            + "#include \"sound.h\"\n\n" + "\n".join(memory.table_registry(loaded, 4, "sound")) + "\n",
+            file_header("tables.c", "the tables the sound program reads by name, which the board sets"
+                        + (", and the registers it keeps" if signatures.CONTEXT else ""))
+            + "#include \"sound.h\"\n\n"
+            + ("/* registers the whole program keeps */\n"
+               + "\n".join(f"{context_type(index)} {emitter.context_name(index)};" for index in signatures.CONTEXT)
+               + "\n\n" if signatures.CONTEXT else "")
+            + ("\n".join(memory.table_registry(loaded, 4, "sound")) + "\n" if loaded else ""),
             encoding="ascii")
     left = sum(len(block.statements) for function in built.values() for block in function.blocks.values())
     gotos = sum(text.count("goto ") for text in texts.values())
@@ -516,6 +548,11 @@ def write_c(program, out_dir, variables_path=None):
     print(f"branches:   {flow.conditions_recovered} now compare values instead of flags")
     print(f"gotos:      {gotos}")
     return 0
+
+
+def context_type(index):
+    """The C type of a register the whole program keeps (SOUND_CONTEXT): its width's."""
+    return "uint8_t" if cpu.Z80.register_bits.get(index, 16) == 8 else "uint16_t"
 
 
 def write_reports(program, built, flow, names, out_dir):

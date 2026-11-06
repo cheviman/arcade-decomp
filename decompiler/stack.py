@@ -21,6 +21,10 @@ from v60 import ir
 from . import cpu
 
 NEW_STACK = -0x100000    # slot offsets after code sets SP itself: far from anything the caller's stack holds
+# a block that starts by setting SP to an address of its own takes any SP in: ways with SP in different places
+# may meet there (The Simpsons' Z80, whose failed self test loops back to its LD SP); off by default, where such
+# ways are an error (decompile_sound.py sets it from the profile's SOUND_STACK_RESTARTS)
+RESTARTS = False
 MEMORY_SP = 32           # the register SP becomes in a function whose stack stays in memory (V60 only)
 LEFT_CALLER = 33         # a register the V60 does not have: set when the function just called returned for
                          # its caller too (link_caller_exits)
@@ -110,6 +114,7 @@ def slots(function):
     """The stack as slots: see analyse()."""
     function.exits_caller = False
     stacks = 0
+    restarts = {label for label, block in function.blocks.items() if sets_sp_first(block)} if RESTARTS else set()
     start = {function.entry: 0}
     pending = [function.entry]
     done = set()
@@ -175,6 +180,8 @@ def slots(function):
             # Z80's reset gives the board its main loop)
             raise StackError(f"{function.name}: returns with SP {sp:+d} from where it started")
         for successor in block.successors():
+            if successor in start and start[successor] != sp and successor in restarts:
+                continue
             if successor in start and start[successor] != sp:
                 target = function.blocks[successor]
                 if target.statements or not isinstance(target.end, ir.Return):
@@ -192,6 +199,16 @@ def slots(function):
             start[successor] = sp
             pending.append(successor)
     return start
+
+
+def sets_sp_first(block):
+    """True when the block sets SP to a constant before anything in it reads SP (RESTARTS)."""
+    for statement in block.statements:
+        if isinstance(statement, ir.SetReg) and statement.index == cpu.current.sp:
+            return isinstance(statement.value, ir.Const)
+        if any(mentions_sp(expression) for expression in ir.statement_expressions(statement)):
+            return False
+    return False
 
 
 def link_caller_exits(functions):

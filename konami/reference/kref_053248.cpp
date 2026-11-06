@@ -12,8 +12,9 @@
  *      kref [--timing cycles|frames] [--frames N] [--hashes hashes.txt] [--trace executed.txt] [--calls called.txt]
  *           [--jumps jumps.txt] [--rom-reads reads.txt] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR]
  *           [--script controls.txt] [--service] [--rom FOLDER] [--no-sound] [--sound-hashes hashes.txt]
- *           [--sound-wav sound.wav] [--sound-trace executed.txt] [--sound-rom-reads reads.txt]
- *           [--video-hashes hashes.txt] [--video-dump FRAME ... --video-dir DIR]
+ *           [--sound-wav sound.wav] [--sound-trace executed.txt] [--sound-rom-reads reads.txt] [--sound-check]
+ *           [--video-hashes hashes.txt] [--video-dump FRAME ... --video-dir DIR] [--video-check FILE]
+ *           [--assets-check FOLDER]
  *
  *    It runs the original program, so it reads the player's ROM set when it starts, as MAME does: the set in
  *    --rom's folder or .zip (rom/ by default), into the board's memory (game/data.h, runtime/src/rom_set.c).
@@ -35,12 +36,26 @@
  *    Z80's RAM; --sound-wav the sound mixed, in stereo; --sound-trace the Z80's places executed (the sound ROM's
  *    region offsets: 0000-7FFF fixed, 10000-27FFF its banks'; 30000 plus the address above BFFF);
  *    --sound-rom-reads the sound ROM's bytes the Z80 reads as data, as --rom-reads does the 053248's.
+ *    --sound-check runs the game's own sound chips too (runtime/src/ym2151.c, k053260.c) on what MAME's get, at
+ *    the same times, and prints how many frames' samples (or the chips' reads and timers) differ, and for the
+ *    first one what differed.
+ *    --sound-timing keeps the Z80's time with the timing model the game's own sound board has
+ *    (tools/decompile_sound.py writes the table, build/sound/timing.txt; ksound_053260.cpp keeps it around MAME's
+ *    Z80), so that the two compare sample for sample; without it the Z80 runs cycle by cycle.
+ *    --sound-board-check runs the game's own sound board beside MAME's (runtime/src/sound_cpu.c and
+ *    sound_board.c: the decompiled sound program of src/sound/ on the board's own chips), fed the same commands
+ *    at the same times, and writes "FRAME REFERENCE_SAMPLES REFERENCE_RAM OWN_SAMPLES OWN_RAM" hashes a frame (the
+ *    --sound-hashes ones: the RAM's without the Z80's stack, with its two answers to the 053248); it prints how
+ *    many frames differ, and for the first one what differs. It needs --sound-timing, and a kref built with the
+ *    game's sound board (K_GAME_SOUND in reference.cmake).
  *
  *    --video-hashes and --video-dump draw the frames with MAME's K052109, K053246/K053247 and K053251
  *    (video/kvideo_053246.cpp): the hash of every frame's pixels, and frames as BMP (DIR/frame_N.bmp), 320x224
  *    from line 16. As simpsons.cpp's screen updates after VBLANK, frame N's picture is drawn when its VBLANK
  *    ends (line 16), with the scroll the K052109 takes then and the sprites the DMA copied as the VBLANK before
  *    it started; its hash goes with the frame's state hash.
+ *    --video-check draws every frame with the game's own video too (runtime/src/video.c) and writes "FRAME
+ *    REFERENCE OWN" hashes; the first frame that differs goes to DIR/reference_N.bmp and DIR/own_N.bmp.
  *
  *    The CPU sees 64 KB, the program's banks one at a time at 6000-7FFF: the addresses this writes are the
  *    program ROM's places (its region's offsets, 000000-07FFFF: the bank's at 6000-7FFF when the instruction
@@ -59,6 +74,11 @@
  *    frames as text; --dump writes the board's memories at the end of those frames, a file each; --service
  *    turns the test switch on; --interrupts writes a line per interrupt the CPU takes: "FRAME IRQ|FIRQ PLACE",
  *    the place of the instruction it came after.
+ *
+ *    --assets-check loads the game's assets from FOLDER (runtime/src/assets.c: what the game reads instead of the
+ *    ROM set, tools/extract_assets.py writes them) into memories of their own, and prints, for each of the board's memories, how many
+ *    bytes the assets give and how many of those differ from the ROM set's (the first places that do); it runs
+ *    nothing else.
  */
 #include "emu.h"
 #include "konami.h"
@@ -67,10 +87,15 @@
 
 #include "game/data.h"
 #include "game/extract.h"
+#include "game/assets.h"
 #include "simpsons/machine.h"
 #include "simpsons/script.h"
+#include "simpsons/video.h"
 #include "ksound_053260.h"
 #include "kvideo_053246.h"
+#ifdef K_GAME_SOUND_BOARD
+#include "simpsons/sound_board.h"
+#endif
 
 #include <cinttypes>
 #include <cstdio>
@@ -389,10 +414,11 @@ void write_wav(const std::string &path, const std::vector<int16_t> &samples, uin
 	out.write(reinterpret_cast<const char *>(file.data()), std::streamsize(file.size()));
 }
 
-// The last frame the reference video drew, as a 24-bit BMP
-void write_bmp(const std::string &path)
+// A frame as a 24-bit BMP: the last the reference video drew, or the one given
+void write_bmp(const std::string &path, const uint32_t *pixels = nullptr)
 {
-	const uint32_t *pixels = kv_frame();
+	if (!pixels)
+		pixels = kv_frame();
 	const int row = (KV_WIDTH * 3 + 3) & ~3;
 	const uint32_t size = 54 + uint32_t(row) * KV_HEIGHT;
 	std::vector<uint8_t> file(size, 0);
@@ -419,10 +445,71 @@ void write_bmp(const std::string &path)
 	out.write(reinterpret_cast<const char *>(file.data()), std::streamsize(file.size()));
 }
 
+// --sound-board-check: the game's own sound board runs beside the reference's, on the same commands
+bool g_sound_board = false;
+void (*g_reference_sound_irq)(void) = nullptr;
+
+void raise_both_sound_irqs()
+{
+	g_reference_sound_irq();
+#ifdef K_GAME_SOUND_BOARD
+	simpsons_sound_irq();
+#endif
+}
+
 // The sound board catches up with the 053248's present
 void sound_sync()
 {
 	ks_run_until(present());
+#ifdef K_GAME_SOUND_BOARD
+	if (g_sound_board)
+		simpsons_sound_run(present());
+#endif
+}
+
+// --assets-check: the game's assets (game/assets.h) into memories of their own, against the ROM set's regions: for
+// each one, the bytes the assets give and how many of them differ (the first places that do, the assets' byte and
+// the ROM's)
+int check_assets(const std::string &folder)
+{
+	const uint8_t *const from_rom[GAME_ASSETS_REGIONS] = { game_program, game_sound, game_tiles, game_sprites,
+		game_samples, game_eeprom };
+	std::vector<std::vector<uint8_t>> memories(GAME_ASSETS_REGIONS), given(GAME_ASSETS_REGIONS);
+	game_assets_memory into[GAME_ASSETS_REGIONS];
+	for (int region = 0; region < GAME_ASSETS_REGIONS; region++)
+	{
+		const size_t size = game_assets_size(game_assets_region(region));
+		memories[region].assign(size, 0);
+		given[region].assign(size, 0);
+		into[region] = { memories[region].data(), given[region].data() };
+	}
+	if (const char *problem = game_assets_load_into(folder.c_str(), into))
+	{
+		std::cerr << "The assets in " << folder << " do not load: " << problem << '\n';
+		return 1;
+	}
+	int differ = 0;
+	for (int region = 0; region < GAME_ASSETS_REGIONS; region++)
+	{
+		const size_t size = memories[region].size();
+		size_t count = 0, wrong = 0;
+		std::string first;
+		for (size_t at = 0; at < size; at++)
+			if (given[region][at])
+			{
+				count++;
+				if (memories[region][at] != from_rom[region][at] && wrong++ < 8)
+				{
+					char place[40];
+					std::snprintf(place, sizeof(place), " %06zX %02X/%02X", at, memories[region][at], from_rom[region][at]);
+					first += place;
+				}
+			}
+		std::printf("%-8s %7zu of %7zu bytes given, %zu differ%s%s\n", game_assets_name(game_assets_region(region)),
+			count, size, wrong, wrong ? " (the first, assets/ROM:" : "", wrong ? (first + ")").c_str() : "");
+		differ += wrong != 0;
+	}
+	return differ ? 1 : 0;
 }
 
 } // namespace
@@ -432,15 +519,18 @@ int main(int argc, char **argv)
 	const char *usage = "Usage: kref [--timing cycles|frames] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--interrupts FILE]"
 		" [--jumps FILE] [--rom-reads FILE] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR] [--script FILE]"
 		" [--service] [--rom FOLDER] [--no-sound] [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE]"
-		" [--sound-rom-reads FILE] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]\n";
+		" [--sound-rom-reads FILE] [--sound-check] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
+		" [--video-check FILE] [--assets-check FOLDER] [--sound-timing FILE] [--sound-board-check FILE]\n";
 	std::string rom_folder = "rom";
 	std::string hashes_path, trace_path, calls_path, jumps_path, rom_reads_path, dump_folder = ".", script_path;
 	std::set<uint64_t> text_frames, dump_frames;
 	uint64_t frames = 600;
-	bool frames_given = false, service = false, sound = true;
+	bool frames_given = false, service = false, sound = true, sound_check = false;
 	std::string sound_hashes_path, sound_wav_path, sound_trace_path, sound_rom_reads_path;
-	std::string video_hashes_path, video_folder = ".";
+	std::string video_hashes_path, video_folder = ".", video_check_path;
 	std::set<uint64_t> video_dump_frames;
+	std::string assets_folder;
+	std::string sound_timing_path, sound_board_path;
 
 	for (int index = 1; index < argc; index++)
 	{
@@ -495,6 +585,12 @@ int main(int argc, char **argv)
 			sound_trace_path = argv[++index];
 		else if (argument == "--sound-rom-reads" && has_value)
 			sound_rom_reads_path = argv[++index];
+		else if (argument == "--sound-check")
+			sound_check = true;
+		else if (argument == "--sound-timing" && has_value)
+			sound_timing_path = argv[++index];
+		else if (argument == "--sound-board-check" && has_value)
+			sound_board_path = argv[++index];
 		else if (argument == "--video-hashes" && has_value)
 			video_hashes_path = argv[++index];
 		else if (argument == "--video-dump" && has_value)
@@ -502,6 +598,10 @@ int main(int argc, char **argv)
 				video_dump_frames.insert(std::strtoull(argv[++index], nullptr, 10));
 		else if (argument == "--video-dir" && has_value)
 			video_folder = argv[++index];
+		else if (argument == "--video-check" && has_value)
+			video_check_path = argv[++index];
+		else if (argument == "--assets-check" && has_value)
+			assets_folder = argv[++index];
 		else if (argument == "--rom" && has_value)
 			rom_folder = argv[++index];
 		else
@@ -516,6 +616,8 @@ int main(int argc, char **argv)
 		std::cerr << "The ROM set in " << rom_folder << " cannot be read: " << problem << '\n';
 		return 1;
 	}
+	if (!assets_folder.empty())
+		return check_assets(assets_folder);
 	simpsons_reset();
 	simpsons_board.now = present;
 	if (service)
@@ -552,13 +654,52 @@ int main(int argc, char **argv)
 		hashes.open(hashes_path);
 	if (!video_hashes_path.empty())
 		video_hashes.open(video_hashes_path);
-	const bool video = video_hashes.is_open() || !video_dump_frames.empty();
+	// --video-check: the game's own video (runtime/src/video.c) draws every frame too, and the two are compared
+	std::ofstream video_check;
+	if (!video_check_path.empty())
+		video_check.open(video_check_path);
+	static simpsons_frame own_frame;
+	uint64_t video_differences = 0, first_video_difference = 0;
+	const bool video = video_hashes.is_open() || !video_dump_frames.empty() || video_check.is_open();
 	if (video)
 		kv_attach();
+	if (video_check.is_open())
+		simpsons_video_reset();
 	std::vector<int16_t> sound_mix;
+	std::ofstream sound_board;
+	uint64_t sound_board_differences = 0, sound_board_first = 0;
+	if (!sound_board_path.empty() && (!sound || sound_timing_path.empty()))
+	{
+		std::cerr << "--sound-board-check needs the sound board and --sound-timing\n" << usage;
+		return 1;
+	}
 	if (sound)
 	{
 		ks_attach();
+		if (!sound_timing_path.empty() && !ks_use_timing(sound_timing_path.c_str()))
+		{
+			std::cerr << sound_timing_path << ": no timing model in it\n";
+			return 1;
+		}
+		if (sound_check)
+			ks_check_chips();
+		if (!sound_board_path.empty())
+		{
+#ifdef K_GAME_SOUND_BOARD
+			if (const char *problem = simpsons_sound_init())
+			{
+				std::cerr << "The game's sound board does not start: " << problem << '\n';
+				return 1;
+			}
+			sound_board.open(sound_board_path);
+			g_sound_board = true;
+			g_reference_sound_irq = simpsons_board.sound_irq;
+			simpsons_board.sound_irq = raise_both_sound_irqs;
+#else
+			std::cerr << "This kref has no game sound board to compare\n";
+			return 1;
+#endif
+		}
 		simpsons_board.sound_sync = sound_sync;
 		if (!sound_rom_reads_path.empty())
 			ks_record_rom_reads();
@@ -570,11 +711,27 @@ int main(int argc, char **argv)
 	auto vblank_end = [&](uint64_t number) {
 		// the K052109 takes its scroll, and the screen updates (after VBLANK, as simpsons.cpp's)
 		if (video)
-			kv_vblank_end(video_hashes.is_open() || video_dump_frames.count(number) != 0);
+			kv_vblank_end(video_hashes.is_open() || video_dump_frames.count(number) != 0 || video_check.is_open());
+		if (video_check.is_open())
+		{
+			simpsons_video_vblank_end(&own_frame);
+			const uint64_t reference = kv_frame_hash(), own = simpsons_video_hash(&own_frame);
+			char line[64];
+			std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", number, reference, own);
+			video_check << line;
+			if (reference != own && video_differences++ == 0)
+			{
+				first_video_difference = number;
+				write_bmp(video_folder + "/reference_" + std::to_string(number) + ".bmp");
+				write_bmp(video_folder + "/own_" + std::to_string(number) + ".bmp", own_frame.pixels);
+			}
+		}
 	};
 	auto vblank_start = [&](uint64_t number) {
 		if (video)
 			kv_vblank_start();
+		if (video_check.is_open())
+			simpsons_video_vblank_start();
 		if (g_frame_timing)
 			simpsons_frame_vblank((g_cpu->cc() & 0x10) != 0);
 		else
@@ -591,6 +748,52 @@ int main(int argc, char **argv)
 					ks_frame_samples_hash(), ks_state_hash());
 				sound_hashes << line;
 			}
+#ifdef K_GAME_SOUND_BOARD
+			if (g_sound_board)
+			{
+				// the game's own sound board's frame against the reference's
+				simpsons_sound_end_frame(simpsons_board.cycles);
+				const uint64_t samples = ks_frame_samples_hash(), ram = ks_state_hash();
+				const uint64_t own_samples = simpsons_sound_samples_hash(), own_ram = simpsons_sound_state_hash();
+				char line[96];
+				std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 "\n",
+					number, samples, ram, own_samples, own_ram);
+				sound_board << line;
+				if ((samples != own_samples || ram != own_ram) && sound_board_differences++ == 0)
+				{
+					sound_board_first = number;
+					std::cerr << "sound board check, frame " << number << ": the " << (samples != own_samples ? "samples" : "")
+						<< (samples != own_samples && ram != own_ram ? " and the " : "") << (ram != own_ram ? "Z80's RAM" : "")
+						<< " differ; Z80 cycles " << ks_z80_cycles() << " and " << simpsons_sound_z80_cycles() << '\n';
+					static const char *const sources[2] = { "YM2151", "K053260" };
+					uint64_t reference_sources[2], own_sources[2];
+					ks_frame_source_hashes(reference_sources);
+					simpsons_sound_source_hashes(own_sources);
+					for (int source = 0; source < 2; source++)
+						if (reference_sources[source] != own_sources[source])
+							std::cerr << "  the " << sources[source] << "'s samples differ\n";
+					int shown = 0;
+					for (size_t at = 0; at < sizeof(simpsons_board.sound_ram) && shown < 16; at++)
+						if (simpsons_board.sound_ram[at] != simpsons_sound.ram[at]
+							&& (0xF000u + at < SIMPSONS_SOUND_STACK_START || 0xF000u + at >= SIMPSONS_SOUND_STACK_END))
+						{
+							char bytes[48];
+							std::snprintf(bytes, sizeof(bytes), "  %04X: %02X and %02X\n", unsigned(0xF000u + at),
+								simpsons_board.sound_ram[at], simpsons_sound.ram[at]);
+							std::cerr << bytes;
+							shown++;
+						}
+					for (int port = 0; port < 2; port++)
+						if (simpsons_board.sound_ports[2 + port] != simpsons_sound.answers[port])
+						{
+							char bytes[48];
+							std::snprintf(bytes, sizeof(bytes), "  answer %d: %02X and %02X\n", port,
+								simpsons_board.sound_ports[2 + port], simpsons_sound.answers[port]);
+							std::cerr << bytes;
+						}
+				}
+			}
+#endif
 			if (!sound_wav_path.empty())
 			{
 				size_t count = 0;
@@ -697,9 +900,25 @@ int main(int argc, char **argv)
 	}
 	if (!rom_reads_path.empty())
 		write_rom_reads(rom_reads_path);
+	if (video_check.is_open())
+	{
+		std::cout << "video check:       " << video_differences << " frames differ";
+		if (video_differences)
+			std::cout << ", the first " << first_video_difference;
+		std::cout << std::endl;
+	}
+	if (g_sound_board)
+	{
+		std::cout << "sound board check: " << sound_board_differences << " frames differ";
+		if (sound_board_differences)
+			std::cout << ", the first " << sound_board_first;
+		std::cout << std::endl;
+	}
 	if (sound)
 	{
-		std::cout << "Z80 cycles:        " << ks_z80_cycles() << '\n';
+		std::cout << "Z80 cycles:        " << ks_z80_cycles() << std::endl;
+		if (sound_check)
+			ks_check_print();
 		if (!sound_wav_path.empty())
 			write_wav(sound_wav_path, sound_mix, ks_mix_rate(), 2);
 		if (!sound_trace_path.empty())

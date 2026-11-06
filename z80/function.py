@@ -59,8 +59,9 @@ def leaders(program):
         for target in program.successors(instruction):
             if target != following:
                 found.add(target)
-        if instruction.flow in (dis.FLOW_BRANCH, dis.FLOW_JUMP, dis.FLOW_RETURN, dis.FLOW_CALL):
-            found.add(following)
+        if instruction.flow in (dis.FLOW_BRANCH, dis.FLOW_JUMP, dis.FLOW_RETURN, dis.FLOW_CALL) \
+                or instruction.mnemonic == "halt":
+            found.add(following)    # (after a HALT, the NMI's handler has run: the time goes on from there)
         if windows and instruction.mnemonic == "ei" and following in instructions:
             # the first place the Z80 takes an interrupt an EI lets in: after the instruction that follows it
             found.add((following + instructions[following].length) & 0xFFFF)
@@ -149,7 +150,9 @@ class Builder:
     def close_transfers(self, function):
         """Branch targets in other functions get a block of their own with the tail call."""
         def resolve(target, origin):
-            if target in function.blocks:
+            # (the loop's top is the board's wait from the loop's own code too: The Simpsons' main loop polls the
+            # YM2151's timer there)
+            if target in function.blocks and target != self.loop:
                 return target
             if target == self.loop:
                 label = ("wait", target)
@@ -293,5 +296,17 @@ class Builder:
         if mnemonic == "reti":
             # the handler enables interrupts right before it (EI), so copying IFF2 to IFF1 changes nothing
             block.end = ir.Return()
+            return
+        if mnemonic == "retn":
+            # the end of the NMI's handler: IFF1 back from IFF2, which the board keeps around the NMI it gives
+            # (z80_halt)
+            block.end = ir.Return()
+            return
+        if mnemonic == "halt":
+            # the Z80 waits for an interrupt: the board's NMI (The Simpsons' K053260 timer, armed by a write the
+            # program makes before), whose handler it runs and whose time passes (z80_halt); the block after it
+            # starts when the handler returns
+            statements.append(ir.Effect("z80_halt"))
+            block.end = self.transfer(function.entry, following)
             return
         raise lift.Unsupported(f"{address:04X}: {instruction.text}")
