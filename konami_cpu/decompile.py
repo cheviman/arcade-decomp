@@ -6,7 +6,7 @@ Description: decompiles a Konami CPU program (the 053248's, banked) into readabl
              function
 Version:     0.1.0
 Created:     06-11-2026
-Modified:    06-11-2026
+Modified:    07-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--checks] [--trace] [--out DIR] [--symbols FILE]
@@ -291,11 +291,28 @@ def caller_exits_always_said(built, exiting):
                 block.statements.append(clear)
 
 
+def caller_exits_consumed(built, exiting):
+    """A call that returned past its caller (stack.link_caller_exits' "left" blocks) returns the function it was made
+    from at once, to its own caller, which goes on as after any return: there LEFT_CALLER is cleared, so that a
+    caller further up never takes it for a return past itself (07A5E3: an object handler's PULLS D,PC under 07B5DD
+    made the step dispatch at 07A3B7 return). The functions that may return past their caller clear it on those
+    ways already (caller_exits_always_said)."""
+    for entry, function in built.items():
+        if entry in exiting:
+            continue
+        for label, block in function.blocks.items():
+            if isinstance(label, tuple) and label[0] == "left":
+                clear = ir.SetReg(stack.LEFT_CALLER, ir.const(0))
+                clear.origin = getattr(block.end, "origin", None)
+                block.statements.insert(0, clear)
+
+
 def analyse(program, built):
     """The returns past a caller, preserved registers and the data flow summaries, in place (the stack's slots are
     settle's)"""
     exiting = stack.link_caller_exits(built)
     caller_exits_always_said(built, exiting)
+    caller_exits_consumed(built, exiting)
     flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
     signatures.OPEN = open_entries(program, built)
     flow.declared = declared_results(program, signatures.OPEN)
@@ -385,7 +402,10 @@ def keyed_names(known):
     record_tables = {emit.PLACES + address: value for address, value in known.record_tables.items()}
     rom = set(known.tables) | set(known.record_tables)
     counts = {(emit.PLACES + address if address in rom else address): value for address, value in known.counts.items()}
-    return known._replace(tables=tables, record_tables=record_tables, counts=counts)
+    # (what a table leads to, under its key too: pointers.data_key finds it so)
+    targets = {(("global", emit.PLACES + key[1]) if key[0] == "global" and key[1] in rom else key): value
+               for key, value in known.targets.items()}
+    return known._replace(tables=tables, record_tables=record_tables, counts=counts, targets=targets)
 
 
 def piece_names():
@@ -404,32 +424,42 @@ def piece_names():
     return found
 
 
+def statement_accesses(statement):
+    """(address, bits) of the memory a statement reads or writes (memory.accesses_of's, one statement)"""
+    found = []
+    if isinstance(statement, ir.Store):
+        found.append((statement.address, statement.bits))
+    for expression in ir.statement_expressions(statement):
+        for node in ir.walk(expression):
+            if isinstance(node, ir.Load):
+                found.append((node.address, node.bits))
+    return found
+
+
 def keyed_accesses(built):
-    """(address, bits) of every access, its program's addresses keyed as the bank of its function names them"""
+    """(address, bits) of every access, its program's addresses keyed as the bank of its function names them (in the
+    fixed program, as the bank the CPU surely has at the statement's instruction: emit.statement_bank)"""
     found = []
     for entry, function in built.items():
         emit.current_bank = analysis.bank_of(entry)
-
-        def change(node):
-            if isinstance(node, ir.Const) and node.bits == 16 and node.value >= analysis.WINDOW:
-                key = emit.canonical(node.value)
-                if key < emit.OUTSIDE:
-                    return ir.const(key, 32)
-            return None
-        for address, bits in memory.accesses_of([function]):
-            if isinstance(address, ir.Const) and address.value >= analysis.WINDOW:
-                key = emit.canonical(address.value)
-                found.append((ir.const(key, 32) if key < emit.OUTSIDE else address, bits))
-                continue
-            parts = memory.based(address)
-            if parts is not None and parts[0] >= analysis.WINDOW:
-                key = emit.canonical(parts[0])
-                if key < emit.OUTSIDE:
-                    found.append((ir.op("add", (ir.const(key, 32), ir.zext(parts[1], 32) if parts[1].bits < 32
-                                                else parts[1]), 32), bits))
-                    continue
-            found.append((address, bits))
+        for block in function.blocks.values():
+            for statement in block.statements + [block.end]:
+                emit.statement_bank(statement)
+                for address, bits in statement_accesses(statement):
+                    if isinstance(address, ir.Const) and address.value >= analysis.WINDOW:
+                        key = emit.canonical(address.value)
+                        found.append((ir.const(key, 32) if key < emit.OUTSIDE else address, bits))
+                        continue
+                    parts = memory.based(address)
+                    if parts is not None and parts[0] >= analysis.WINDOW:
+                        key = emit.canonical(parts[0])
+                        if key < emit.OUTSIDE:
+                            found.append((ir.op("add", (ir.const(key, 32), ir.zext(parts[1], 32)
+                                                        if parts[1].bits < 32 else parts[1]), 32), bits))
+                            continue
+                    found.append((address, bits))
     emit.current_bank = None
+    emit.origin_bank = None
     return found
 
 
@@ -559,6 +589,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
         pairs.tidy_bytes(function, live_after[entry])
 
     emit.use_memory_map(known)
+    emit.BANK_AT = program.analysis.single_bank    # (the bank the fixed program's code surely has, by instruction)
     data_names = {emit.PLACES + address: symbol.name for address, symbol in program.symbols.items()
                   if symbol.kind == "data"}
     data_names.update(piece_names())
@@ -579,6 +610,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     typing = pointers.Program(built, flow, found, results_of_calls, signatures.CONTEXT, known.targets, hints,
                               site_hints)
     fields, accesses_typed = typing.run()
+    emit.current_bank = None    # (pointers.ENTERING set it function by function)
 
     always = {entry: set(summary.always) for entry, summary in flow.summaries.items()}
     emitter = emit.Emitter(built, found, names, signatures.CONTEXT, set(), named, always, lambda address: 0, trace)

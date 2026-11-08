@@ -4,7 +4,7 @@ Description: works out which registers point at which of the game's structures, 
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    01-11-2026
+Modified:    07-11-2026
 Author:      Sebastian Toyos
 
 The structures (STRUCTS) are OutRunners': the game objects (0x100 bytes, 124 of them below each screen's
@@ -165,6 +165,24 @@ ELEMENT_READS = False
 # fields of the families above it too, unless one of its own takes their bytes (symbols.txt names each field once,
 # in the family that has it in common). Off, every family's view holds only its own scoped lines.
 NESTED_FAMILIES = False
+# A program that names its data by keys of its own rather than by the addresses its code uses (the 053248's: a window
+# address is a different place in each bank, konami_cpu/emit.py): a function (address) -> the key its tables of
+# records (RECORD_TABLES) and what its tables lead to (TARGETS) are keyed by, or None where the address names no data
+# of the program's; and one this module calls with each function's entry before it walks it, as the key of a window
+# address depends on the function's bank. None for both by default: the addresses are the keys.
+DATA_KEY = None
+ENTERING = None
+# How many records before a table of records (RECORD_TABLES) a base plus a record's number may start from and still
+# read that table, by its name, where the code counts its records from 1 (the 053248's team moves); 0 by default: none
+RECORDS_BEFORE = 0
+
+
+def data_key(value):
+    """The key the program's data at address 'value' is named by (DATA_KEY), or the address itself"""
+    if DATA_KEY is None:
+        return value
+    found = DATA_KEY(value)
+    return value if found is None else found
 
 
 def link_kind(link, offset=0):
@@ -302,6 +320,18 @@ def record_table(value):
     for address, (_, struct) in RECORD_TABLES.items():
         if 0 <= value - address < STRUCTS[struct] * RECORD_COUNTS.get(address, 1):
             return struct, value - address
+    return None
+
+
+def record_before(value):
+    """(structure, a negative offset) for an address a whole number of records (up to RECORDS_BEFORE) before a table
+    of records: the base the code adds a record's number to where the numbers start at 1 (team_moves[i - 1].field);
+    None otherwise"""
+    for address, (_, struct) in RECORD_TABLES.items():
+        size = STRUCTS[struct]
+        for count in range(1, RECORDS_BEFORE + 1):
+            if value == address - count * size:
+                return struct, -count * size
     return None
 
 
@@ -566,8 +596,11 @@ def kind_of(node, state, zeros):
                     found += (INSTANCE_FAMILIES[instance[0]],)
         if found is None and in_work_ram(value):
             found = ("global", value)
+        if found is None and DATA_KEY is not None and node.value >= 1 << POINTER_BITS \
+                and DATA_KEY(node.value) is not None:
+            found = record_table(DATA_KEY(node.value)) or ("rom", 0)    # (a key of DATA_KEY's, wider than a pointer)
         if found is None and rom_address(value):
-            found = record_table(value) or ("rom", 0)
+            found = record_table(data_key(value)) or ("rom", 0)
         if found is None and any(start <= value < end for start, end in DEVICE_AREAS):
             found = ("io", 0)
         return found
@@ -741,14 +774,15 @@ def rom_address(value):
     return ROM_DATA[0] <= value < ROM_DATA[1]
 
 
-def constant_base(address):
-    """The constant of "constant + rest", or of a constant address."""
+def constant_base(address, mask=None):
+    """The constant of "constant + rest", or of a constant address (cut to ADDRESS_MASK, or to 'mask')."""
+    mask = ADDRESS_MASK if mask is None else mask
     if isinstance(address, ir.Const):
-        return address.value & ADDRESS_MASK
+        return address.value & mask
     if isinstance(address, ir.Op) and address.name == "add":
         for arg in address.args:
             if isinstance(arg, ir.Const):
-                return arg.value & ADDRESS_MASK
+                return arg.value & mask
     return None
 
 
@@ -765,6 +799,14 @@ def target_of(address, state, bits):
             return scoped[0] if scoped[1] == bits else None    # the family's own use of the field
     else:
         base = constant_base(hit[1] if hit is not None else address)
+        if base is not None and DATA_KEY is not None:
+            # (a table of the program's data, by the key its lines are under; a key of DATA_KEY's is wider than a
+            # pointer, and not cut)
+            wide = constant_base(hit[1] if hit is not None else address, 0xFFFFFFFF)
+            if wide >= 1 << POINTER_BITS and DATA_KEY(wide) is not None:
+                base = DATA_KEY(wide)
+            elif rom_address(base):
+                base = data_key(base)
         key = ("global", base) if base is not None else None
         scoped = SCOPED_TARGETS.get(("global", GLOBAL_FAMILY, base)) if GLOBAL_FAMILY is not None else None
         if scoped is not None:
@@ -978,6 +1020,7 @@ def indexed_access(address, state, in_fields=True, zeros=None):
             terms.append(node)
     gather(address, 1)
     width = 1 << POINTER_BITS
+    raw = constant    # (a key of DATA_KEY's is wider than a pointer: it is not cut)
     constant %= width
     if constant >= width // 2:
         constant -= width    # (a displacement back: the pointer's arithmetic wraps at its width)
@@ -1037,12 +1080,18 @@ def indexed_access(address, state, in_fields=True, zeros=None):
                     return hit
         if any(found is not None and (found[0] in STRUCTS or found[0] == "global") for found in kinds):
             return None    # (a field of a structure a register points at: the constant is its offset, no table)
-        table = record_table(constant & ADDRESS_MASK)
+        mask = ADDRESS_MASK
+        if DATA_KEY is not None and (rom_address(constant & ADDRESS_MASK) or raw >= width):
+            # (and the record table by its key, which names it)
+            constant, mask = data_key(raw if raw >= width else constant & ADDRESS_MASK), 0xFFFFFFFF
+        table = record_table(constant & mask)
+        if table is None and terms and RECORDS_BEFORE:
+            table = record_before(constant & mask)
         if table is None and terms:
-            table = instance_record(constant & ADDRESS_MASK)
+            table = instance_record(constant & mask)
         if table is None:
             return None
-        pointer, kind, constant = ir.Const(constant - table[1] & ADDRESS_MASK, 32), (table[0], 0), table[1]
+        pointer, kind, constant = ir.Const(constant - table[1] & mask, 32), (table[0], 0), table[1]
     rest = [term for term in terms if term is not pointer]
     if len(rest) > 1 and all(term == rest[0] for term in rest):
         rest = [ir.op("mul", (rest[0], ir.Const(len(rest), rest[0].bits)), rest[0].bits)]    # (i + i: twice i)
@@ -1406,6 +1455,8 @@ class Program:
     def analyse(self, entry, record):
         global GLOBAL_FAMILY
         GLOBAL_FAMILY = self.global_families.get(entry)
+        if ENTERING is not None:
+            ENTERING(entry)
         function = self.functions[entry]
         blocks = function.blocks
         told = self.entry_kinds.get(entry, {})

@@ -6,7 +6,7 @@ Description: a Konami CPU program (the 053248's, banked) split into functions, a
              of IR blocks for the decompiler
 Version:     0.1.0
 Created:     06-11-2026
-Modified:    06-11-2026
+Modified:    07-11-2026
 Author:      Sebastian Toyos
 
 Program takes what the static analysis finds (konami_cpu/analysis.py, symbols.txt, no traces) and splits it into
@@ -295,6 +295,27 @@ def set_pair_byte(index, value):
                                      ir.op("shl", (wide_value, ir.const(8, 8)), 16)), 16))
 
 
+def banked_reads(statements, bank):
+    """A fixed program's instruction that reads a window address where the CPU surely has 'bank' (LDX $600C after
+    "LDB #$13; STB <$0E; SETLN <$0E"): the address its operand names is that bank's place, the key the decompiler
+    names the program's data by (konami_cpu/emit.py's PLACES + place), so that the read is of the table there. The
+    C reads it by the table's name; the key's low 16 bits are still the CPU's address. The statements, changed in
+    place."""
+    if bank is None:
+        return statements
+    from . import emit    # (emit's key; emit does not import this module)
+
+    def change(node):
+        if isinstance(node, ir.Load) and isinstance(node.address, ir.Const) \
+                and analysis.WINDOW <= node.address.value < analysis.FIXED_CPU:
+            return ir.Load(ir.Const(emit.PLACES + analysis.place_of(bank, node.address.value), 32), node.bits)
+        return None
+    for statement in statements:
+        if isinstance(statement, (ir.SetTemp, ir.SetReg, ir.SetFlag)):
+            ir.map_statement(statement, change)
+    return statements
+
+
 def rewrite_statements(statements, place, join=True):
     """The statements of one instruction for the decompiler: words joined, the direct page a constant, A and B the
     bytes of D (a write of both, as LDD does, a write of D)"""
@@ -349,11 +370,23 @@ class Found(analysis.Analysis):
         super().reset()
         self.reached = {}           # {instruction place: {places}}
         self.computed_states = {}   # {instruction place: what the registers and the bank hold there}
+        self.bank_states = {}       # {instruction place: what the bank can be there, as the last walk of its block saw}
         self._at = None
 
     def named_places(self, at, instruction, state):
         self._at = at
+        self.bank_states[at] = state.get("bank")
         super().named_places(at, instruction, state)
+
+    def single_bank(self, place):
+        """The bank the CPU surely has at the instruction at 'place' (every way there sets that one), or None"""
+        values = self.bank_states.get(place)
+        if analysis.unknown_too(values):
+            return None
+        found = analysis.known(values)
+        if len(found) != 1 or found[0][0] != analysis.CONSTANT:
+            return None
+        return found[0][1]
 
     def computed(self, place, instruction, state):
         self.computed_states[place] = dict(state)
@@ -915,6 +948,7 @@ class Builder:
         if lifter.length != placed.length:
             raise Unsupported(f"{place:06X}: the lift reads {lifter.length} bytes, the decoder {placed.length}")
         control = lifter.control
+        bank = self.analysis.single_bank(place) if placed.bank is None else None
 
         if opcode in (PUSHS, PULLS):
             ended = self.stack_registers(block, placed, opcode, lifter)
@@ -933,7 +967,7 @@ class Builder:
             return
         elif control.kind == "call":
             lifted = [statement for statement in lifter.statements if not mentions_stack(statement)]
-            statements += rewrite_statements(lifted, place, self.joins(placed))
+            statements += banked_reads(rewrite_statements(lifted, place, self.joins(placed)), bank)
             if control.target is not None:
                 statements.append(ir.Call(target=self.target(placed, control.target), return_address=following))
             else:
@@ -952,7 +986,7 @@ class Builder:
             block.end = ir.Return()
             return
         else:
-            statements += rewrite_statements(list(lifter.statements), place, self.joins(placed))
+            statements += banked_reads(rewrite_statements(list(lifter.statements), place, self.joins(placed)), bank)
 
         if control.kind == "goto":
             if interrupts:

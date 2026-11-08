@@ -10,6 +10,7 @@
  *
  *    Not part of the game. Usage:
  *      kref [--timing cycles|frames] [--frames N] [--hashes hashes.txt] [--trace executed.txt] [--calls called.txt]
+ *           [--interrupts FILE] [--stack FILE] [--order FIRST LAST FILE]
  *           [--jumps jumps.txt] [--rom-reads reads.txt] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR]
  *           [--script controls.txt] [--service] [--rom FOLDER] [--no-sound] [--sound-hashes hashes.txt]
  *           [--sound-wav sound.wav] [--sound-trace executed.txt] [--sound-rom-reads reads.txt] [--sound-check]
@@ -73,7 +74,9 @@
  *    of its vectors), a measure for the coverage of the ROM; --text prints the K052109's fixed layer of those
  *    frames as text; --dump writes the board's memories at the end of those frames, a file each; --service
  *    turns the test switch on; --interrupts writes a line per interrupt the CPU takes: "FRAME IRQ|FIRQ PLACE",
- *    the place of the instruction it came after.
+ *    the place of the instruction it came after; --order FIRST LAST FILE writes every instruction the frames
+ *    FIRST to LAST run, in order, with the registers it starts with ("FRAME PLACE D= X= Y= U= S= CC="): what a
+ *    traced build of the decompiled program (tools/decompile.py --trace, SIMPSONS_TRACE) is compared with.
  *
  *    --assets-check loads the game's assets from FOLDER (runtime/src/assets.c: what the game reads instead of the
  *    ROM set, tools/extract_assets.py writes them) into memories of their own, and prints, for each of the board's memories, how many
@@ -118,6 +121,10 @@ public:
 
 	u8 cc() const { return m_cc; }
 	u16 s() const { return m_s.w; }
+	u16 d() const { return m_q.r.d; }
+	u16 x() const { return m_x.w; }
+	u16 y() const { return m_y.w; }
+	u16 u() const { return m_u.w; }
 
 private:
 	static inline machine_config m_config;
@@ -136,6 +143,9 @@ uint16_t g_previous_pc = 0;
 uint64_t g_instructions = 0;
 uint32_t g_lowest_s = 0x10000;     // --stack: the lowest S an instruction starts with, once the boot has set it
 uint64_t g_irq_frames = 0, g_firq_frames = 0;
+// --order: every instruction of those frames, in the order they ran
+std::ofstream g_order;
+uint64_t g_order_first = 0, g_order_last = 0;
 
 // An instruction's place: its program ROM's offset, or 080000 plus its address below 6000
 uint32_t place_of(uint16_t pc)
@@ -278,6 +288,14 @@ void on_instruction(offs_t pc)
 	if (g_cpu->s() >= SIMPSONS_WORK_RAM && g_cpu->s() < g_lowest_s)
 		g_lowest_s = g_cpu->s();
 	g_executed[place] = 1;
+	if (g_order.is_open() && simpsons_board.frame >= g_order_first && simpsons_board.frame <= g_order_last)
+	{
+		char line[80];
+		std::snprintf(line, sizeof(line), "%" PRIu64 " %06X D=%04X X=%04X Y=%04X U=%04X S=%04X CC=%02X\n",
+			simpsons_board.frame, unsigned(place), g_cpu->d(), g_cpu->x(), g_cpu->y(), g_cpu->u(), g_cpu->s(),
+			g_cpu->cc());
+		g_order << line;
+	}
 	if (g_previous != kOutside)
 	{
 		if (g_previous_kind & kCall)
@@ -524,7 +542,7 @@ int check_assets(const std::string &folder)
 
 int main(int argc, char **argv)
 {
-	const char *usage = "Usage: kref [--timing cycles|frames] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--interrupts FILE] [--stack FILE]"
+	const char *usage = "Usage: kref [--timing cycles|frames] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--interrupts FILE] [--stack FILE] [--order FIRST LAST FILE]"
 		" [--jumps FILE] [--rom-reads FILE] [--text FRAME ...] [--dump FRAME ... --dump-dir DIR] [--script FILE]"
 		" [--service] [--rom FOLDER] [--no-sound] [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE]"
 		" [--sound-rom-reads FILE] [--sound-check] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
@@ -570,6 +588,12 @@ int main(int argc, char **argv)
 			calls_path = argv[++index];
 		else if (argument == "--interrupts" && has_value)
 			g_interrupts.open(argv[++index]);
+		else if (argument == "--order" && index + 3 < argc)
+		{
+			g_order_first = std::strtoull(argv[++index], nullptr, 10);
+			g_order_last = std::strtoull(argv[++index], nullptr, 10);
+			g_order.open(argv[++index]);
+		}
 		else if (argument == "--stack" && has_value)
 			stack_path = argv[++index];
 		else if (argument == "--jumps" && has_value)

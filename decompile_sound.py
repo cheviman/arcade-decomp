@@ -490,6 +490,16 @@ def write_c(program, out_dir, variables_path=None):
     for entry in set(joined) | split:
         if entry in texts and emitter.shared_results.get(emitter.names.get(entry)):
             texts[entry] = writers[entry].write()
+    # (a table the C reads by a register that holds a multiple of its elements' size, NAME[register / size], is an array
+    # in sound.h; the count of indexes the header is made from cannot see the register's low bits: once such a read is
+    # written, the table is made an array and the functions are written again, its other reads as NAME[0])
+    scalar = {item.name: item for item in named.tables.values() if not item.indexed}
+    subscripted = {name for name in scalar if any(re.search(rf"\b{name}\[", text) for text in texts.values())}
+    if subscripted:
+        for name in subscripted:
+            scalar[name].indexed = True
+        for entry in texts:
+            texts[entry] = writers[entry].write()
     if problems:
         for entry, problem in problems[:20]:
             print(f"  {entry:04X}  {problem}")
@@ -531,6 +541,11 @@ def write_c(program, out_dir, variables_path=None):
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
     write_sources(out_dir, files, texts, "sound.h", header=file_header)
     loaded = named.loaded_tables()
+    if getattr(game_profile, "SOUND_TABLES_USED_ONLY", False):
+        # (only the tables the C reads: a number that is an address of the ROM, ld bc,$0007 a count, names none the
+        # board would have to load)
+        used = "\n".join(texts.values())    # (the functions' C)
+        loaded = [(address, name) for address, name in loaded if re.search(rf"\b{re.escape(name)}\b", used)]
     if loaded or signatures.CONTEXT:
         (out_dir / "tables.c").write_text(
             file_header("tables.c", "the tables the sound program reads by name, which the board sets"

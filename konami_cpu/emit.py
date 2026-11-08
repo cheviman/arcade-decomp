@@ -5,7 +5,7 @@ Name:        emit.py
 Description: writes a Konami CPU program's functions as C, through the decompiler's writer
 Version:     0.1.0
 Created:     06-11-2026
-Modified:    06-11-2026
+Modified:    07-11-2026
 Author:      Sebastian Toyos
 
 The decompiler's FunctionWriter does the work (decompiler/emit.py); this gives it the 053248's memory, its effects
@@ -19,9 +19,15 @@ on, from the profile:
     (6000-7FFF), the fixed program (8000-FFFF) is everyone's. Its tables are named by their place (the region's
     offset, as symbols.txt and the assets have them), which the decompiler keys at PLACES + place so that no place
     is taken for an address of the work RAM: canonical() turns a CPU address into that key, with the bank of the
-    function being written (current_bank); a window address read from the fixed program, whose bank only the
-    running program knows, has no name and goes through the bus. A table's NAME_ADDRESS is its CPU address (what
-    the program holds as a value); the game loads it by its place (src/table.c's registry);
+    function being written (current_bank); a window address the fixed program reads is named in the bank the
+    static analysis finds the CPU surely has at the instruction (konami_cpu/function.py's banked_reads for an
+    operand's address, origin_bank for one worked out), and in no bank where it chose the bank by a table (but for
+    the profile's WINDOW_ELEMENTS). A table's NAME_ADDRESS is its CPU address (what the program holds as a value); the
+    game loads it by its place (src/table.c's registry). A table read with the CPU's signed index (A,X) is the
+    element the CPU picks, NAME[(int8_t)a], NAME[(int8_t)(a << 1) / 2] for words, NAME[(int8_t)a - 1] where the code
+    counts from 1, or by its name and the bytes into it (TABLE8, TABLE16) where no element fits; the tables of
+    records and what a table leads to are keyed by place too (pointers.DATA_KEY), so that a pointer read from a table
+    is typed by symbols.txt;
   - the board's devices (0000-3FFF: the palette, the K052109 and its RAM, the sprite RAM and the RAM at 3000, which
     1FC2 swaps in and out, and the ports) are reached through the bus by name (io_read8, io_write8).
 Effects: frame_wait(WAIT) where the program finds nothing to do until its next frame, take_interrupts() after it and
@@ -29,6 +35,8 @@ after what lets an interrupt in, firq_point() where the IRQ handler takes the sp
 the bank), the interrupt mask's enable_irq()/disable_irq()/enable_firq()/disable_firq()/restore_mask(), lost_stack()
 (a function that runs on a stack the code that reaches it pushed, which no path the program takes reaches as one).
 """
+import re
+
 from decompiler import cprint
 from decompiler import emit
 from decompiler import memory
@@ -45,6 +53,16 @@ PLACES = 0x100000           # the key the decompiler names the program's data by
 OUTSIDE = 0x200000          # the key of a window address whose bank is not known (no name)
 PROGRAM_SIZE = analysis.CODE_END
 current_bank = None         # the bank of the function being written (None: the fixed program's)
+# in the fixed program, the bank the CPU surely has at the instruction being written (statement_bank), where it
+# reads a window address it worked out (LDX #$6000 after the bank's SETLN, then LDX D,X)
+origin_bank = None
+# what gives that bank: (instruction place) -> bank or None (konami_cpu/decompile.py sets it from the analysis)
+BANK_AT = None
+# the window's data the fixed program reads in a bank it chose by a table, whatever the bank is (the profile's
+# WINDOW_ELEMENTS: {function place: {window address: elements name}}): read as those elements at the window's start
+# (BANK_WINDOW, game/support.h) plus the offset, NAME(BANK_WINDOW + i), since no one place has them
+WINDOW_ELEMENTS = dict(getattr(game_profile, "WINDOW_ELEMENTS", {}))
+current_entry = None        # the place of the function being written
 # the names of the frame waits (the profile's FRAME_WAIT_NAMES: {CPU address: name})
 FRAME_WAIT_NAMES = dict(getattr(game_profile, "FRAME_WAIT_NAMES", {}))
 SHIFTS = ("lsrdi", "rordi", "asrdi", "asldi", "roldi")
@@ -61,7 +79,17 @@ def canonical(address):
         return PLACES + analysis.place_of(None, address)
     if address >= analysis.WINDOW and current_bank is not None:
         return PLACES + analysis.place_of(current_bank, address)
+    if address >= analysis.WINDOW and origin_bank is not None:
+        return PLACES + analysis.place_of(origin_bank, address)
     return OUTSIDE + address
+
+
+def statement_bank(statement):
+    """Sets origin_bank for a statement of the fixed program's code: the bank the CPU surely has at its instruction"""
+    global origin_bank
+    origin = getattr(statement, "origin", None)
+    origin_bank = BANK_AT(origin) if BANK_AT is not None and current_bank is None and isinstance(origin, int) \
+        else None
 
 
 def cpu_of_key(key):
@@ -77,7 +105,8 @@ def use_memory_map(names):
     """Makes the 053248's memory the one decompiler/memory.py and decompiler/pointers.py work on: 'names'
     (disassemble.Names, its program's addresses already keyed by canonical()) gives the structures"""
     memory.WORK_RAM = WORK_RAM_AREA
-    memory.ROM_AREAS = ((analysis.WINDOW, 0x10000), (PLACES, PLACES + PROGRAM_SIZE))
+    # (the places first: the area memory.Memory bounds a table's reach by, the keys the tables are named by)
+    memory.ROM_AREAS = ((PLACES, PLACES + PROGRAM_SIZE), (analysis.WINDOW, 0x10000))
     memory.ADDRESS_MASK = 0xFFFFFF
     memory.ADDRESS_DIGITS = 4
     memory.RAM_MACRO, memory.ROM_MACRO = "RAM", "DATA"
@@ -156,24 +185,207 @@ def use_memory_map(names):
     pointers.PAGED = False
     pointers.REVERSED = True
     pointers.RECORDS_LOADED_WHOLE = True
-    pointers.ELEMENT_READS = False
+    # (the profile's ELEMENT_READS, off by default: the values a pointer walks, symbols.txt elements lines, read one at a
+    # time at their address, NAME(p), as the records' copies run: data_record)
+    pointers.ELEMENT_READS = getattr(game_profile, "ELEMENT_READS", False)
+    if pointers.ELEMENT_READS:
+        # (what a value of one is called where a local holds it: the elements' name, not "element")
+        for struct, kind in names.arrays.items():
+            if names.fields.get((struct, 0), ("",))[0] == "element":
+                names.fields[(struct, 0)] = (struct, kind)
     pointers.NESTED_FAMILIES = False
     pointers.SIGNED_OFFSETS = False
+    # (the tables of records and what the tables lead to are keyed by place: a constant of the code is the place it
+    # names in the bank of the function being walked)
+    pointers.DATA_KEY = data_key
+    pointers.ENTERING = entering
+    # (the profile's RECORDS_BEFORE, none by default: a base that many records before a table of records, where the
+    # code counts its records from 1, still reads that table, team_moves[i - 1].field)
+    pointers.RECORDS_BEFORE = getattr(game_profile, "RECORDS_BEFORE", 0)
+
+
+def data_key(address):
+    """The key of the program's data at CPU address 'address' in current_bank (pointers.DATA_KEY), or None"""
+    key = canonical(address)
+    return key if PLACES <= key < PLACES + PROGRAM_SIZE else None
+
+
+def entering(entry):
+    """The bank of the function the pointers' analysis walks (pointers.ENTERING)"""
+    global current_bank
+    current_bank = analysis.bank_of(entry) if isinstance(entry, int) else None
+
+
+def signed_offset(rest):
+    """The byte an indexed operand adds signed to its index register (A,X and B,X: konami.lst's INDEXED takes the
+    accumulator as an int8_t), looked through the widening the names' pass gives an offset; None for any other
+    offset"""
+    node = rest
+    while isinstance(node, ir.Op) and node.name in ("zext", "fits") and node.args[0].bits > 8:
+        node = node.args[0]
+    if isinstance(node, ir.Op) and node.name == "sext" and node.args[0].bits == 8:
+        return node
+    return None
+
+
+def doubled(offset):
+    """How many low bits of a signed byte offset (signed_offset) are known to be zero: 1 for an index the code
+    doubled before it (ASLA: a table of words), 2 for one it multiplied by 4..."""
+    return pointers.low_zeros(offset.args[0], {})
+
+
+def offset_terms(rest):
+    """The terms of an offset added up (looked through widenings)"""
+    while isinstance(rest, ir.Op) and rest.name in ("zext", "fits") and rest.args[0].bits > 8:
+        rest = rest.args[0]
+    if isinstance(rest, ir.Op) and rest.name == "add":
+        return [term for arg in rest.args for term in offset_terms(arg)]
+    return [rest]
+
+
+def signed_sum(rest):
+    """True for an offset that adds the CPU's signed byte to something else (LEAX A,X then LDA B,X: a row and a
+    column), or that is what DIVX worked out (a quotient, any number): a table read by its name and that offset"""
+    terms = offset_terms(rest)
+    if len(terms) == 1:
+        return isinstance(terms[0], ir.Op) and terms[0].name.startswith("helper:divx")
+    # (every other term an index, not a pointer: u + (int8_t)b - 3 is a record's byte, no table at FFFD)
+    signed = [term for term in terms if signed_offset(term) is not None]
+    return bool(signed) and all(term in signed or memory.small(term) for term in terms)
+
+
+def wrapped(text):
+    """'text' as one operand of a cast: in parentheses unless it is a name or a number, or in them already"""
+    if re.fullmatch(r"[\w.]+", text):
+        return text
+    if text.startswith("("):
+        depth = 0
+        for position, character in enumerate(text):
+            depth += {"(": 1, ")": -1}.get(character, 0)
+            if not depth:
+                if position == len(text) - 1:
+                    return text
+                break
+    return f"({text})"
 
 
 class Memory(memory.Memory):
     """The decompiler's memory names, with the tables of the program's data keyed by canonical(): an unnamed table
-    is named after its place, and its NAME_ADDRESS is its CPU address"""
+    is named after its place, and its NAME_ADDRESS is its CPU address. A table read with the CPU's signed index (A,X)
+    is that table's element by the index as the CPU takes it, NAME[(int8_t)a], or (the index doubled for a table of
+    words) the element that many bytes on, NAME[(int8_t)(a << 1) / 2]; a read at another width, or into an element,
+    by the table's name and the bytes, TABLE8(name, 0x1u + (int8_t)a)"""
 
     def __init__(self, names, accesses, data_names=None, places=None):
         self.data_names = dict(data_names or {})
         self.banks_of = dict(places or {})    # {key: bank or None} of the tables
-        super().__init__(names, accesses, data_names)
+        self.unnamed_names = set()            # the tables named here, after their piece or their place
+        self.named_keys = set(names.tables)   # the tables symbols.txt names (their keys)
+        # (a table read with a signed index is a table like one read with a small one: what the C names)
+        small = ir.Load(ir.Const(0, 16), 8)
+        widened = []
+        for address, bits in accesses:
+            parts = memory.based(address) if memory.constant_address(address) is None else None
+            if parts is not None and PLACES <= parts[0] < PLACES + PROGRAM_SIZE \
+                    and (signed_offset(parts[1]) is not None or signed_sum(parts[1])):
+                address = ir.op("add", (ir.Const(parts[0], 32), ir.zext(small, 32)), 32)
+            widened.append((address, bits))
+        super().__init__(names, widened, data_names)
+
+    def access(self, address, bits, index_text, indexed=False):
+        parts = memory.based(address) if memory.constant_address(address) is None else None
+        window = WINDOW_ELEMENTS.get(current_entry, {}).get(parts[0] & 0xFFFF) if parts is not None else None
+        if window is not None and memory.own_copy(parts[0]) >= OUTSIDE and window in pointers.ELEMENTS:
+            # (the window's data in a bank the code chose by a table: those elements, from the window's start)
+            element_bits, signed = memory.SIGNED[pointers.ELEMENTS[window]]
+            if element_bits == bits:
+                moved = parts[0] - analysis.WINDOW
+                start = "BANK_WINDOW" if not moved else f"BANK_WINDOW + 0x{moved:X}u"
+                return f"{window.upper()}({start} + {index_text(parts[1])})", signed, False
+        offset = signed_offset(parts[1]) if parts is not None else None
+        if offset is not None:
+            found = self.signed_read(memory.own_copy(parts[0]), offset, bits, index_text)
+            if found is not None:
+                return found
+        elif parts is not None and signed_sum(parts[1]):
+            item = self.tables.get(memory.own_copy(parts[0]))
+            if item is not None:
+                if item.bits == bits and len(offset_terms(parts[1])) == 1:
+                    # (the quotient DIVX worked out: an element by that number)
+                    return self.indexed_text(self.tables, item, index_text(parts[1])), item.signed, False
+                # (a row and a column, as the CPU adds them: the bytes into the table by its name)
+                return f"TABLE{bits}({item.name}, {index_text(parts[1])})", False, False
+        found = super().access(address, bits, index_text, indexed)
+        if found is None and parts is not None:
+            key = memory.own_copy(parts[0])
+            item = self.tables.get(key)
+            if item is not None and key in self.named_keys and not any(
+                    not isinstance(term, (ir.Op, ir.Const)) and term.bits > 8 for term in offset_terms(parts[1])):
+                # (a table symbols.txt names, read by a 16-bit number the code works out, D after ASLB; ROLA: by its
+                # name and the bytes into it)
+                return f"TABLE{bits}({item.name}, {index_text(parts[1])})", False, False
+        return found
+
+    def signed_read(self, base, offset, bits, index_text):
+        """(C, signed, False) for a read of 'bits' at the program's data 'base' (a key) plus the CPU's signed byte
+        'offset', by the name of the table it is in; None where no table has a name there"""
+        if not PLACES <= base < PLACES + PROGRAM_SIZE:
+            return None
+        item, number, byte = self.tables.get(base), 0, 0
+        if item is None:
+            found = self.element(self.tables, base)
+            if found is not None:
+                item, number, byte = found
+        if item is None:
+            # (a few bytes into a table: the second byte of its words, 79A7 into 79A6's)
+            start = next((start for start in range(base - 1, base - 4, -1) if start in self.tables), None)
+            if start is not None and start + self.tables[start].bits // 8 > base:
+                item, byte = self.tables[start], base - start
+        before = 0
+        if item is None:
+            # (an element before a table: the code counts from 1, LDB <$57 the players; NAME[(int8_t)players - 1])
+            found = self.table_just_after(base)
+            if found is not None:
+                item, before = found
+        if item is None:
+            return None
+        size = item.bits // 8
+        text = f"(int8_t){wrapped(index_text(offset.args[0]))}"
+        if item.bits == bits and not byte and (size == 1 or doubled(offset) >= size.bit_length() - 1) \
+                and not before % size:
+            index = text if size == 1 else f"{text} / {size}"
+            if number:
+                index = f"{number} + {index}"
+            if before:
+                index = f"{index} - {before // size}"
+            return self.indexed_text(self.tables, item, index), item.signed, False
+        into = base - item.address
+        if into < 0:
+            return f"TABLE{bits}({item.name}, {text} - 0x{-into:X})", False, False
+        return f"TABLE{bits}({item.name}, {f'0x{into:X}u + ' if into else ''}{text})", False, False
+
+    def table_just_after(self, base):
+        """(table, how many bytes after 'base' it starts) for a table symbols.txt names 1 or 2 bytes after 'base', a
+        place no table or piece of the data starts at: the base the code indexes from where its index starts at 1"""
+        if base in self.data_names or base in self.tables:
+            return None
+        for distance in (1, 2):
+            item = self.tables.get(base + distance)
+            if item is not None and item.name not in self.unnamed_names:
+                return item, distance
+        return None
 
     def add_unnamed(self, items, widths, name_of):
         if items is self.tables:
+            # (a base just before a table symbols.txt names, where the code counts from 1: that table, no other)
+            for address in [address for address in widths
+                            if address not in items and self.table_just_after(address) is not None]:
+                del widths[address]
+
             def name_of(address):
-                return self.data_names.get(address, f"rom_{address - PLACES:06X}")
+                name = self.data_names.get(address, f"rom_{address - PLACES:06X}")
+                self.unnamed_names.add(name)
+                return name
         super().add_unnamed(items, widths, name_of)
 
     def declarations(self):
@@ -202,6 +414,17 @@ class Memory(memory.Memory):
 
 
 class Printer(emit.Printer):
+    def emit(self, node):
+        if isinstance(node, ir.Const) and PLACES <= node.value < PLACES + PROGRAM_SIZE:
+            # a key the decompiler names the program's data by (a table of records the code adds an index to, read
+            # where the pointers' analysis keyed it): the data's name, NAME_ADDRESS, whose value is the CPU's address;
+            # else that address
+            named = self.writer.emitter.address_text(node.value)
+            if named is not None:
+                return cprint.Value(named[0], named[1], True, "u32")
+            return cprint.Value(f"0x{cpu_of_key(node.value):04X}u", cprint.PRIMARY, True, "u32")
+        return super().emit(node)
+
     def helper(self, name, args, bits):
         values = [self.exact(arg).text for arg in args]
         base, _, part = name.partition("_")
@@ -232,9 +455,18 @@ class Writer(emit.FunctionWriter):
         self.printer = Printer(self)
 
     def write(self):
-        global current_bank
+        global current_bank, origin_bank, current_entry
         current_bank = analysis.bank_of(self.function.entry) if isinstance(self.function.entry, int) else None
-        return super().write()
+        current_entry = self.function.entry
+        origin_bank = None
+        try:
+            return super().write()
+        finally:
+            origin_bank = None
+
+    def statement(self, statement):
+        statement_bank(statement)    # (a window address the fixed program reads: in the bank the CPU has there)
+        return super().statement(statement)
 
     def effect(self, statement):
         name = statement.name
@@ -270,9 +502,12 @@ class Writer(emit.FunctionWriter):
     def case_lines(self, pad, key, signed, cases):
         """The lines of a switch on a case key: its subject, then each group of cases"""
         subject = key.args[0] if isinstance(key, ir.Op) and key.name == "case_key" else key
-        text = self.exact(subject)
+        value = self.printer.exact(subject)
+        text = value.text
         if signed:
-            text = f"(int8_t){text}" if subject.bits == 8 else f"(int16_t){text}"
+            # (the cast takes all of the value: (int8_t)(x >> 8), never (int8_t)x >> 8)
+            inner = self.printer.wrap(value, cprint.UNARY)
+            text = f"(int8_t){inner}" if subject.bits == 8 else f"(int16_t){inner}"
         lines = [pad + f"switch ({text})", pad + "{"]
         for values, body in cases:
             for value in sorted(values, key=lambda value: (value - 0x100 if signed and value >= 0x80 else value)
