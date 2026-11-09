@@ -21,6 +21,9 @@ ZERO_1 = ir.Const(0, 1)
 # a branch whose flags none of the comparisons explains reads them as they were set, when what set them
 # reads only temporaries and constants (the Z80's bit shifted out into the carry); the V60's keep them
 DIRECT_FLAGS = False
+# with DIRECT_FLAGS, which flags' definitions a branch reads in their place: a function of the definition (the
+# Konami CPU's: none whose overflow the C would write as a long sum, which a flag variable says better); None, all
+DIRECT_FLAG_DEFINITION = None
 
 FLAGS_READ = {"v": {"ov"}, "nv": {"ov"}, "l": {"cy"}, "nl": {"cy"}, "e": {"z"}, "ne": {"z"},
               "nh": {"cy", "z"}, "h": {"cy", "z"}, "n": {"s"}, "p": {"s"},
@@ -287,6 +290,8 @@ def substituted(condition, defs, used, checked):
     for flag in used:
         reads, memory = reads_of(defs[flag])
         if (reads or memory) and not checked:
+            return None
+        if DIRECT_FLAG_DEFINITION is not None and not DIRECT_FLAG_DEFINITION(defs[flag]):
             return None
     return ir.rebuild(condition, lambda node: defs[node.name] if isinstance(node, ir.Flag) else None)
 

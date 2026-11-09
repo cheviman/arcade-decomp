@@ -100,9 +100,41 @@ def configure():
     dataflow.WORKLIST = True
     knownbits.SIGN_EXTENSIONS = True
     decompiler_emit.WIDENED_INDEXES = False
+    decompiler_emit.NARROW_STORE_PARTS = True
     pairs.PAIRS = {functions.D: (functions.A, functions.B)}
     pairs.BYTES = {functions.A: "a", functions.B: "b"}
     pairs.BIG_ENDIAN = True
+    # (a branch on a flag its own block set reads what the flag was set to where that is no comparison: the bit a
+    # shift put out, LSR then BCC; as the Z80's sound program does; but an overflow stays a flag of its own, which
+    # reads better than the long sum that works it out)
+    conditions.DIRECT_FLAGS = True
+    conditions.DIRECT_FLAG_DEFINITION = lambda definition: not any(
+        isinstance(node, ir.Op) and node.name in ("overflow_add", "overflow_sub") for node in ir.walk(definition))
+
+
+def opposite_comparisons(function):
+    """A branch on an unsigned comparison being false, "x < y == 0" (BCC on the carry of a sum or a difference, read
+    as the flag's definition), as the opposite comparison, "y <= x"; and a byte widened to D and shifted right by its
+    width or more (D's high byte where A is 0, the carry out of its bit 15), as the 0 it is"""
+    def opposite(node):
+        if isinstance(node, ir.Op) and node.name == "eq" and node.args[1] == ir.Const(0, 1):
+            inner = node.args[0]
+            if isinstance(inner, ir.Op) and inner.name in ("ult", "ule"):
+                return ir.op("ule" if inner.name == "ult" else "ult", (inner.args[1], inner.args[0]), 1)
+        return None
+
+    def shifted_out(node):
+        if isinstance(node, ir.Op) and node.name == "shr" and isinstance(node.args[1], ir.Const):
+            value = node.args[0]
+            if isinstance(value, ir.Op) and value.name == "zext" and node.args[1].value >= value.args[0].bits:
+                return ir.Const(0, node.bits)
+        return None
+    for block in function.blocks.values():
+        if isinstance(block.end, ir.Branch):
+            block.end.condition = ir.rebuild(block.end.condition, opposite)
+        for statement in block.statements + [block.end]:
+            ir.map_statement(statement, shifted_out)
+    expressions.simplify_function(function)
 
 
 def load_program(source):
@@ -587,6 +619,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
                            handed)
         expressions.simplify_function(function)
         pairs.tidy_bytes(function, live_after[entry])
+        opposite_comparisons(function)
 
     emit.use_memory_map(known)
     emit.BANK_AT = program.analysis.single_bank    # (the bank the fixed program's code surely has, by instruction)

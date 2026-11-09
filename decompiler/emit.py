@@ -213,6 +213,9 @@ def widened_stride(offset):
 
 # whether switch_index takes an index worked out narrower and widened (widened_stride): the 68000's (m68000/decompile.py)
 WIDENED_INDEXES = False
+# whether a store over several named variables writes 0 to those whose bytes lie above a value widened from fewer bits
+# (the Konami CPU's STD of a byte with A 0: unk_48F0 = 0u, not (uint8_t)(b >> 8u)); off, the shifted value
+NARROW_STORE_PARTS = False
 
 
 def switch_index(value, keys, read32):
@@ -1508,8 +1511,11 @@ class FunctionWriter:
             down = cpu.byte_shift(within, width // 8, count)
             up = cpu.byte_shift(position, statement.bits // 8, count)
             keep = ~(mask << down) & ((1 << width) - 1)
-            if text is None:
-                part = (value.value >> up) & mask
+            # (NARROW_STORE_PARTS: bytes above a value widened from fewer bits are 0)
+            narrow = NARROW_STORE_PARTS and isinstance(value, ir.Op) and value.name == "zext" \
+                and up >= value.args[0].bits
+            if text is None or narrow:
+                part = (value.value >> up) & mask if text is None else 0
                 if whole:
                     literal = cprint.signed_literal(part, width) if signed else cprint.literal(part, width)
                     lines.append(f"{target} = {literal};")

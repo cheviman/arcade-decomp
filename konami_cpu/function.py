@@ -130,6 +130,14 @@ def classify(a, b, r):
 class Canonical(lift.Lifter):
     """lift.Lifter with the flags written as the decompiler's passes read them: the same values"""
 
+    def set_flag(self, name, value):
+        # (bit 0 of a value is its low bit: lift.bit_of shifts by 0)
+        if isinstance(value, ir.Op) and value.name == "trunc" and isinstance(value.args[0], ir.Op) \
+                and value.args[0].name == "shr" and isinstance(value.args[0].args[1], ir.Const) \
+                and value.args[0].args[1].value == 0:
+            value = ir.trunc(value.args[0].args[0], value.bits)
+        super().set_flag(name, value)
+
     def set_flags(self, mask, a, b, r, bits):
         found = classify(a, b, r)
         if found is None:
