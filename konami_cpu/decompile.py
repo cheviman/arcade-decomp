@@ -48,6 +48,7 @@ from pathlib import Path
 
 import game_profile  # noqa: E402  (the game's: its root, its ROM set, its settings)
 from decompile import call_results, fewer_controls, fewer_write_backs, grouped_prototypes  # noqa: E402
+from decompile import name_params_by_use  # noqa: E402
 from decompile import replaced_functions, source_files, twin, write_sources, write_variables  # noqa: E402
 from decompiler import cleanup  # noqa: E402
 from decompiler import conditions  # noqa: E402
@@ -62,6 +63,7 @@ from decompiler import preserved  # noqa: E402
 from decompiler import signatures  # noqa: E402
 from decompiler import stack  # noqa: E402
 from decompiler import structure  # noqa: E402
+from decompiler import variables  # noqa: E402
 from decompiler.function import Block, Function  # noqa: E402
 from decompiler.gotos import GotoError  # noqa: E402
 from v60 import ir  # noqa: E402
@@ -98,6 +100,14 @@ def configure():
     signatures.INITIAL = {}
     dataflow.HANDLER_SLOTS = ()
     dataflow.WORKLIST = True
+    # (the profile's data flow settings, as the 68000's (m68000/decompile.py), off by default: what a function reads
+    # to hand back a register, part by part; a register written with an operation that leaves some of its parts writes
+    # only the others; what a function hands back is what its callers read once everything is known; a web
+    # symbols.txt names twice takes the name of its definition first in the program)
+    dataflow.PASSES_BY_PART = getattr(game_profile, "PASSES_BY_PART", False)
+    dataflow.UNCHANGED_PARTS = getattr(game_profile, "UNCHANGED_PARTS", False)
+    dataflow.NARROW_OUTPUTS = getattr(game_profile, "NARROW_OUTPUTS", False)
+    variables.CHOSEN_IN_ORDER = getattr(game_profile, "CHOSEN_IN_ORDER", False)
     knownbits.SIGN_EXTENSIONS = True
     decompiler_emit.WIDENED_INDEXES = False
     decompiler_emit.NARROW_STORE_PARTS = True
@@ -687,6 +697,12 @@ def write_c(program, out_dir, variables_path=None, trace=False):
         structure.split_loop_entries(function, notes)
     writers = {entry: emit.Writer(emitter, function, live_after[entry], fields[entry], live_at_start[entry])
                for entry, function in built.items()}
+    if decompiler_emit.PARAMS_BY_USE:
+        # (the profile's PARAMS_BY_USE: the parameters and results symbols.txt does not name take the name of what the
+        # function does with them, as the 68000's driver does: the structure read through one, or what the functions
+        # it hands it to, or every caller, call it)
+        name_params_by_use(emitter, writers, lambda entry: emit.Writer(emitter, built[entry], live_after[entry],
+                                                                        fields[entry], live_at_start[entry]))
     texts = {}
     problems = []
     for entry, writer in writers.items():

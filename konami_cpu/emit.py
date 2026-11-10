@@ -47,6 +47,7 @@ from v60 import ir
 import game_profile
 
 from . import analysis
+from . import function as functions
 
 WORK_RAM_AREA = getattr(game_profile, "WORK_RAM_AREA", (0x4000, 0x6000))
 PLACES = 0x100000           # the key the decompiler names the program's data by: PLACES + its place
@@ -137,16 +138,24 @@ def use_memory_map(names):
         "hardware": ["/* the board's registers (read and written through the bus) */"],
     }))
     emit.REGIONS = []
-    emit.OWN_OBJECT_REGISTERS = ()
+    # the register the game's handlers find their object in (the profile's OBJECT_REGISTER, The Simpsons' X: the
+    # object lists' dispatchers hand it, 07CB62 "LDX #$4F80"): a function of a family reads that object's fields by
+    # the family's names (symbols.txt scoped lines); none by default
+    own = getattr(game_profile, "OBJECT_REGISTER", None)
+    numbers = {name: number for number, name in functions.KONAMI.register_names.items()}
+    emit.OWN_OBJECT_REGISTERS = (numbers[own.lower()],) if own else ()
     emit.BOARD_MEMORIES = {WORK_RAM_AREA[0]}
-    emit.NUMBERS_BY_FIELD = False
-    emit.PARAMS_BY_USE = False
-    emit.NAMES_BY_STORES = False
-    emit.PARAMS_FROM_CALLERS = False
-    emit.NAMES_BY_COMPARISONS = False
+    # (the profile's naming settings, as the 68000's (m68000/emit.py), off by default: a constant stored into a field
+    # typed as a number is a number; a parameter or result takes the name of the structure read through it, or of the
+    # variable every caller hands it; a variable stored into, or compared with, one field only takes its name)
+    emit.NUMBERS_BY_FIELD = getattr(game_profile, "NUMBERS_BY_FIELD", False)
+    emit.PARAMS_BY_USE = getattr(game_profile, "PARAMS_BY_USE", False)
+    emit.NAMES_BY_STORES = getattr(game_profile, "NAMES_BY_STORES", False)
+    emit.PARAMS_FROM_CALLERS = getattr(game_profile, "PARAMS_FROM_CALLERS", False)
+    emit.NAMES_BY_COMPARISONS = getattr(game_profile, "NAMES_BY_COMPARISONS", False)
     emit.UNREACHABLE_ENDS = True    # (a function whose every way out of its last block returns says its end is never reached)
     emit.NAMED_CODE_CASES = True
-    emit.INSTANCE_FAMILIES_BY_FUNCTION = {}
+    emit.INSTANCE_FAMILIES_BY_FUNCTION = dict(getattr(game_profile, "INSTANCE_FAMILIES_BY_FUNCTION", {}))
     pointers.STRUCTS = dict(names.structs)
     pointers.PLAYERS = (0, 0, 0)
     pointers.VARIABLES = None
@@ -159,15 +168,21 @@ def use_memory_map(names):
     pointers.POINTER_BITS = 16
     pointers.PAGE_LINKS = False
     pointers.ROM_DATA = (analysis.WINDOW, 0x10000)
-    pointers.ARRAYS = {}
-    pointers.INSTANCES = {}
-    pointers.INSTANCE_FAMILIES = {}
+    # the game's structures that lie one after another at a fixed address (the profile's STRUCT_ARRAYS: name ->
+    # (first, count); The Simpsons' objects), and the family a structure at a fixed address always is
+    # (INSTANCE_FAMILIES); none by default
+    pointers.ARRAYS = dict(getattr(game_profile, "STRUCT_ARRAYS", {}))
+    pointers.INSTANCES = {first + number * names.structs[struct]: (struct, names.structs[struct])
+                          for struct, (first, count) in pointers.ARRAYS.items() for number in range(count)}
+    pointers.INSTANCE_FAMILIES = dict(getattr(game_profile, "INSTANCE_FAMILIES", {}))
     pointers.VARIABLE_BLOCKS = {}
     pointers.BASE_KINDS = {}
     pointers.PAGE_LINK_KINDS = {}
     pointers.NESTED = {}
     pointers.BELOW = {}
-    pointers.OWN_REGISTERS = ()
+    # (the profile's OWN_OBJECT_POINTERS, off by default: the object register is the family's object in the pointer
+    # analysis too, so a family's pointer fields type what is read through them)
+    pointers.OWN_REGISTERS = emit.OWN_OBJECT_REGISTERS if getattr(game_profile, "OWN_OBJECT_POINTERS", False) else ()
     pointers.STRUCT_FUNCTION = "ram"
     pointers.ROM_STRUCTS = set(names.rom_structs)
     pointers.RUNS = set(names.structs)
@@ -193,7 +208,8 @@ def use_memory_map(names):
         for struct, kind in names.arrays.items():
             if names.fields.get((struct, 0), ("",))[0] == "element":
                 names.fields[(struct, 0)] = (struct, kind)
-    pointers.NESTED_FAMILIES = False
+    # (the profile's NESTED_FAMILIES, off by default: a family's view takes the fields of the families its name extends)
+    pointers.NESTED_FAMILIES = getattr(game_profile, "NESTED_FAMILIES", False)
     pointers.SIGNED_OFFSETS = False
     # (the tables of records and what the tables lead to are keyed by place: a constant of the code is the place it
     # names in the bank of the function being walked)
@@ -269,6 +285,10 @@ def wrapped(text):
     return f"({text})"
 
 
+# the accumulators A, B and D: what the program counts and computes in, never an address
+ACCUMULATORS = (functions.A, functions.B, functions.D)
+
+
 class Memory(memory.Memory):
     """The decompiler's memory names, with the tables of the program's data keyed by canonical(): an unnamed table
     is named after its place, and its NAME_ADDRESS is its CPU address. A table read with the CPU's signed index (A,X)
@@ -291,6 +311,8 @@ class Memory(memory.Memory):
                 address = ir.op("add", (ir.Const(parts[0], 32), ir.zext(small, 32)), 32)
             widened.append((address, bits))
         super().__init__(names, widened, data_names)
+        # (the board's registers symbols.txt names: io lines; the others the decompiler names after their address)
+        self.named_hardware = set(names.hardware)
 
     def access(self, address, bits, index_text, indexed=False):
         parts = memory.based(address) if memory.constant_address(address) is None else None
@@ -423,6 +445,13 @@ class Printer(emit.Printer):
             if named is not None:
                 return cprint.Value(named[0], named[1], True, "u32")
             return cprint.Value(f"0x{cpu_of_key(node.value):04X}u", cprint.PRIMARY, True, "u32")
+        family = self.writer.global_family
+        if isinstance(node, ir.Const) and family and id(node) not in self.writer.numbers():
+            # the address of work RAM the function's family names its own way (a scoped global: the scratch bytes
+            # insert_high_score hands on as the new entry's place), by that name
+            item = self.writer.emitter.memory.scoped.get(family, {}).get(node.value)
+            if item is not None:
+                return cprint.Value(f"{item.name}_ADDRESS", cprint.PRIMARY, True, "u32")
         return super().emit(node)
 
     def helper(self, name, args, bits):
@@ -467,6 +496,20 @@ class Writer(emit.FunctionWriter):
     def statement(self, statement):
         statement_bank(statement)    # (a window address the fixed program reads: in the bank the CPU has there)
         return super().statement(statement)
+
+    def numbers(self):
+        """emit.FunctionWriter's, and the constants the function puts in A, B or D, the accumulators, unless it reads or
+        writes memory through that variable: a sound command (LDD #$5A00), an animation and its time (LDD #$8000), a
+        speed (LDD #$FFC0) are numbers whatever address they equal; the pointers are in X, Y and U"""
+        if hasattr(self, "_numbers"):
+            return self._numbers
+        found = super().numbers()
+        pointing = self.address_variables()
+        for block in self.function.blocks.values():
+            for statement in block.statements:
+                if isinstance(statement, ir.SetReg) and statement.index in ACCUMULATORS                         and isinstance(statement.value, ir.Const)                         and self.vars.def_name(statement, statement.index) not in pointing:
+                    found.add(id(statement.value))
+        return found
 
     def effect(self, statement):
         name = statement.name
@@ -545,6 +588,14 @@ class Writer(emit.FunctionWriter):
 
 class Emitter(emit.Emitter):
     """emit.Emitter with nothing of the V60 program's"""
+
+    def address_text(self, value):
+        """emit.Emitter's, but for a register of the board symbols.txt does not name: the 053248 sees its devices from
+        0000 up (VIDEO_00C0), where the program's small numbers are (0xC0, a field's offset 0x3C, a sound 0x1D00), so a
+        constant is such a register only by an io line's name"""
+        if value in self.memory.hardware and value not in getattr(self.memory, "named_hardware", ()):
+            return None
+        return super().address_text(value)
 
     def restores_current(self, entry):
         return None, None

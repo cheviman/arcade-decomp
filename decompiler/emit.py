@@ -3514,6 +3514,9 @@ class Emitter:
         if not hasattr(self, "_globals"):
             found = set(self.names.values()) | set(self.register_names.values()) | set(cprint.UNSIGNED.values())
             found |= set(cprint.SIGNED.values()) | GLOBAL_WORDS
+            # (and the CPU's own register names, which the parameters and the variables still named after a register
+            # take: a field named y would give a local the name a parameter in Y has, the Konami CPU's x, y, d)
+            found |= set(getattr(cpu.current, "variable_names", {}).values())
             for items in (self.memory.variables, self.memory.tables, self.memory.hardware, self.memory.overlays,
                           getattr(self.memory, "board", {})):
                 for item in items.values():

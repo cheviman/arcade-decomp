@@ -27,6 +27,9 @@ SHARED_RAM = (0xE000, 0x10000)
 PROGRAM_ROM = (0x0000, 0xA000)
 BLOCK_FETCHES = True    # a block's z80_block() says its opcode fetches too, which count R up (the game's runtime
                         # keeps R: game_profile.SOUND_BLOCK_FETCHES)
+NUMBER_ARGUMENTS = {}   # {function name: registers} whose constants are numbers (game_profile.SOUND_NUMBER_ARGUMENTS)
+SPLIT_STORES = False    # a store of a constant over several named fields as one assignment each, as the main CPU's C
+                        # writes it (game_profile.SOUND_JOIN_CONSTANT_STORES, whose joined bytes may be two fields)
 
 
 def use_memory_map(names, arrays):
@@ -36,8 +39,10 @@ def use_memory_map(names, arrays):
     import game_profile
     from decompiler import memory
     from decompiler import pointers
-    global BLOCK_FETCHES, SHARED_RAM, PROGRAM_ROM
+    global BLOCK_FETCHES, SHARED_RAM, PROGRAM_ROM, NUMBER_ARGUMENTS, SPLIT_STORES
     BLOCK_FETCHES = getattr(game_profile, "SOUND_BLOCK_FETCHES", True)
+    NUMBER_ARGUMENTS = dict(getattr(game_profile, "SOUND_NUMBER_ARGUMENTS", {}))
+    SPLIT_STORES = getattr(game_profile, "SOUND_JOIN_CONSTANT_STORES", False)
     SHARED_RAM = getattr(game_profile, "SOUND_RAM_AREA", SHARED_RAM)
     PROGRAM_ROM = getattr(game_profile, "SOUND_ROM_AREA", PROGRAM_ROM)
     memory.WORK_RAM = SHARED_RAM
@@ -107,6 +112,10 @@ def use_memory_map(names, arrays):
         emit.OWN_THROUGH_STACK = True
     # (the profile's SOUND_NESTED_FAMILIES, off by default: a family whose name starts with another's takes its fields)
     pointers.NESTED_FAMILIES = getattr(game_profile, "SOUND_NESTED_FAMILIES", False)
+    # (the profile's SOUND_INSTANCE_FAMILIES, none by default: the family a record at a fixed address is in, in the
+    # functions whose names start so, {(address, prefix): family}, as the 68000's INSTANCE_FAMILIES_BY_FUNCTION: The
+    # Simpsons' sound_main sets up the K053260's records, whose chip bytes are the pcm family's)
+    emit.INSTANCE_FAMILIES_BY_FUNCTION = dict(getattr(game_profile, "SOUND_INSTANCE_FAMILIES", {}))
     # the names the 68000's C takes from what the code does (decompiler/emit.py), for the sound program's: the
     # profile's SOUND_PARAMS_BY_USE, SOUND_NAMES_BY_STORES, SOUND_PARAMS_FROM_CALLERS and SOUND_NAMES_BY_COMPARISONS,
     # off by default
@@ -161,10 +170,48 @@ class SoundWriter(emit.FunctionWriter):
         super().__init__(*args, **kwargs)
         self.printer = SoundPrinter(self)
 
+    def numbers(self):
+        """The decompiler's numbers, and with the profile's SOUND_NUMBER_ARGUMENTS ({function name: registers}, none
+        by default) the constants a block sets those registers to before it calls (or jumps to) that function: a
+        pitch is a number whatever data of the program ROM is at that address (The Simpsons' set_pitch)."""
+        found = super().numbers()
+        arguments = NUMBER_ARGUMENTS
+        if not arguments or getattr(self, "_argument_numbers", False):
+            return found
+        self._argument_numbers = True
+        registers = {name: index for index, name in cpu.current.register_names.items()}
+        wanted = {}
+        for entry, name in self.emitter.names.items():
+            if name in arguments:
+                wanted[entry] = {registers[register] for register in arguments[name]}
+        for block in self.function.blocks.values():
+            statements = block.statements + [block.end]
+            for position, statement in enumerate(statements):
+                target = statement.target if isinstance(statement, (ir.Call, ir.TailCall)) else None
+                if target is None or target not in wanted:
+                    continue
+                left = set(wanted[target])
+                for earlier in reversed(statements[:position]):
+                    if isinstance(earlier, ir.SetReg) and earlier.index in left:
+                        left.discard(earlier.index)
+                        value = earlier.value
+                        while isinstance(value, ir.Op) and value.name in ("zext", "sext", "trunc", "fits"):
+                            value = value.args[0]
+                        if isinstance(value, ir.Const):
+                            found.add(id(value))
+                    if not left:
+                        break
+        return found
+
     def statement(self, statement):
         if isinstance(statement, ir.Store):
             target = self.memory(statement.address, statement.bits, id(statement))
             if target is not None and target[2]:
+                if SPLIT_STORES and (target[0].startswith(("AS", "AT")) or self.family_splits(statement)):
+                    # (a constant over two named fields, one assignment each: count = 0x2A, timer = 0x20)
+                    split = self.split_store(statement)
+                    if split is not None:
+                        return split
                 return [self.assignment(target[0], statement, target[1])]
             if target is not None:
                 raise emit.EmitError(f"{self.function.name}: writes the program ROM")

@@ -151,6 +151,53 @@ def part_of(value, part):
     return ir.trunc(ir.op("shr", (value, SHIFT), 16), 8)
 
 
+# whether a pair loaded from a word in memory a byte at a time, or stored to one so, counts as used whole when the
+# splitter weighs splitting it into its bytes (the profile's SOUND_WORDS_IN_MEMORY: decompile_sound.py sets it): the
+# record's pitch read, moved and stored back in HL stays a word; off, every byte written or read counts on its own
+WORDS_IN_MEMORY = False
+
+
+def loaded_byte(statement, pair, part):
+    """The address of the byte memory gives part 'part' of the pair in a partial write of it, or None."""
+    if not (isinstance(statement, ir.SetReg) and statement.index == pair):
+        return None
+    parts, rest, _ = dataflow.partial_write(statement)
+    if parts & {0, 1} != {part}:
+        return None
+    loads = [node for node in ir.walk(rest) if isinstance(node, ir.Load)]
+    return loads[0].address if len(loads) == 1 and loads[0].bits == 8 else None
+
+
+def stored_byte(statement, pair, part):
+    """The address a store of part 'part' of the pair writes, or None."""
+    if not (isinstance(statement, ir.Store) and statement.bits == 8):
+        return None
+    value = statement.value
+    if part == 1:
+        if not (isinstance(value, ir.Op) and value.name in ("trunc", "fits") and isinstance(value.args[0], ir.Op)
+                and value.args[0].name == "shr" and is_const(value.args[0].args[1], 8)):
+            return None
+        value = value.args[0].args[0]
+    elif isinstance(value, ir.Op) and value.name in ("trunc", "fits"):
+        value = value.args[0]
+    else:
+        return None
+    return statement.address if is_pair(value, pair) else None
+
+
+def memory_words(statements, pair):
+    """How many times the statements load the pair's two bytes from a word in memory, low byte then high, one
+    statement after the other, or store them to one so (WORDS_IN_MEMORY)."""
+    found = 0
+    for first, second in zip(statements, statements[1:]):
+        low, high = loaded_byte(first, pair, 0), loaded_byte(second, pair, 1)
+        if low is None or high is None:
+            low, high = stored_byte(first, pair, 0), stored_byte(second, pair, 1)
+        if low is not None and high is not None and next_address(low, high):
+            found += 1
+    return found
+
+
 class Splitter:
     def __init__(self, function, flow, signature):
         self.function = function
@@ -171,6 +218,13 @@ class Splitter:
         writing it from one); an empty set otherwise."""
         written = set()
         halves_used = whole_used = 0
+        if WORDS_IN_MEMORY:
+            # (a pair read from a word in memory a byte at a time, or stored there so, "ld l,(ix+n); ld h,(ix+n+1)",
+            # is a use of it whole: the two halves count as one whole use)
+            for block in self.function.blocks.values():
+                found = memory_words(block.statements, pair)
+                halves_used -= 2 * found
+                whole_used += found
         for block in self.function.blocks.values():
             for statement in block.statements + [block.end]:
                 if isinstance(statement, ir.SetStack) and is_pair(statement.value, pair):
@@ -531,6 +585,12 @@ BIG_ENDIAN = False
 # (the profile's SOUND_TABLE_REGISTERS: decompile_sound.py sets it); off, only (x) and (x + 1), (ix+n) and (ix+n+1)
 SUMS = False
 
+# where two stores in a row of constant bytes at an address and the next are one word stored: None (only the two
+# bytes of one value), or a function of (the function, the first store's address) that says whether a word starts
+# there (the profile's SOUND_JOIN_CONSTANT_STORES: decompile_sound.py gives one that knows the records' fields):
+# "ld hl,$0600; ld (ix+$02),l; ld (ix+$03),h" once HL is known, the record's pitch set to 0600
+JOIN_CONSTANTS = None
+
 
 def sum_terms(node):
     """(the sum of the constants, the other terms sorted) of a 16-bit sum."""
@@ -623,7 +683,7 @@ def tidy_bytes(function, after=None):
                     elif live == {1}:
                         statement.value = in_pair(statement.index, 1, found[0])
             ir.map_statement(statement, tidy_change)
-        block.statements, seconds = joined_stores(block.statements)
+        block.statements, seconds = joined_stores(block.statements, function)
         if after is not None:
             # a store that stands for two: what is live after it is what was live after the second
             for joined, (first, second) in seconds.items():
@@ -645,27 +705,49 @@ def word_of_byte(value, part):
     return None
 
 
-def joined_stores(statements):
+def joined_stores(statements, function=None):
     """Two stores in a row of the low and the high byte of one word at an address and the next ("ld (ix+n),l;
-    ld (ix+n+1),h") as the word stored: z80_write16 writes the two bytes in that order too. Returns the
-    statements and {id of a joined store: the second store it stands for}."""
+    ld (ix+n+1),h") as the word stored: z80_write16 writes the two bytes in that order too. With JOIN_CONSTANTS,
+    where it says a word starts at the first address (a field of a record), also two constant bytes (the word they
+    make), the two bytes of a word read a byte at a time ("ld a,(ix+$3e); ld (ix+$32),a; ld a,(ix+$3f); ld
+    (ix+$33),a": the word read, when the second byte is not the one the first store writes), and two bytes that
+    read no memory (the word they make). Returns the statements and {id of a joined store: the second store it
+    stands for}."""
     found = []
     seconds = {}
     for statement in statements:
         previous = found[-1] if found else None
+        if not (isinstance(statement, ir.Store) and statement.bits == 8 and isinstance(previous, ir.Store)
+                and previous.bits == 8 and next_address(previous.address, statement.address)):
+            found.append(statement)
+            continue
+        word = None
         # (through a pointer only: two variables in a row, or two registers of the RF5C68, stay two)
-        if isinstance(statement, ir.Store) and statement.bits == 8 and isinstance(previous, ir.Store) \
-                and previous.bits == 8 and not isinstance(previous.address, ir.Const) \
-                and next_address(previous.address, statement.address):
+        if not isinstance(previous.address, ir.Const):
             word = word_of_byte(previous.value, 1 if BIG_ENDIAN else 0)
-            if word is not None and word == word_of_byte(statement.value, 0 if BIG_ENDIAN else 1):
-                joined = ir.Store(previous.address, word, 16)
-                if hasattr(previous, "origin"):
-                    joined.origin = previous.origin
-                found[-1] = joined
-                seconds[id(joined)] = (previous, statement)
-                continue
-        found.append(statement)
+            if word is not None and word != word_of_byte(statement.value, 0 if BIG_ENDIAN else 1):
+                word = None
+        if word is None and JOIN_CONSTANTS is not None and JOIN_CONSTANTS(function, previous.address):
+            low, high = (statement.value, previous.value) if BIG_ENDIAN else (previous.value, statement.value)
+            if isinstance(low, ir.Const) and isinstance(high, ir.Const):
+                word = ir.const(((high.value & 0xFF) << 8) | (low.value & 0xFF), 16)
+            elif isinstance(low, ir.Load) and isinstance(high, ir.Load) and low.bits == high.bits == 8 \
+                    and next_address(*((high.address, low.address) if BIG_ENDIAN else (low.address, high.address))) \
+                    and statement.value.address != previous.address and pure(statement.value.address):
+                word = ir.Load(high.address if BIG_ENDIAN else low.address, 16)
+            elif pure(low) and pure(high):
+                shifted = ir.const((high.value & 0xFF) << 8, 16) if isinstance(high, ir.Const) \
+                    else ir.op("shl", (ir.zext(high, 16), ir.const(8, 16)), 16)
+                word = ir.zext(low, 16) if isinstance(high, ir.Const) and not high.value & 0xFF \
+                    else ir.op("or", (shifted, ir.zext(low, 16)), 16)
+        if word is None:
+            found.append(statement)
+            continue
+        joined = ir.Store(previous.address, word, 16)
+        if hasattr(previous, "origin"):
+            joined.origin = previous.origin
+        found[-1] = joined
+        seconds[id(joined)] = (previous, statement)
     return found, seconds
 
 

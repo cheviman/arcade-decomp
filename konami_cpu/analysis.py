@@ -249,6 +249,31 @@ class Analysis:
             cpu = (cpu + instruction.length) & 0xFFFF
         return not strict
 
+    def uses_callers_stack(self, place):
+        """True when the code at 'place' pulls from the stack, or reads or writes through S, before it pushes anything
+        (up to its first branch, jump, call or return): code that runs on a stack its entry did not make, the middle of
+        a routine, which a table read backwards takes for an entry (the stage 7 boss's states took 079423, after
+        07941B's "PUSHS A", which reads it back with "LDA ,S"). Read forwards it is no test: an entry may start by
+        pulling what its dispatcher pushed (with it, the stages' steps lost entries their scripts run, frame 710)"""
+        bank = bank_of(place)
+        cpu = cpu_of(place)
+        for _ in range(TRIAL_INSTRUCTIONS * 2):
+            if place_of(bank, cpu) is None:
+                return False
+            instruction = self.decode(bank, cpu)
+            if instruction.flow == dis.FLOW_INVALID:
+                return False
+            if instruction.mnemonic == "PULLS":
+                return True
+            if instruction.mnemonic == "PUSHS" or instruction.mnemonic == "LEAS":
+                return False
+            if any(operand.mode == "indexed" and operand.reg == "S" for operand in instruction.operands):
+                return True
+            if instruction.flow != dis.FLOW_NORMAL:
+                return False
+            cpu = (cpu + instruction.length) & 0xFFFF
+        return False
+
     def enter(self, place, state=None, kind=None, source="flow"):
         """A block starts at 'place' with the registers and the bank in 'state'"""
         if place is None or not 0 <= place < CODE_END or place >= place_of(None, VECTOR_AREA):
@@ -311,7 +336,8 @@ class Analysis:
 
     def ends_table(self, place, table):
         """Where a table without a described length stops: code, or a place the code names as data (another table's
-        start is none: tables overlap)"""
+        start is none: tables overlap, and a routine's steps run on into the next table's on purpose: the enemy walking
+        to its target, F1FE, goes on with the steps of lining up with it, F202, at its step 2)"""
         return place != table and (place in self.instructions or place in self.code_starts
                                    or (place in self.data_starts and place not in self.table_starts))
 
@@ -369,7 +395,7 @@ class Analysis:
                             or (index < 0 and any(place in self.code_behind
                                                   for place in range(record_place, record_place + length))) \
                             or target is None or target >= place_of(None, VECTOR_AREA) or target in self.bad_entries \
-                            or not self.clean(target, strict=index < 0):
+                            or not self.clean(target, strict=index < 0)                             or (index < 0 and self.uses_callers_stack(target)):
                         break
                     low, high = self.table_spans.get(table, (table, table))
                     self.table_spans[table] = (min(low, record_place), max(high, record_place + length))

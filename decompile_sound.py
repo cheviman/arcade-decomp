@@ -89,7 +89,11 @@ REGISTERS = {name: index for index, name in cpu.Z80.register_names.items()}    #
 
 def code_values(program):
     """Addresses of the program's functions it loads into a register pair as values (ld hl, nn): the handlers it
-    stores in its channels' records and compares (0, the reset's, is a zero)"""
+    stores in its channels' records and compares (0, the reset's, is a zero). With the profile's
+    SOUND_HANDLER_SETTERS (none by default: every such load), only the loads whose next instruction calls or jumps
+    to one of those routines, or that run into one (The Simpsons' "ld hl,HANDLER; jp $0C33"): a pitch or a count
+    that happens to be a function's address (ld bc,$1000, a delay; ld hl,$1208, a pitch) stays a number"""
+    setters = getattr(game_profile, "SOUND_HANDLER_SETTERS", None)
     found = set()
     for body in program.bodies.values():
         for instruction in body.values():
@@ -98,6 +102,12 @@ def code_values(program):
             to, source = instruction.operands
             if to.mode == "reg" and to.reg in ("bc", "de", "hl", "ix", "iy") and source.mode == "immediate" \
                     and source.value in program.entries and source.value:
+                if setters is not None:
+                    after = instruction.address + instruction.length
+                    following = body.get(after)
+                    if after not in setters and (following is None or following.mnemonic not in ("call", "jp")
+                                                 or following.target not in setters):
+                        continue
                 found.add(source.value)
     return found
 
@@ -290,7 +300,10 @@ def write_c(program, out_dir, variables_path=None):
     for entry, function_name in names.items():
         if not IDENTIFIER.match(function_name):
             raise SystemExit(f"{entry:04X}: '{function_name}' cannot be a C function name")
-    # a pair the function writes a byte at a time: its bytes as variables of their own
+    # a pair the function writes a byte at a time: its bytes as variables of their own (with the profile's
+    # SOUND_WORDS_IN_MEMORY, off by default, a pair a word in memory is loaded into or stored from a byte at a time is
+    # used whole there: z80/pairs.py)
+    pairs.WORDS_IN_MEMORY = getattr(game_profile, "SOUND_WORDS_IN_MEMORY", False)
     for entry, function in built.items():
         pairs.split(function, flow, found[entry])
 
@@ -311,6 +324,9 @@ def write_c(program, out_dir, variables_path=None):
     table_registers = getattr(game_profile, "SOUND_TABLE_REGISTERS", False)
     tables = set(disassemble.load_names(SYMBOLS, REGISTERS).tables) if table_registers else set()
     pairs.SUMS = table_registers    # (the two bytes of an entry read so are one word: z80/pairs.py)
+    # (the profile's SOUND_JOIN_CONSTANT_STORES, off by default: two constant bytes stored at a word of the structure
+    # the object register points at, by sound_symbols.txt's fields, are the word stored, z80/pairs.py)
+    pairs.JOIN_CONSTANTS = word_fields(program) if getattr(game_profile, "SOUND_JOIN_CONSTANT_STORES", False) else None
     names_before = getattr(game_profile, "SOUND_NAMES_BEFORE_TABLES", 0)
     # (the profile's SOUND_CONSTANT_ADDRESSES, off by default: an access through a register that holds the same address
     # of the RAM on every way to it reads that address, expressions.constant_addresses: "ld hl,VARIABLE; dec (hl)" and
@@ -518,7 +534,7 @@ def write_c(program, out_dir, variables_path=None):
     prototypes = grouped_prototypes(files, lambda entry: emitter.prototype(entry) + (
         ";\n" + emitter.definition(entry) if names[entry] in emitter.replaced else ""))
     ports = emitter.port_declarations()
-    (out_dir / "sound.h").write_text(
+    header = (
         file_header("sound.h", "the sound program's ports, variables, tables, structures and functions")
         + f"#ifndef {game_profile.GUARD}_SOUND_H\n#define {game_profile.GUARD}_SOUND_H\n\n"
         + "#include \"sound/support.h\"\n\n"
@@ -538,14 +554,22 @@ def write_c(program, out_dir, variables_path=None):
            if emitter.constants else "")
         + "\n\n/* the sound program's structures in the shared RAM */\n"
         + "\n".join(emitter.layouts.declarations()) + "\n\n"
-        + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
-    write_sources(out_dir, files, texts, "sound.h", header=file_header)
+        + "\n".join(prototypes) + "\n\n#endif\n")
     loaded = named.loaded_tables()
     if getattr(game_profile, "SOUND_TABLES_USED_ONLY", False):
         # (only the tables the C reads: a number that is an address of the ROM, ld bc,$0007 a count, names none the
-        # board would have to load)
-        used = "\n".join(texts.values())    # (the functions' C)
+        # board would have to load; nor does a comment that names one)
+        used = re.sub(r"/\*.*?\*/", "", "\n".join(texts.values()), flags=re.S)    # (the functions' C)
         loaded = [(address, name) for address, name in loaded if re.search(rf"\b{re.escape(name)}\b", used)]
+        # (and sound.h declares the pointers of those only: a table the C names by its address alone, NAME_ADDRESS,
+        # such as a patch it hands load_patch, keeps that define, not a pointer no board sets)
+        unused = {name for name in re.findall(r"^extern const void \*(\w+)_data;$", header, re.M)
+                  if not re.search(rf"\b{re.escape(name)}\b", used)}
+        header = "\n".join(line for line in header.split("\n")
+                           if not (re.fullmatch(r"extern const void \*\w+_data;", line) and line[19:-6] in unused)
+                           and not (line.startswith("#define ") and line.split()[1] in unused))
+    (out_dir / "sound.h").write_text(header, encoding="ascii")
+    write_sources(out_dir, files, texts, "sound.h", header=file_header)
     if loaded or signatures.CONTEXT:
         (out_dir / "tables.c").write_text(
             file_header("tables.c", "the tables the sound program reads by name, which the board sets"
@@ -563,6 +587,60 @@ def write_c(program, out_dir, variables_path=None):
     print(f"branches:   {flow.conditions_recovered} now compare values instead of flags")
     print(f"gotos:      {gotos}")
     return 0
+
+
+def word_fields(program):
+    """For SOUND_JOIN_CONSTANT_STORES: a function of (function, address) true when the address is the object register
+    (game_profile.SOUND_OBJECT_REGISTER) plus the offset of a 16-bit field of SOUND_FAMILY_STRUCT, as that function
+    sees the structure: its families' scoped fields (sound_symbols.txt), the nearest first, then the structure's."""
+    known = disassemble.load_names(SYMBOLS, REGISTERS)
+    struct = getattr(game_profile, "SOUND_FAMILY_STRUCT", None)
+    register = REGISTERS.get(getattr(game_profile, "SOUND_OBJECT_REGISTER", ""))
+    generic = {offset: int(kind[1:]) for (name, offset), (_, kind) in known.fields.items() if name == struct}
+    families = {family: {offset: int(kind[1:]) for offset, (_, kind) in fields.items()}
+                for (name, family), fields in known.scoped.items() if name == struct}
+    views = {}
+
+    first, count = load_arrays(SYMBOLS).get(struct, (0, 0))
+    size = known.structs.get(struct, 0)
+    instances = getattr(game_profile, "SOUND_INSTANCE_FAMILIES", {})
+
+    def view(name, own=True, family_of_instance=None):
+        """The view's {offset: bits}: the families of function 'name' (own) or the instance's family, then the
+        structure's fields (a wider field first where two start at one place)"""
+        key = (name, own, family_of_instance)
+        if key not in views:
+            found = []    # (start, bits), the nearest family's first
+            chosen = [family for family in families if name == family or name.startswith(family + "_")] if own \
+                else [family for family in families if family_of_instance is not None
+                      and (family_of_instance == family or family_of_instance.startswith(family + "_"))]
+            for fields in [families[family] for family in sorted(chosen, key=len, reverse=True)] + [generic]:
+                for offset, bits in sorted(fields.items(), key=lambda item: (item[0], -item[1])):
+                    if not any(start <= offset < start + width // 8 or offset <= start < offset + bits // 8
+                               for start, width in found):
+                        found.append((offset, bits))
+            views[key] = dict(found)
+        return views[key]
+
+    def word_at(function, address):
+        if function is None or register is None:
+            return False
+        name = program.names.get(function.entry, "")
+        if isinstance(address, ir.Const) and size and first <= address.value < first + count * size:
+            # (a record at its own address: its fields, or those of the family it is in this function's)
+            base = first + (address.value - first) // size * size
+            family = next((family for (place, prefix), family in instances.items()
+                           if place == base and (name == prefix or name.startswith(prefix + "_"))), None)
+            return view(name, False, family).get(address.value - base) == 16
+        if isinstance(address, ir.Reg):
+            base, offset = address, 0
+        elif isinstance(address, ir.Op) and address.name == "add" and isinstance(address.args[0], ir.Reg) \
+                and isinstance(address.args[1], ir.Const):
+            base, offset = address.args[0], address.args[1].value
+        else:
+            return False
+        return base.index == register and view(name).get(offset) == 16
+    return word_at
 
 
 def context_type(index):
