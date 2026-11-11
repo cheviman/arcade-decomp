@@ -6,7 +6,7 @@ Description: decompiles a Konami CPU program (the 053248's, banked) into readabl
              function
 Version:     0.1.0
 Created:     06-11-2026
-Modified:    07-11-2026
+Modified:    11-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--checks] [--trace] [--out DIR] [--symbols FILE]
@@ -528,11 +528,12 @@ def keyed_names(known):
 
 
 def piece_names():
-    """{key: name} of the pieces of the program's data the assets hold (assets/data/layout.txt)"""
+    """{key: name} of the pieces of the program's data the assets hold (assets/data/layout.txt): the names the tables
+    the C reads take, so without the file there is no C"""
     layout = ROOT / "assets" / "data" / "layout.txt"
     found = {}
     if not layout.exists():
-        return found
+        raise SystemExit(f"{layout} is not there: the C reads the program's data by the names of the assets' pieces")
     for line in layout.read_text(encoding="ascii").splitlines():
         parts = line.split()
         if len(parts) >= 2 and not line.startswith("#") and IDENTIFIER.match(parts[0]):
@@ -894,7 +895,13 @@ def write_c(program, out_dir, variables_path=None, trace=False):
         + "#include \"game/support.h\"\n#include \"ram.h\"\n\n" + carried_text
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
     layouts = cpu_addresses(emitter.layouts.declarations())
-    declared = set(re.findall(r"^#define (\w+)_ADDRESS ", "\n".join(named.declarations() + layouts), re.M))
+    # (a place of the work RAM named after its address that no function's C uses any more, now read as a routine's
+    # variable or an object's field, is no declaration of ram.h)
+    used = set(re.findall(r"\bunk_[0-9A-F]+\b", "\n".join(texts.values())))
+    declarations = [line for line in named.declarations()
+                    if not (re.match(r"#define (unk_[0-9A-F]+)(?:_ADDRESS)? ", line)
+                            and re.match(r"#define (unk_[0-9A-F]+)", line).group(1) not in used)]
+    declared = set(re.findall(r"^#define (\w+)_ADDRESS ", "\n".join(declarations + layouts), re.M))
     labels = [f"#define {name}_ADDRESS 0x{emit.cpu_of_key(key):04X}u    /* {key - emit.PLACES:06X} */"
               for key, name in sorted(emitter.data_labels.items())
               if emit.PLACES <= key < emit.PLACES + emit.PROGRAM_SIZE and name not in declared]
@@ -903,7 +910,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     (out_dir / "ram.h").write_text(
         file_header("ram.h", "the game's variables, tables, board registers and structures")
         + f"#ifndef {guard}_RAM_H\n#define {guard}_RAM_H\n\n"
-        + "\n".join(named.declarations()) + "\n\n/* data of the program symbols.txt and the assets label (their CPU "
+        + "\n".join(declarations) + "\n\n/* data of the program symbols.txt and the assets label (their CPU "
         "addresses) */\n" + "\n".join(labels) + "\n\n/* numbers the code uses, by name (symbols.txt constant lines) */\n"
         + "\n".join(numbers) + "\n\n/* the game's structures */\n"
         + "\n".join(layouts) + "\n\n#endif\n", encoding="ascii")
@@ -980,6 +987,8 @@ def main(arguments):
     tracing = "--trace" in arguments
     arguments = [argument for argument in arguments if argument not in ("--check", "--checks", "--trace")]
     configure()
+    if not checking:
+        piece_names()    # (before the analysis: without the assets' pieces there is no C to write)
     started = time.time()
     program = load_program(Path(arguments[0]) if arguments else ROOT / "rom")
     print(f"analysis:   {len(program.entries)} functions, {time.time() - started:.0f} s")

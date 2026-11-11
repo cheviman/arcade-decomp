@@ -1,25 +1,35 @@
-The files in this directory are copied from MAME (https://github.com/mamedev/mame). They are
-only built into development tools (the reference, system32/reference/), never into a game.
+The files in this directory are copied from MAME 0.289 (https://github.com/mamedev/mame). They are
+only built into development tools (the reference of Konami's boards, konami/reference/: kref and the
+oracles), never into a game. The Z80 core the reference runs is the one in system32/reference/mame/z80/
+(its own LICENSE); the YM2151 is ymfm's (konami/reference/ymfm/, its own LICENSE).
 
-- src/devices/cpu/v60/ (here at the top): the NEC V60 CPU core (v60.cpp, v60.h, *.hxx) and its
-  disassembler (v60d.cpp, v60d.h); copyright Farfetch'd, R. Belmont. arcade-decomp's v60/disassembler.py
-  is a Python port of v60d.cpp.
-- src/mame/sega/segas32_v.cpp (sega/): the System 32 and Multi 32 video; copyright Aaron Giles.
-  The games' runtime/src/video.c follows its behavior. One line is changed, marked "segasonic": draw_one_sprite
-  clipped a horizontally flipped sprite against the clip's right edge instead of its left one, so an
-  opaque flipped sprite ran on to the left edge drawing what follows it in the sprite ROM.
-- src/devices/cpu/z80/ (z80/): the Z80 CPU core (z80.cpp, z80.h, z80.inc, z80.lst, from which
-  z80make.py writes the core's steps at build time; copyright Juergen Buchmueller, z80make.py Andre I.
-  Holub) and its disassembler (z80dasm.cpp, z80dasm.h; copyright Juergen Buchmueller).
-  arcade-decomp's z80/disassembler.py is a Python port of z80dasm.cpp.
-- src/devices/sound/multipcm.cpp, multipcm.h, gew.cpp and gew.h (sound/): the Yamaha YMW-258-F
-  (Sega 315-5560, the MultiPCM) on the GEW sample player it shares with its family; copyright Miguel
-  Angel Horna.
+- src/devices/cpu/m68000/ (m68000/): the Motorola 68000 CPU core (m68000.cpp, m68000.h, m68kcommon.cpp,
+  m68kcommon.h, and m68000.lst, from which m68000gen.py writes the core's steps at build time; copyright
+  Olivier Galibert) and its disassembler (m68kdasm.cpp, m68kdasm.h; copyright Karl Stenerud).
+  arcade-decomp's m68000/disassembler.py is a Python port of m68kdasm.cpp.
+- src/devices/cpu/m6809/ (m6809/): the 6809 CPU core and Konami's CPU on it, the 052001 and 053248
+  (m6809.cpp, m6809.h, m6809inl.h, konami.cpp, konami.h, and base6x09.lst, m6809.lst and konami.lst, from
+  which m6809make.py writes the cores' steps at build time; copyright Nathan Woods, m6809make.py Olivier
+  Galibert) and their disassembler (6x09dasm.cpp, 6x09dasm.h; copyright Nathan Woods, Sean Riddle, Tim
+  Lindner). arcade-decomp's konami_cpu/disassembler.py is a Python port of 6x09dasm.cpp's
+  konami_disassembler.
+- src/mame/konami/ (konami/): the tile chip K052109 and the sprite chip K051960 (copyright Fabio
+  Priuli, Acho A. Tang, R. Belmont), the sprite chips K053246/K053247 (k053246_k053247_k055673.cpp, .h)
+  and konami_helper (copyright David Haywood), the priority encoder K053251 (copyright Fabio Priuli, Acho
+  A. Tang, R. Belmont), konamipt.h (copyright Manuel Abadia), and the drivers tmnt.cpp (copyright Nicola
+  Salmoria) and simpsons.cpp (copyright Ernesto Corvi).
+- src/devices/sound/ (sound/): the K007232 (copyright Nicola Salmoria, Hiromitsu Shioya), the uPD7759
+  (copyright Juergen Buchmueller, Mike Balfour, Howie Cohen, Olivier Galibert, Aaron Giles), the K053260
+  (copyright Ernesto Corvi, Alex W. Jackson) and ymopm.cpp, .h, MAME's device for ymfm's YM2151
+  (copyright Aaron Giles).
+- src/devices/machine/eeprom.cpp, eeprom.h, eepromser.cpp and eepromser.h (machine/): the serial EEPROMs
+  (the ER5911 among them); copyright Aaron Giles.
+- src/emu/drawgfx.cpp, drawgfx.h, drawgfxt.ipp (copyright Nicola Salmoria, Aaron Giles), tilemap.cpp and
+  tilemap.h (emu/), and src/lib/util/bitmap.cpp, bitmap.h, palette.cpp and palette.h (util/): the
+  graphics MAME's video chips draw with; copyright Aaron Giles where not said.
 
-The games' runtime/src/machine.c, io.c, sound.c and video.c follow the behavior of MAME's System 32 and Multi 32
-driver (src/mame/sega/segas32.cpp, segas32_m.cpp; copyright Aaron Giles), its link board
-(src/mame/sega/s32comm.cpp; copyright Ariane Fugmann) and A/D converter (src/devices/machine/msm6253.cpp;
-copyright AJR) under the same terms.
+The games' runtime/src/ (the board's memory map, its video and its sound chips) follow the behavior of these
+files and of the drivers here under the same terms.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are
