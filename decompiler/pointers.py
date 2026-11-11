@@ -83,6 +83,8 @@ GLOBAL_FAMILY = None          # the family whose own names of the work RAM the f
 CONTEXT_KINDS = {}
 OBJECT_REGISTERS = ()      # what the game keeps here it reads as objects, wherever it put them
 OWN_REGISTERS = ()         # what points at the object a function runs on when it starts (the object loop's)
+HINTS_OVER_FAMILY = False  # a parameter's type of a family in symbols.txt wins over the function's family on an own
+                           # register (Simpsons: player_struggle runs on the player in U, its holder in X); emit too
 HANDLER_FIELD = None  # where an object keeps the code the object loop runs for it: set to a function of a
                                # family, the object is that family's
 # blocks of the work RAM the object registers walk as variables, not as objects: start -> size (the test
@@ -1464,11 +1466,14 @@ class Program:
         state = {index: kind for index, kind in CONTEXT_KINDS.items()
                  if told.get(index) != CONFLICT or index in OBJECT_REGISTERS}
         state.update(known(told))
-        state.update(self.hints.get(entry, {}))
+        hinted = self.hints.get(entry, {})
+        state.update(hinted)
         own = self.families.get(entry)
         if own is not None:
             # the object the function runs on is its family's, whatever its callers say
             for index in OWN_REGISTERS:
+                if HINTS_OVER_FAMILY and family_of(hinted.get(index)) is not None:
+                    continue
                 kind = state.get(index)
                 if kind is not None and kind[:2] == ("object", 0):
                     state[index] = ("object", 0, own)

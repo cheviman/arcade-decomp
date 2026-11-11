@@ -216,6 +216,10 @@ WIDENED_INDEXES = False
 # whether a store over several named variables writes 0 to those whose bytes lie above a value widened from fewer bits
 # (the Konami CPU's STD of a byte with A 0: unk_48F0 = 0u, not (uint8_t)(b >> 8u)); off, the shifted value
 NARROW_STORE_PARTS = False
+# whether a call whose flag nothing reads after it is written as the call alone, as one whose register nothing reads
+# is (the Konami CPU's sound queue hands back its carry, which 337 callers drop: queue_sound(command), not carry =
+# queue_sound(command)); off, the flag is assigned
+DEAD_FLAG_RESULTS = False
 
 
 def switch_index(value, keys, read32):
@@ -1937,7 +1941,13 @@ class FunctionWriter:
         object loop's (OWN_OBJECT_REGISTERS: R20 and R23 on the V60) when the function starts, and copies of
         them."""
         blocks = self.function.blocks
-        start = {self.function.entry: frozenset(OWN_OBJECT_REGISTERS)}
+        own = set(OWN_OBJECT_REGISTERS)
+        if pointers.HINTS_OVER_FAMILY:
+            # (a parameter symbols.txt says points at another family's object is not the function's object)
+            for index, kind in self.emitter.param_kinds.get(self.function.entry, {}).items():
+                if pointers.family_of(kind) not in (None, self.family):
+                    own.discard(index)
+        start = {self.function.entry: frozenset(own)}
         pending = [self.function.entry]
         before = {}
         while pending:
@@ -2912,6 +2922,14 @@ class FunctionWriter:
         if returned[0] == "r" and isinstance(self.current, ir.TailCall) \
                 and returned[1] not in self.end_registers(ir.Return()):
             return f"{call};"    # a tail call whose value this function does not hand back
+        if DEAD_FLAG_RESULTS and returned[0] == "f":
+            if isinstance(self.current, ir.Call):
+                live = self.after.get(id(self.current))
+                if live is not None and not any(variable[0] == "f" and variable[1] == returned[1] for variable in live):
+                    return f"{call};"    # nothing reads the flag it hands back
+            elif isinstance(self.current, ir.TailCall) and returned not in self.results \
+                    and returned != self.returned:
+                return f"{call};"    # a tail call whose flag this function does not hand back
         target_name = self.register_set(returned[1]) if returned[0] == "r" else self.use(returned)
         return f"{target_name} = {call};"
 
@@ -3229,6 +3247,7 @@ class Emitter:
         self.register_names = {}    # context register -> its name (symbols.txt)
         self.param_widths = {}      # entry -> {register: width of the parameter} (FunctionWriter)
         self.param_pointers = {}    # entry -> the registers symbols.txt says it takes pointers to a structure in
+        self.param_kinds = {}       # entry -> {register: the pointer kind symbols.txt gives it} (HINTS_OVER_FAMILY)
         self.result_bits = {}       # entry -> bits of the register it returns, where narrower (cleanup.RESULT_BITS)
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
         self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS

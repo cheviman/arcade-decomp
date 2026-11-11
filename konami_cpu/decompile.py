@@ -125,6 +125,7 @@ def configure():
     knownbits.SIGN_EXTENSIONS = True
     decompiler_emit.WIDENED_INDEXES = False
     decompiler_emit.NARROW_STORE_PARTS = True
+    decompiler_emit.DEAD_FLAG_RESULTS = True    # (a call's carry nothing reads: the call alone)
     pairs.PAIRS = {functions.D: (functions.A, functions.B)}
     pairs.BYTES = {functions.A: "a", functions.B: "b"}
     pairs.BIG_ENDIAN = True
@@ -646,6 +647,19 @@ def write_index(out_dir, program, built, names, entries, files):
     (out_dir / "index.txt").write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
+def keep_alive(alive, function):
+    """Every statement and node of 'function' into 'alive', so that none is freed while the C is written: the passes'
+    notes are keyed by the id() of statements and nodes (the live variables after each statement, the fields the
+    pointers' analysis types), and CPython gives a new object the id of a freed one, which then took that one's note
+    (a direct page variable read as a field of an object through a register no variable holds, as it fell in a run's
+    memory: check_structure's player_run, OBJECT(u + 0x60u)->flags for players_playing)"""
+    for block in function.blocks.values():
+        for statement in block.statements + [block.end]:
+            alive.append(statement)
+            for expression in ir.statement_expressions(statement):
+                alive.extend(ir.walk(expression))
+
+
 def write_c(program, out_dir, variables_path=None, trace=False):
     built, failures, unfollowed = settle(program)
     if failures:
@@ -688,20 +702,30 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     whole = set()
     live_after = {}
     live_at_start = {}
+    alive = []    # (keep_alive: every statement and node the notes are keyed by, until the C is written)
     for entry, function in built.items():
+        keep_alive(alive, function)
         expressions.drop_repacks(function, flow)
+        keep_alive(alive, function)
         after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
+        keep_alive(alive, function)
         expressions.tidy(function, flow, after, whole)
+        keep_alive(alive, function)
         results_of_calls = call_results(function, found, flow)
         if expressions.propagate_constants(function, results_of_calls, signatures.CONTEXT) \
                 | expressions.fold_kept_constants(function, results_of_calls, signatures.CONTEXT):
             after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
             expressions.tidy(function, flow, after, whole)
+        keep_alive(alive, function)
         if functions.narrow_cases(function):
             after, start = cleanup.eliminate(flow, function, found[entry].results, signatures.CONTEXT, arguments)
+            keep_alive(alive, function)
             expressions.tidy(function, flow, after, whole)
+        keep_alive(alive, function)
         if expressions.inline_registers(function, flow, after, whole):
+            keep_alive(alive, function)
             expressions.simplify_function(function)
+        keep_alive(alive, function)
         live_after[entry] = after
         live_at_start[entry] = start
     results_of_calls = {entry: call_results(function, found, flow) for entry, function in built.items()}
@@ -742,6 +766,8 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     typing = pointers.Program(built, flow, found, results_of_calls, signatures.CONTEXT, known.targets, hints,
                               site_hints)
     fields, accesses_typed = typing.run()
+    for function in built.values():
+        keep_alive(alive, function)
     emit.current_bank = None    # (pointers.ENTERING set it function by function)
 
     always = {entry: set(summary.always) for entry, summary in flow.summaries.items()}
@@ -752,6 +778,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     emitter.reroll_statements = True
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
     emitter.param_pointers = {entry: set(kinds) for entry, kinds in hints.items()}
+    emitter.param_kinds = hints
     emitter.flow = flow
     emitter.result_bits = dict(cleanup.RESULT_BITS)
     emitter.code_addresses = {}

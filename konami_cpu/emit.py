@@ -183,6 +183,7 @@ def use_memory_map(names):
     # (the profile's OWN_OBJECT_POINTERS, off by default: the object register is the family's object in the pointer
     # analysis too, so a family's pointer fields type what is read through them)
     pointers.OWN_REGISTERS = emit.OWN_OBJECT_REGISTERS if getattr(game_profile, "OWN_OBJECT_POINTERS", False) else ()
+    pointers.HINTS_OVER_FAMILY = True    # (a param line's type over the function's family: the holder in X)
     pointers.STRUCT_FUNCTION = "ram"
     pointers.ROM_STRUCTS = set(names.rom_structs)
     pointers.RUNS = set(names.structs)
