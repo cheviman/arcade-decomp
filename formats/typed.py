@@ -4,7 +4,7 @@ Description: the program ROM's tables as symbols.txt types them: one record a li
              names the columns, numbers as numbers and addresses as the names of what they reach
 Version:     0.1.0
 Created:     27-10-2026
-Modified:    06-11-2026
+Modified:    11-11-2026
 Author:      Sebastian Toyos
 
 A piece symbols.txt gives a type (a 'table NAME TYPE' line, or a table of records the code reads by index)
@@ -35,7 +35,9 @@ VALUE_TYPES = {"u8": "B", "s8": "b", "u16": "H", "s16": "h", "u32": "I", "s32": 
 # rgb555 and rgb555alt, a 16-bit colour as #RRGGBB (five bits a component, scaled to eight) and a '+' when
 # bit 15 is set: as the palette RAM holds it (blue, green and red from bit 10 down) or in the palette
 # window's alternate format (the low bit of blue, green and red in bits 14-12, the rest 4:4:4)
-SIZES = {"u8": 1, "s8": 1, "u16": 2, "s16": 2, "u24": 3, "u32": 4, "s32": 4, "rgb555": 2, "rgb555alt": 2}
+# b16, a 16-bit value in a stream the code reads a byte at a time (a text's cell before its characters): the
+# game holds it as its two bytes, the low one first, whatever order its processor keeps a halfword in
+SIZES = {"u8": 1, "s8": 1, "u16": 2, "s16": 2, "b16": 2, "u24": 3, "u32": 4, "s32": 4, "rgb555": 2, "rgb555alt": 2}
 COLUMN_TYPES = set(SIZES) | {"text"}
 SENTINELS = (0, 0xFFFFFFFF)     # values a column of addresses holds besides them: none, an end
 LOWEST_ADDRESS = 0x400          # below it, a value is a number (the vectors are no data the tables point at)
@@ -562,7 +564,8 @@ def pointed_segments(places, region, base, kept=(), records=()):
     [(offset, type, bytes)]}, the rest of the piece as its own type. A record takes its size; an array of
     values, and a record whose array goes on past it, up to what comes next. A table of addresses ends where
     the first of the records it points at in its own piece starts (the records after a table of their
-    addresses: sprite_list_switches'), and what a record points at is followed the same way; 'records' ([(address,
+    addresses: sprite_list_switches'), and what a record points at is followed the same way, as are the records
+    that follow it and those of a list that follows it; 'records' ([(address,
     structure)]) are records a piece of another format holds (a format's own walk read them), whose pointers
     are followed too."""
     _load()
@@ -602,10 +605,32 @@ def pointed_segments(places, region, base, kept=(), records=()):
         pointed = _TARGETS.get((kind, _LAYOUTS[kind][0]))
         return (pointed, SIZES[_FLEXIBLE[kind]]) if pointed and _FLEXIBLE[kind] in ("u32", "s32") else None
 
-    def has_pointers(kind):
+    def following_records(kind):
+        """(the records with pointers that follow a record of 'kind', how many bytes after it the first one
+        starts, the structure of the record they follow, how many bytes after 'kind's record that one starts),
+        or None: its own records (field NAME STRUCT[]), or those of the list that follows it, past the list's
+        own record (a road_palette_record, then a palette_fade_list's length, then its fades)"""
+        skipped, seen, before, before_at = 0, {kind}, kind, 0
         records = _FLEXIBLE.get(kind)
-        return bool(_pointed(kind, None)[0]) or array_of(kind) is not None or \
-            (records in _LAYOUTS and bool(_pointed(records, None)[0]))
+        while records in _LAYOUTS and records not in seen:
+            if _pointed(records, None)[0]:
+                return records, skipped + _LAYOUTS[kind][0], before, before_at
+            seen.add(records)
+            before, before_at = records, skipped + _LAYOUTS[kind][0]
+            skipped += _LAYOUTS[records][0]
+            records = _FLEXIBLE.get(records)
+        return None
+
+    def list_length(kind, address):
+        """How many bytes of records follow the record of 'kind' at 'address', when it says so (an unsigned
+        column named length: palette_fade_list's, palette_block_list's); else None"""
+        for name, offset, column_kind in _LAYOUTS[kind][1]:
+            if name == "length" and column_kind in ("u16", "u32"):
+                return struct.unpack_from("<" + VALUE_TYPES[column_kind], region, address + offset - base)[0]
+        return None
+
+    def has_pointers(kind):
+        return bool(_pointed(kind, None)[0]) or array_of(kind) is not None or following_records(kind) is not None
 
     def lay(target, pointed, array=False):
         """Lays 'pointed' out at 'target' (an array of its records, up to what comes next, for 'array'),
@@ -660,12 +685,18 @@ def pointed_segments(places, region, base, kept=(), records=()):
                         end = min(end, target)
                     follow(target, pointed)
                 number += 1
-        records = _FLEXIBLE.get(kind) if kind in _FLEXIBLE and _FLEXIBLE[kind] in _LAYOUTS else None
-        if records is not None and _pointed(records, None)[0]:
-            # the records that follow it, each one's pointers, up to the first that points nowhere
+        following = following_records(kind)
+        if following is not None:
+            # the records that follow it, each one's pointers: as many bytes of them as the record they follow
+            # says (its length), else up to the first that points nowhere
+            records, first, before, before_at = following
             record_size = _LAYOUTS[records][0]
-            at = address + _LAYOUTS[kind][0]
-            while at + record_size <= holder[1]:
+            at = address + first
+            end = holder[1]
+            length = list_length(before, address + before_at) if address + first <= end else None
+            if length is not None:
+                end = min(end, at + length // record_size * record_size)
+            while at + record_size <= end:
                 found = False
                 for offset, pointed in _pointed(records, None)[0]:
                     target = target_of(struct.unpack_from("<I", region, at + offset - base)[0])
@@ -673,7 +704,7 @@ def pointed_segments(places, region, base, kept=(), records=()):
                         continue
                     found = True
                     follow(target, pointed)
-                if not found:
+                if not found and length is None:
                     break
                 at += record_size
         array = array_of(kind)
