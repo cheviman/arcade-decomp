@@ -131,7 +131,7 @@ def parse_layout(attributes, where):
 
 
 NAME_KINDS = ("var", "io", "table", "struct", "field", "register", "scoped", "param", "result", "local", "port",
-              "file", "anchor", "comment", "elements", "constant", "task", "unread")    # names for the decompiled C (load_names; file lines:
+              "file", "anchor", "comment", "elements", "constant", "task", "unread", "flag")    # names for the decompiled C (load_names; file lines:
                                               # decompile.source_files)
 
 
@@ -216,6 +216,8 @@ class Names(NamedTuple):
                          # array ('scoped STRUCT FAMILY OFFSET NAME TYPE[N]'), read ->view.name[i]
     carried_seeds: dict  # (function name, register number) -> name of what the function hands from one routine it
                          # runs to the next in that register ('register a5 NAME FUNCTION': the object loop)
+    flags: dict          # (function name, flag) -> the name of the function's variable for that flag of the CPU
+                         # ('flag FUNCTION cy NAME': what the carry says there, "found", "done")
 
 
 def load_names(path, registers=None):
@@ -282,7 +284,7 @@ def load_names(path, registers=None):
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {}, set(), set(), {}, {})
+                  set(), {}, set(), set(), {}, {}, {})
     registers = registers or {}
 
     def register_number(text):
@@ -411,6 +413,18 @@ def load_names(path, registers=None):
                 names.locals[key] = parts[4]
                 if len(parts) == 6:
                     names.local_structs[key] = parts[5]
+            continue
+        if parts[0] == "flag":
+            # (the flag by the processor's name for it, cy z s ov h, or by its C name, carry zero negative...)
+            flags = {"z": "zero", "s": "negative", "ov": "overflow", "cy": "carry", "x": "extend", "h": "half_carry"}
+            flag = parts[2] if len(parts) == 4 else None
+            flag = next((short for short, long in flags.items() if long == flag), flag)
+            if len(parts) != 4 or flag not in flags or not parts[3].isidentifier():
+                raise SystemExit(f"{where}: expected 'flag FUNCTION FLAG NAME' (FLAG one of "
+                                 f"{' '.join(flags)})")
+            if names.flags.get((parts[1], flag), parts[3]) != parts[3]:
+                raise SystemExit(f"{where}: {parts[1]}'s {parts[2]} is '{names.flags[(parts[1], flag)]}' already")
+            names.flags[(parts[1], flag)] = parts[3]
             continue
         if parts[0] == "register":
             # (RN, or the register's name on a processor whose registers have names: d7; with a function, what it

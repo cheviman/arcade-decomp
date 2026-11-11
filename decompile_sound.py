@@ -449,6 +449,15 @@ def write_c(program, out_dir, variables_path=None):
     emitter.local_names = {(entries_by_name[function], spot, value): name
                            for (function, spot, value), name in known.locals.items()
                            if spot == "entry" and function in entries_by_name}
+    # what a routine's flag says where it hands it back (flag lines), and the callers whose flag only comes from those
+    # (decompiler/emit.py inherited_flag_names, as the 053248's)
+    from decompiler import emit as decompiler_emit
+    unknown = sorted(function for function, _ in known.flags if function not in entries_by_name)
+    if unknown:
+        raise SystemExit(f"sound_symbols.txt: flag lines for what is no function: {', '.join(unknown[:5])}")
+    given = {(entries_by_name[function], flag): name for (function, flag), name in known.flags.items()}
+    emitter.flag_names = decompiler_emit.inherited_flag_names(built, found, flow, given, live_after)
+    emitter.flag_names_given = set(given)
     # a function that hands results back through pointers is written both ways, as the game's (decompile.py):
     # the C keeps the one that writes them back before fewer early returns
     joined = {}

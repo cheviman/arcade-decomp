@@ -55,6 +55,48 @@ def flag_name(flag):
     return cpu.current.flag_names[flag]
 
 
+def inherited_flag_names(built, found, flow, given, live_after):
+    """{(entry, flag): name}: the names symbols.txt's 'flag' lines give ('given'), and for a function with none the one
+    every call that writes the flag there gives (its callees' flag: what the carry a routine hands back says, "found",
+    "done"), of the calls whose flag something reads after them ('live_after': a sound queued drops its carry), when
+    no other statement of it writes the flag; until none changes, so that a name goes up through the functions that
+    only hand the flag on"""
+    names = dict(given)
+    flags = sorted({flag for _, flag in given})
+    writers = {}
+    for entry, function in built.items():
+        for flag in flags:
+            calls, other = [], False
+            for block in function.blocks.values():
+                for statement in block.statements + [block.end]:
+                    if isinstance(statement, ir.SetFlag) and statement.name == flag:
+                        other = True
+                    elif isinstance(statement, ir.Effect) and ("f", flag) in flow.statement_writes(statement):
+                        other = True
+                    elif isinstance(statement, (ir.Call, ir.TailCall)):
+                        live = live_after.get(entry, {}).get(id(statement)) if isinstance(statement, ir.Call) else None
+                        if live is not None and not any(variable[0] == "f" and variable[1] == flag
+                                                        for variable in live):
+                            continue    # (a flag nothing reads after the call)
+                        targets = [statement.target] if statement.target is not None \
+                            else list(getattr(statement, "choices", ()))
+                        calls += [target for target in targets
+                                  if target in found and ("f", flag) in found[target].results]
+            if calls and not other:
+                writers[(entry, flag)] = calls
+    changed = True
+    while changed:
+        changed = False
+        for (entry, flag), calls in writers.items():
+            if (entry, flag) in names:
+                continue
+            said = {names.get((target, flag)) for target in calls}
+            if len(said) == 1 and None not in said:
+                names[(entry, flag)] = said.pop()
+                changed = True
+    return names
+
+
 def register_bits(index):
     return cpu.current.register_bits.get(index, 32)
 PSW_INTERRUPTS = 1 << 18    # the processor status bit that lets interrupts in
@@ -3182,7 +3224,27 @@ class FunctionWriter:
             text.append("")
         text += body
         text.append("}")
-        return "\n".join(text) + "\n"
+        said_lines = len(comment_lines(said)) if said else 0
+        return "\n".join(text[:said_lines] + self.named_flags(text[said_lines:])) + "\n"
+
+    def named_flags(self, lines):
+        """The function's code with its flags' variables by the names symbols.txt gives them ('flag' lines: the
+        carry a routine hands back for "found", "done"), the pointer to one as p_NAME (the prototype's already)."""
+        names = {flag: name for (entry, flag), name in self.emitter.flag_names.items() if entry == self.entry}
+        if not names:
+            return lines
+        code = "\n".join(lines)
+        body = "\n".join(lines[1:])    # (past the definition, which has the prototype's names: NAME, p_NAME)
+        for flag, name in sorted(names.items()):
+            if re.search(rf"(?<![\w.>]){re.escape(name)}\b", body):
+                if (self.entry, flag) in self.emitter.flag_names_given:
+                    raise EmitError(f"{self.emitter.names.get(self.entry)}: the flag name '{name}' is taken there")
+                # (a name its callees give, taken here by another variable: the variable keeps the flag's name,
+                # its pointer takes the prototype's)
+                code = re.sub(rf"(?<![\w.>])p_{flag_name(flag)}\b", f"p_{name}", code)
+                continue
+            code = re.sub(rf"(?<![\w.>])(p_)?{flag_name(flag)}\b", lambda found: (found.group(1) or "") + name, code)
+        return code.split("\n")
 
     def declarations(self, words):
         """The function's variables; of the ones that start at 0, only those its code ('words') mentions."""
@@ -3255,6 +3317,8 @@ class Emitter:
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
                                     # something else puts its own in its place (decompile.py, replaced_functions)
         self.trampolines = {}       # entry -> (function, way in) of a function that only jumps to another
+        self.flag_names = {}        # (entry, flag) -> the name symbols.txt gives the function's variable for a flag
+        self.flag_names_given = set()    # ... of those, the ones a line gives (the others its callees': inherited)
         self.param_names = {}       # (entry, register) -> the name symbols.txt gives a parameter or result
         self.result_names = {}      # (entry, register) -> the name a "result" line gives what a function
                                     # nothing calls hands back
@@ -3518,6 +3582,8 @@ class Emitter:
                                             self.result_names.get((entry, value[1])))
             if name is not None and self.local_name(name) is not None:
                 return name
+        elif (entry, value[1]) in self.flag_names:
+            return self.flag_names[(entry, value[1])]
         return value_name(value)
 
     def local_sites_free(self):

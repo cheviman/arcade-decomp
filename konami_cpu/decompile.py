@@ -121,6 +121,8 @@ def configure():
     dataflow.PASSES_BY_PART = getattr(game_profile, "PASSES_BY_PART", False)
     dataflow.UNCHANGED_PARTS = getattr(game_profile, "UNCHANGED_PARTS", False)
     dataflow.NARROW_OUTPUTS = getattr(game_profile, "NARROW_OUTPUTS", False)
+    # (and the least outputs: what some caller reads, not what handlers hand back to each other through their tables)
+    dataflow.LEAST_OUTPUTS = getattr(game_profile, "LEAST_OUTPUTS", False)
     variables.CHOSEN_IN_ORDER = getattr(game_profile, "CHOSEN_IN_ORDER", False)
     knownbits.SIGN_EXTENSIONS = True
     decompiler_emit.WIDENED_INDEXES = False
@@ -384,6 +386,7 @@ def analyse(program, built):
     if changed:
         flow.reset()
         flow.solve()
+    flow.shrink_outputs()    # (LEAST_OUTPUTS: what handlers hand back to each other with no caller that reads it)
     flow.conditions_recovered = changed
     return flow
 
@@ -449,6 +452,7 @@ def carry(program, built, flow, found):
                              if key in virtual and virtual[key] in used for part in parts)
     flow.declared = declared_results(program, signatures.OPEN)
     flow.solve()
+    flow.shrink_outputs()
     flow.conditions_recovered = recovered
     return flow, signatures.compute(flow), {number: (key[0], None if key[1] is None else program.names[key[1]])
                                             for number, key in sorted(used.items())}
@@ -793,6 +797,12 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     emitter.result_names = {(entries_by_name[function_name], register): name
                             for (function_name, register), name in known.results.items()
                             if function_name in entries_by_name}
+    unknown = sorted(function_name for function_name, _ in known.flags if function_name not in entries_by_name)
+    if unknown:
+        raise SystemExit(f"{SYMBOLS.name}: flag lines for what is no function: {', '.join(unknown[:5])}")
+    given = {(entries_by_name[function_name], flag): name for (function_name, flag), name in known.flags.items()}
+    emitter.flag_names = decompiler_emit.inherited_flag_names(built, found, flow, given, live_after)
+    emitter.flag_names_given = set(given)
     emitter.local_sites = {(spot, value): name for (function_name, spot, value), name in known.locals.items()
                            if spot != "entry"}
     emitter.local_names = {(entries_by_name[function_name], spot, value): name

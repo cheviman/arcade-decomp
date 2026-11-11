@@ -508,8 +508,18 @@ class Writer(emit.FunctionWriter):
         pointing = self.address_variables()
         for block in self.function.blocks.values():
             for statement in block.statements:
-                if isinstance(statement, ir.SetReg) and statement.index in ACCUMULATORS                         and isinstance(statement.value, ir.Const)                         and self.vars.def_name(statement, statement.index) not in pointing:
+                if isinstance(statement, ir.SetReg) and statement.index in ACCUMULATORS \
+                        and isinstance(statement.value, ir.Const) \
+                        and self.vars.def_name(statement, statement.index) not in pointing:
                     found.add(id(statement.value))
+            # (and what an accumulator is compared with: CMPD #$4000, a zoom's limit, is no floor_map_ADDRESS)
+            for statement in block.statements + [block.end]:
+                for expression in ir.statement_expressions(statement):
+                    for node in ir.walk(expression):
+                        if isinstance(node, ir.Op) and node.name in emit.COMPARISONS \
+                                and any(isinstance(arg, ir.Reg) and arg.index in ACCUMULATORS
+                                        and self.vars.use_name(arg) not in pointing for arg in node.args):
+                            found |= {id(arg) for arg in node.args if isinstance(arg, ir.Const)}
         return found
 
     def effect(self, statement):

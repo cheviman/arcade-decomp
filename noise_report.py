@@ -121,6 +121,51 @@ INFORMATION = {
 }
 # the kinds the original's own doing leaves in the C (see the module's notes), with the registers kept as globals
 FAITHFUL = ("wide_access",)
+# whether the parameters and locals named after a register or a flag that only pass a value along (declared, copied
+# from or to their pointer, given to calls, set by calls, handed back, kept in part while the code sets the other
+# byte) are counted apart from the ones the code uses: the profile's NOISE_PASSED_VALUES (the Konami CPU's handlers,
+# reached through step tables with no length, hand D, U, X and the carry on to each other: what the register held
+# between routines, which the C cannot drop)
+PASSED_VALUES = getattr(game_profile, "NOISE_PASSED_VALUES", False)
+if PASSED_VALUES:
+    KINDS["passed_registers"] = ("of those named after a register, the ones that only pass a value along (faithful)",
+                                 None)
+    KINDS["passed_flags"] = ("of the flags' variables, the ones that only pass a flag along (faithful)", None)
+    FAITHFUL = FAITHFUL + ("passed_registers", "passed_flags")
+FLAG_NAME = r"(?:zero|negative|overflow|carry|extend|half_carry)(?:_\d+)?"
+# a stack slot named after its offset: stack_4; with the profile's NOISE_PLAIN_STACK_SLOTS also the plain stack the
+# emitter gives a function's first one when the name is free (decompiler/emit.py renumbered), which is just as unnamed
+STACK_SLOT = r"\bstack(?:_[0-9A-F]+)? = " if getattr(game_profile, "NOISE_PLAIN_STACK_SLOTS", False) \
+    else r"\bstack_[0-9A-F]+ = "
+
+
+def only_passed(name, body):
+    """True if the code ('body', the function's lines) only passes the value of variable 'name' along: declared,
+    copied from or to its pointer, given to calls (as itself or &name), set by a call, handed back, or kept in part
+    while the code sets its other byte ((name & 0xFFu) | ...)."""
+    plain = name[2:] if name.startswith("p_") else name
+    word = re.compile(rf"(?<![\w.>])\*?&?{re.escape(name)}\b(?!\()")
+    argument = re.compile(rf"\w\((?:[^;]*?(?:\(|, ))?&?{re.escape(name)}(?:,|\))")
+    operated = re.compile(rf"[-+*/&|^<>=!]\s*{re.escape(name)}\b|\b{re.escape(name)}\s*[-+*/|^<>!]"
+                          rf"|\({re.escape(name)}\)->|\[{re.escape(name)}\]?")
+    kept = re.compile(rf"\(\(?(?:uint\d+_t\))?{re.escape(name)} & 0xFFu\) \| ")
+    for line in body:
+        text = line.strip()
+        if re.match(r"(?:const )?(?:uint\d+_t|int\d+_t|bool|struct \w+ \*?) ", text) or not word.search(text):
+            continue
+        if re.fullmatch(rf"{plain} = (?:\(uint\d+_t\))?\*p_{plain};|\*?\w+ = {re.escape(name)};|return {re.escape(name)};"
+                        rf"|{re.escape(name)} = (?:\(uint\d+_t\))?\*?[a-z_]\w*(?:\(.*\))?;", text):
+            continue    # (a copy to or from another variable or pointer, handed back, set by a call)
+        if name.startswith("p_") and re.fullmatch(rf"\*{re.escape(name)} = [^;]*;|\w+ = [^;]*\*{re.escape(name)}\b[^;]*;",
+                                                  text) and text.count(name) == 1:
+            continue    # (what a pointer to a result is: what the function hands back through it, named apart)
+        rest = kept.sub("", text)
+        if argument.search(rest) and not operated.search(rest.replace(f"&{name}", "")):
+            continue
+        if rest != text and not word.search(rest):
+            continue
+        return False
+    return True
 
 
 def count(paths):
@@ -144,8 +189,10 @@ def count(paths):
                     counts["sub_functions"] += 1
                 if found.group(1) == "BOARD_ORIGINAL":
                     counts["board_replaced"] += 1
-                counts["register_names"] += len(re.findall(rf"(?<!\w)(?:p_)?{CPU_REGISTER}(?:_\d+)?(?=[,)]|$)",
-                                                           found.group(2)))
+                named = re.findall(rf"(?<!\w)((?:p_)?{CPU_REGISTER}(?:_\d+)?)(?=[,)]|$)", found.group(2))
+                counts["register_names"] += len(named)
+                # (the function's names after a register or a flag and its lines, for PASSED_VALUES at its end)
+                current = {"register_names": list(named), "flag_variables": [], "body": []}
                 if z80:
                     counts["register_names"] += len(re.findall(rf"(?<!\w)(?:p_)?{Z80_REGISTER}(?=[,)]|$)",
                                                                found.group(2)))
@@ -154,7 +201,14 @@ def count(paths):
                 continue
             if line == "}":
                 in_function = False    # (what follows a function's end, a table of data, is no code of it)
+                if PASSED_VALUES and not z80:
+                    for kind, passed in (("register_names", "passed_registers"), ("flag_variables", "passed_flags")):
+                        for name in current[kind]:
+                            if only_passed(name, current["body"]):
+                                counts[kind] -= 1
+                                counts[passed] += 1
                 continue
+            current["body"].append(line)
             for kind, (_, pattern) in KINDS.items():
                 if pattern is not None and not (kind == "code_switches" and CODE_CASE is not None):
                     counts[kind] += len(pattern.findall(line))
@@ -165,13 +219,16 @@ def count(paths):
                     counts["code_switches"] += 1    # (a switch, by its first case)
                     switch_counted = True
             if re.match(r"^\t(?:uint\d+_t|int\d+_t) ", line):
-                counts["register_names"] += len(re.findall(rf"\b{CPU_REGISTER}(?:_\d+)? = ", line))
-                counts["flag_variables"] += len(re.findall(r"\b(?:zero|negative|overflow|carry|extend|half_carry)"
-                                                           r"(?:_\d+)? = ", line))
+                declared = re.findall(rf"\b({CPU_REGISTER}(?:_\d+)?) = ", line)
+                counts["register_names"] += len(declared)
+                flags = re.findall(rf"\b({FLAG_NAME}) = ", line)
+                counts["flag_variables"] += len(flags)
+                current["register_names"] += declared
+                current["flag_variables"] += flags
                 if z80:
                     counts["register_names"] += len(re.findall(rf"\b{Z80_REGISTER} = ", line))
                 counts["temp_names"] += len(re.findall(r"\bt\d+ = ", line))
-                counts["stack_names"] += len(re.findall(r"\bstack_[0-9A-F]+ = ", line))
+                counts["stack_names"] += len(re.findall(STACK_SLOT, line))
             if line.startswith("\tbool "):
                 counts["control_variables"] += 1
             if COPY_BACK.match(line) and not COPY_BACK.match(lines[index - 1]):

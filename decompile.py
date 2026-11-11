@@ -1205,9 +1205,15 @@ def write_variables(path, writers, names, texts):
              "# for what a call hands back, effect for what a string move or a division leaves"]
     for entry, writer in sorted(writers.items()):
         text = texts.get(entry, "")
-        for name, sites in sorted(writer.variable_sites().items()):
+        found = writer.variable_sites()
+        for name, sites in sorted(found.items()):
             if not re.search(rf"\b{re.escape(name)}\b", text):
-                continue
+                # (the C may call it by its base: renumbered gives a function's first stack_2 or x_2 the plain name
+                # when that is free)
+                base = re.sub(r"_[0-9A-F]+$", "", name)
+                if base == name or base in found or not re.search(rf"\b{re.escape(base)}\b", text):
+                    continue
+                name = base
             spots = " ".join(f"{spot if spot == 'entry' else format(spot, '06X')}:{value}"
                              + (f":{how}" if how in ("call", "effect") else "")
                              for spot, value, how in sorted(set(sites), key=lambda site: (str(site[0]), site[1])))

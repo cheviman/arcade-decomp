@@ -66,6 +66,10 @@ UNCHANGED_PARTS = False
 # whether the outputs, once they settle, are made again from what the callers read with everything known (narrow):
 # the profile's NARROW_OUTPUTS; False for the V60's and the Z80's programs
 NARROW_OUTPUTS = False
+# whether the settled outputs then shrink to the least set some caller reads or hands back to one that does
+# (Program.least_outputs: handlers that hand a value back to each other through their tables, with no caller that
+# reads it). The profile's LEAST_OUTPUTS; False for the V60's, the 68000's and the Z80's programs
+LEAST_OUTPUTS = False
 
 
 def handler_slot():
@@ -958,6 +962,77 @@ class Program:
                 return
             for entry in self.functions:
                 self.exit_live[entry] = frozenset(self.exit_live.get(entry, frozenset()) | outputs[entry])
+
+    def shrink_outputs(self):
+        """With LEAST_OUTPUTS, after solve: the settled outputs taken down to the least ones (least_outputs) and
+        everything solved again from them, any that grow from there staying (a driver calls it; solve is as it was).
+        True if they shrank."""
+        if not LEAST_OUTPUTS:
+            return False
+        fewer = self.least_outputs()
+        if all(fewer[entry] == self.exit_live.get(entry, frozenset()) for entry in self.functions):
+            return False
+        self.exit_live = fewer
+        self.summaries = {entry: Summary() for entry in self.functions}
+        self.solve()
+        return True
+
+    def least_outputs(self):
+        """{entry: the outputs some caller reads, or hands back to a caller that reads them}: the least of them, out
+        of the settled ones (exit_live). Outputs only grow while they are worked out, and functions that hand a value
+        back to each other keep it with no caller that reads it (Simpsons: a step's handlers and the steps through
+        their tables, which hand back D, X and U as they found them: 1587 of 1803 outputs). An output of a callee is
+        needed where it is live after a call with nothing live where the caller ends (the caller reads it), or with one
+        of the caller's needed outputs live there (the caller hands it back); a tail call hands its callee's outputs to
+        the caller's callers; the context registers and the declared results stay."""
+        def key(variable):
+            return variable[0], variable[1]
+
+        needed = {entry: set() for entry in self.functions}
+        depends = {}    # (caller, key of its output) -> [(callee, variable)] live after the caller's calls for it
+        pending = []
+
+        def need(entry, variable):
+            if variable not in needed[entry]:
+                needed[entry].add(variable)
+                pending.append((entry, key(variable)))
+
+        def handed(caller, live_by_call):
+            found = []
+            for call, live in live_by_call:
+                if call.slot is not None:
+                    continue
+                for target in self.call_targets(call):
+                    if target in needed:
+                        found += [(target, variable) for variable in live & self.summaries[target].writes]
+            return found
+
+        for caller, function in self.functions.items():
+            exit_live = self.exit_live.get(caller, frozenset())
+            for target, variable in handed(caller, self.liveness(caller, record_calls=True,
+                                                                 exit_live=frozenset())[1]):
+                need(target, variable)
+            for output in {key(variable) for variable in exit_live}:
+                parts = frozenset(variable for variable in exit_live if key(variable) == output)
+                found = handed(caller, self.liveness(caller, record_calls=True, exit_live=parts)[1])
+                for block in function.blocks.values():
+                    end = block.end
+                    if isinstance(end, ir.TailCall) and end.target in needed:
+                        found += [(end.target, variable) for variable in parts & self.summaries[end.target].writes]
+                depends[(caller, output)] = found
+            for variable in exit_live:
+                if variable in self.context:
+                    need(caller, variable)
+        for entry, registers in self.declared.items():
+            if entry in needed:
+                for variable in self.exit_live.get(entry, frozenset()):
+                    if variable[0] == "r" and variable[1] in registers:
+                        need(entry, variable)
+        while pending:
+            for target, variable in depends.get(pending.pop(), ()):
+                need(target, variable)
+        return {entry: frozenset(variables & self.exit_live.get(entry, frozenset()))
+                for entry, variables in needed.items()}
 
     def narrow(self, outputs, rounds=30):
         """While the outputs grow, a call whose callee does not hand back a value yet reads everything the callee
