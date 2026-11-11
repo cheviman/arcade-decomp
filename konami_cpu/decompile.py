@@ -40,6 +40,7 @@ mistaken table leads to it) is written as lost_stack().
 The functions the board puts its own in place of (runtime/replaced.txt, a name a line: the boot's ROM test's sum,
 which reads the program's code) are written as BOARD_ORIGINAL(name), and declared both ways in game.h.
 """
+import dataclasses
 import re
 import sys
 import time
@@ -50,6 +51,7 @@ import game_profile  # noqa: E402  (the game's: its root, its ROM set, its setti
 from decompile import call_results, fewer_controls, fewer_write_backs, grouped_prototypes  # noqa: E402
 from decompile import name_params_by_use  # noqa: E402
 from decompile import replaced_functions, source_files, twin, write_sources, write_variables  # noqa: E402
+from decompiler import carried  # noqa: E402
 from decompiler import cleanup  # noqa: E402
 from decompiler import conditions  # noqa: E402
 from decompiler import cpu  # noqa: E402
@@ -80,6 +82,18 @@ REPORTS = ROOT / "build" / "decompile"
 CREATED = getattr(game_profile, "DECOMPILED", "06-11-2026")    # when src/ was first written
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 REGISTERS = {name: index for index, name in functions.KONAMI.register_names.items()}    # param and local lines
+# the profile's CARRIED_REGISTERS, off by default: what the registers carry from one function to a later one that no
+# call links to it (decompiler/carried.py: the object lists' runners hand their handlers what the handler before left
+# in Y) is in global variables, part by part, the rest in locals and parameters, as the 68000's driver does
+CARRIED = getattr(game_profile, "CARRIED_REGISTERS", False)
+# the registers that can carry something (A and B are D's bytes; S, DP and PC are no values of the program)
+# (the profile's CARRIED_REGISTER_NAMES: which of them, all four by default)
+CARRIED_REGISTERS = tuple(REGISTERS[name]
+                          for name in getattr(game_profile, "CARRIED_REGISTER_NAMES", ("x", "y", "u", "d")))
+# the virtual registers that hold the carried parts: VIRTUAL_BASE + the register (past LEFT_CALLER, 33), and those of
+# what a function hands from routine to routine ("register y NAME FUNCTION"), one after another from SEEDED_BASE
+VIRTUAL_BASE = 40
+SEEDED_BASE = 56
 # names the runtime the decompiled code includes already uses (game/support.h)
 TAKEN = {"frame_wait", "take_interrupts", "firq_point", "set_lines", "enable_irq", "disable_irq", "enable_firq",
          "disable_firq", "and_mask", "or_mask", "restore_mask", "interrupt_mask", "lost_stack", "illegal_opcode",
@@ -359,7 +373,10 @@ def analyse(program, built):
     signatures.OPEN = open_entries(program, built)
     flow.declared = declared_results(program, signatures.OPEN)
     flow.solve()
-    while sum(len(preserved.analyse(function, flow.call_writes, context=signatures.CONTEXT))
+    # (with CARRIED, the registers that can carry something are never taken for put back: a PUSHS Y ... PULLS Y around
+    # code that hands on what Y carries is a save and a restore of that global, which the C keeps as code)
+    kept = [register for register in cpu.current.registers if not (CARRIED and register in CARRIED_REGISTERS)]
+    while sum(len(preserved.analyse(function, flow.call_writes, registers=kept, context=signatures.CONTEXT))
               for function in built.values()):
         flow.solve()
     changed = sum(conditions.recover(function, flow) for function in built.values())
@@ -379,6 +396,61 @@ def statements_with(function, name):
                    for expression in ir.statement_expressions(statement) for node in ir.walk(expression)):
                 found.append(f"{getattr(statement, 'origin', 0) or 0:06X} {str(statement)[:160]}")
     return "".join("\n      " + line for line in found[:4])
+
+
+def carry(program, built, flow, found):
+    """What the registers carry from one function to a later one in the virtual registers, global variables in C
+    (decompiler/carried.py), and the data flow and signatures solved again with them: (flow, signatures, {register:
+    (the register it carries, the function that hands it on or None)}), as m68000/decompile.py's carry"""
+    carried.CUT_OWN_PORTS = getattr(game_profile, "CARRIED_CUTS", False)
+    known = disassemble.load_names(SYMBOLS, REGISTERS)
+    by_name = {name: entry for entry, name in program.names.items()}
+    seeds = []
+    for (function_name, index) in sorted(known.carried_seeds):
+        if function_name not in by_name:
+            raise SystemExit(f"{SYMBOLS.name}: a register line for '{function_name}', which is no function")
+        seeds.append((by_name[function_name], index))
+    found_carried = carried.Analysis(flow, built, found, by_value(found), CARRIED_REGISTERS, seeds=seeds)
+    virtual = {(index, None): VIRTUAL_BASE + index for index in CARRIED_REGISTERS}
+    for number, key in enumerate(sorted(key for key in found_carried.carried_groups() if key[1] is not None)):
+        virtual[key] = SEEDED_BASE + number
+    if max(virtual.values()) >= 64:
+        raise SystemExit("more carried registers than the decompiler numbers")
+    # a function that puts a register back gives its callers what they had: the virtual register too, which is a
+    # global the code it calls in between may change, so none of that may happen
+    carrying = found_carried.carried_parts()
+    for entry, function in built.items():
+        for index in set(getattr(function, "preserved", ())) & set(carrying):
+            if found_carried.carries_through(function, index):
+                raise SystemExit(f"{entry:06X} puts back {cpu.current.register_names.get(index)}, part of which the "
+                                 "code it runs carries")
+    moved = found_carried.split(built, virtual)
+    if not moved:
+        return flow, found, {}
+    used = {number: key for key, number in virtual.items() if number in moved}
+    for function in built.values():
+        kept = set(getattr(function, "preserved", ()))
+        function.preserved = kept | {number for number, key in used.items() if key[0] in kept}
+    profile = cpu.current
+    globals_named = {}
+    for number, (index, seed) in used.items():
+        name = known.registers.get(index) if seed is None else known.carried_seeds.get((program.names[seed], index))
+        globals_named[number] = name or (f"carried_{profile.register_names.get(index)}"
+                                         + ("" if seed is None else f"_{program.names[seed]}"))
+    cpu.use(dataclasses.replace(profile, registers=profile.registers + tuple(sorted(used)),
+                                register_bits={**profile.register_bits, **{number: 16 for number in used}},
+                                variable_names={**profile.variable_names, **globals_named}))
+    signatures.CONTEXT = tuple(sorted(used))
+    signatures.SCRATCH_CONTEXT = {number: 0 for number in used}
+    recovered = flow.conditions_recovered
+    flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
+    flow.context = frozenset(("r", virtual[key], part) for key, parts in found_carried.carried_groups().items()
+                             if key in virtual and virtual[key] in used for part in parts)
+    flow.declared = declared_results(program, signatures.OPEN)
+    flow.solve()
+    flow.conditions_recovered = recovered
+    return flow, signatures.compute(flow), {number: (key[0], None if key[1] is None else program.names[key[1]])
+                                            for number, key in sorted(used.items())}
 
 
 def by_value(found):
@@ -582,6 +654,11 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     program.handlers = [handler for handler in program.handlers if handler in built]
     flow = analyse(program, built)
     found = signatures.compute(flow)
+    carrying = {}
+    if CARRIED:
+        flow, found, carrying = carry(program, built, flow, found)
+        print(f"carried:    {len(carrying)} registers' values kept as globals: "
+              + ", ".join(cpu.current.variable_names[number] for number in carrying))
     names = dict(program.names)
     for entry, function_name in names.items():
         if not IDENTIFIER.match(function_name) or function_name in TAKEN:
@@ -593,6 +670,18 @@ def write_c(program, out_dir, variables_path=None, trace=False):
 
     before = sum(len(block.statements) for function in built.values() for block in function.blocks.values())
     known = keyed_names(disassemble.load_names(SYMBOLS, REGISTERS))
+    # the variables, tables and registers are macros: a field by the same name would be taken for one of them (as the
+    # V60's driver says, decompile.py)
+    macros = {name for name, _ in list(known.variables.values()) + list(known.tables.values())
+              + list(known.hardware.values()) + list(known.record_tables.values())}
+    macros |= {name for (struct, _, _), (name, _) in known.overlays.items() if struct == "global"}
+    macros |= {name for (struct, _), scoped in known.scoped.items() if struct == "global" for name, _ in scoped.values()}
+    fields = {name for name, _ in known.fields.values()} | {name for (struct, _), scoped in known.scoped.items()
+                                                             if struct != "global" for name, _ in scoped.values()}
+    clashes = sorted((fields | set(known.structs)) & macros)
+    if clashes:
+        raise SystemExit(f"{SYMBOLS.name}: fields or structures named like a variable, table or register: "
+                         + ", ".join(clashes))
     expressions.KEEP_SITES = {(spot, int(value[1:])) for (_, spot, value) in known.local_structs
                               if spot != "entry" and value.startswith("r")}
     arguments = by_value(found)
@@ -657,7 +746,8 @@ def write_c(program, out_dir, variables_path=None, trace=False):
 
     always = {entry: set(summary.always) for entry, summary in flow.summaries.items()}
     emitter = emit.Emitter(built, found, names, signatures.CONTEXT, set(), named, always, lambda address: 0, trace)
-    emitter.register_names = {}
+    # (what a register carries is the global its register line names: cpu.current.variable_names, set by carry)
+    emitter.register_names = {number: cpu.current.variable_names[number] for number in carrying}
     emitter.layouts = pointers.Layouts(accesses_typed, known)
     emitter.reroll_statements = True
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
@@ -748,10 +838,23 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     prototypes = grouped_prototypes(files, lambda entry: emitter.prototype(entry) + (
         ";\n" + emitter.definition(entry) if names[entry] in emitter.replaced else ""))
     guard = game_profile.GUARD
+    globals_names = [cpu.current.variable_names[number] for number in signatures.CONTEXT]
+    carried_text = ""
+    if globals_names:
+        # what the code carries in its registers from one routine to a later one, each with what symbols.txt says of
+        # it (a comment line by its name)
+        carried_text = ("/* what the code leaves in its registers for later code to read, kept as the game's state "
+                        "(the parts of\n   them no routine sets before it reads: decompiler/carried.py) */\n")
+        for name in globals_names:
+            said = known.comments.get(name)
+            if said:
+                carried_text += "\n".join(decompiler_emit.comment_lines(said)) + "\n"
+            carried_text += f"extern uint16_t {name};\n"
+        carried_text += "\n"
     (out_dir / "game.h").write_text(
         file_header("game.h", "prototypes of the game's functions")
         + f"#ifndef {guard}_GAME_H\n#define {guard}_GAME_H\n\n"
-        + "#include \"game/support.h\"\n#include \"ram.h\"\n\n"
+        + "#include \"game/support.h\"\n#include \"ram.h\"\n\n" + carried_text
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
     layouts = cpu_addresses(emitter.layouts.declarations())
     declared = set(re.findall(r"^#define (\w+)_ADDRESS ", "\n".join(named.declarations() + layouts), re.M))
@@ -769,6 +872,15 @@ def write_c(program, out_dir, variables_path=None, trace=False):
         + "\n".join(layouts) + "\n\n#endif\n", encoding="ascii")
     write_sources(out_dir, files, texts, "game.h", header=file_header, keep=("sound",))
 
+    # the globals of what the registers carry, and the list the runtime keeps a copy of while an interrupt's handler
+    # runs (the IRQ's saves every register and its RTI puts them back; the FIRQ's handler pushes and pulls what it uses)
+    context_text = ((f"/* what the code carries in its registers (game.h) */\nuint16_t "
+                     + ", ".join(f"{name} = 0u" for name in globals_names) + ";\n\n" if globals_names else "")
+                    + "/* the same, for the runtime to put back what an interrupt's handler found there when it "
+                    "returns, as the\n   CPU does */\n"
+                    + (f"uint16_t *const game_context[] = {{ {', '.join('&' + name for name in globals_names)} }};\n"
+                       if globals_names else "uint16_t *const game_context[1] = { 0 };\n")
+                    + f"const size_t game_context_count = {len(globals_names)};\n\n")
     reset, irq, firq = program.handlers_of_vectors()
     for handler in (reset, irq, firq):
         if emitter.wrapper(handler) is not None:
@@ -776,7 +888,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     (out_dir / "table.c").write_text(
         file_header("table.c", "the code the board runs by itself (the reset's, the interrupts' handlers) and the "
                     "tables the game loads by name")
-        + '#include "game.h"\n\n'
+        + '#include "game.h"\n\n' + context_text +
         "/* the code at the reset vector */\n"
         f"void game_entry(void)\n{{\n\t{names[reset]}();\n}}\n\n"
         "/* the IRQ's handler (the K052109's, at VBLANK) */\n"

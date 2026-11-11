@@ -591,20 +591,28 @@ class Analysis:
             there = next(iter(theres)) if len(theres) == 1 else None
             copy(after, statement_id, index if here is None else here, index if there is None else there, part)
         moved = set()
+        # (the bits each register has, a virtual one's those of the register it carries: a 16-bit register's copies and
+        # reads have no bits past its own to keep; the 68000's and the V60's are 32 bits, FULL)
+        carries = {number: index for (index, _), number in virtual.items()}
+
+        def width_of(register):
+            return dataflow.width(cpu.current.register_bits.get(carries.get(register, register), 32))
 
         def moved_copy(to, source, bits):
             """'to' = 'source' in the bits, the rest of 'to' as it was (all of it where 'to' is a virtual register
             whose carried parts the bits cover: the rest of one nothing reads)"""
             moved.update(register for register in (to, source) if register not in self.registers)
+            width = width_of(to)
+            bits &= width
             if to not in self.registers:
                 whole = 0
                 for part in everywhere.get(to, ()):
                     whole |= PARTS[part][1]
-                if not whole & ~bits:
+                if not whole & width & ~bits:
                     return ir.SetReg(to, ir.Reg(source))
-            elif bits == FULL:
+            elif bits == width:
                 return ir.SetReg(to, ir.Reg(source))
-            return ir.SetReg(to, ir.Op("or", (ir.Op("and", (ir.Reg(to), ir.Const(~bits & FULL, 32)), 32),
+            return ir.SetReg(to, ir.Op("or", (ir.Op("and", (ir.Reg(to), ir.Const(~bits & width, 32)), 32),
                                               ir.Op("and", (ir.Reg(source), ir.Const(bits, 32)), 32)), 32))
 
         def copies(statement, found):
@@ -624,7 +632,7 @@ class Analysis:
                 if not found:
                     return None
                 moved.update(found)
-                wanted = self.demand.get((id(statement), id(node)), FULL)
+                wanted = self.demand.get((id(statement), id(node)), FULL) & width_of(node.index)
                 mask = 0
                 for bits in found.values():
                     mask |= bits
@@ -674,7 +682,11 @@ class Analysis:
             return [statement]
         moved.update(carried.values())
         _, rest, keep = dataflow.partial_write(statement)
-        kept_bits = FULL
+        # (the bits the register has: a 16-bit register written whole keeps nothing of the virtual one, though its
+        # write says it keeps the bits past its own, "Y = (Y & ~0xFFFF) | v"; the 68000's and the V60's are 32 bits)
+        register_bits = dataflow.width(cpu.current.register_bits.get(index, 32))
+        keep &= register_bits
+        kept_bits = register_bits
         for part, bits in PARTS:
             if part in written:
                 kept_bits &= ~bits
@@ -683,7 +695,7 @@ class Analysis:
         if any(("def", id(statement), index, part) in self.own_only for part in carried):
             own = written    # (a read of its own reads the variable: it gets all of it, the global its parts)
         found = []
-        value = ir.rebuild(rest if keep else statement.value, change)
+        value = ir.rebuild(rest if keep or rest is not statement.value else statement.value, change)
 
         def kept(register, bits, new, masked):
             # (the parts the write leaves as they were stay so: "R = (R & keep) | rest", "bset #7, D7")
@@ -706,8 +718,8 @@ class Analysis:
             for part, part_bits in PARTS:
                 if carried.get(part) == other:
                     bits |= part_bits
-            found.append(ir.SetReg(other, kept(other, FULL & ~bits if source != index else kept_bits, ir.Reg(source),
-                                               False)))
+            found.append(ir.SetReg(other, kept(other, register_bits & ~bits if source != index else kept_bits,
+                                               ir.Reg(source), False)))
         for new in found:
             if origin is not None:
                 new.origin = origin
