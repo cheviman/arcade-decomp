@@ -2359,8 +2359,12 @@ class FunctionWriter:
                     return f"{pointer}{member}{view}.{overlay[0]}", overlay[1]
                 # bytes of the family's field: a part of it, whatever the structure calls them; an access
                 # that reaches past it is the structure's if the structure has a name for all of it (one of
-                # its own, not one made of the offset: then the family's field names its start)
-                if generic[2] and (offset - scoped_offset) * 8 + bits > scoped_bits \
+                # its own, not one made of the offset: then the family's field names its start); one by its
+                # number from the family's array runs on over that array's elements, which the structure's
+                # field is none of (road_surface_update's page word: four of page_table's bytes)
+                numbered = element_number is not None \
+                    and pointers.SCOPED_ARRAYS.get((struct, family, scoped_offset)) is not None
+                if generic[2] and (offset - scoped_offset) * 8 + bits > scoped_bits and not numbered \
                         and not re.split(r"->|\.", generic[0])[-1].startswith("unk_"):
                     return generic[:2]
                 return cprint.part(bits, text, offset - scoped_offset, scoped_bits, scoped_signed), False

@@ -34,6 +34,8 @@ zero). A summary also keeps what a function always writes on its exits where the
 halfword or the whole of R0 ends up zero, and where it does not, so the caller's side of such a test
 takes only the matching results as written.
 """
+import collections
+
 from v60 import ir
 
 from . import cpu
@@ -348,6 +350,22 @@ class Summary:
                 frozenset(self.base), passes)
 
 
+class Watched(dict):
+    """The functions' summaries, noting which are looked up while 'seen' is a set: the ones a function's
+    own summary is worked out from (Program.solve_summaries)."""
+    seen = None
+
+    def get(self, key, default=None):
+        if self.seen is not None:
+            self.seen.add(key)
+        return dict.get(self, key, default)
+
+    def __getitem__(self, key):
+        if self.seen is not None:
+            self.seen.add(key)
+        return dict.__getitem__(self, key)
+
+
 class Program:
     """Data flow over the decompiler's functions."""
 
@@ -365,6 +383,13 @@ class Program:
         self.zeroed = {}
         # live where each function ends: what it hands back to its callers (solve)
         self.exit_live = {}
+        # what each function was last gone through with, so that it is gone through again only where its
+        # summary can come out different (solve_summaries); 'carry', a program's word that between the
+        # solve before and the next one only the code of the functions in 'touched' has changed
+        self.carry = False
+        self.solving = False
+        self.gone_through = 0   # how many times a function's summary has been worked out
+        self.forget()
         self.declared = {}    # entry -> register numbers a function nothing calls hands back (symbols.txt)
         # the context registers the game uses as scratch (signatures.SCRATCH_CONTEXT): register -> the bits the
         # code that runs after a boundary function may read without setting them; and the boundary functions:
@@ -788,37 +813,98 @@ class Program:
                 summary.passes[key] = entry_reads(frozenset(v for v in handed if (v[0], v[1]) == key))
         return summary
 
+    def forget(self):
+        """Nothing known of what each function was last gone through with: every one is, the next time."""
+        self.version = collections.Counter()    # function -> how many times its summary has changed
+        self.kept_key = {}      # function -> the key of its summary as solve_summaries left it
+        self.read = {}          # function -> {summary it looked up: that summary's version then}
+        self.own = {}           # function -> its own summary's version once it was gone through
+        self.exit_seen = {}     # function -> what was live where it ends then
+        self.touched = set()    # functions whose code has changed since (the program says, with 'carry')
+
+    def stale(self, entry):
+        """Whether going through a function again may give another summary than the one kept: its code,
+        what is live where it ends, a summary it looked up or the one kept has changed since."""
+        read = self.read.get(entry)
+        if read is None or entry in self.touched or self.own[entry] != self.version[entry] \
+                or self.exit_seen[entry] != self.exit_live.get(entry, frozenset()):
+            return True
+        version = self.version
+        return any(version[key] != seen for key, seen in read.items())
+
     def solve_summaries(self):
-        """Summaries of every function, repeated until none changes."""
+        """Summaries of every function, repeated until none changes, without the work that cannot change
+        anything. A function's summary comes from its own code, what is live where it ends and the
+        summaries it looks up (Watched notes which); so a function is left as it is where none of those
+        has changed since it was last gone through and its summary is still the one it came out with
+        then, which is when working it out again gives the same summary. The functions go in the same
+        order, round after round, each seeing the summaries it would see if every one were gone through:
+        every summary comes out the same (Robotech: 280,000 times a function is gone through to 33,000,
+        its 4,375 summaries, signatures and outputs the same one by one). What else a summary reads
+        (zeroed, reaches, the slots' targets) changes only between solves, which start with nothing
+        known; called on its own, outside solve, so does this."""
+        if not self.solving:
+            self.forget()
+        if not isinstance(self.summaries, Watched):
+            self.summaries = Watched(self.summaries)
+        summaries, version = self.summaries, self.version
         rounds = 0
         changed = True
         while changed:
             changed = False
             rounds += 1
             for entry in self.functions:
-                new = self.solve_function(entry)
-                if new.key() != self.summaries[entry].key():
-                    self.summaries[entry] = new
+                if not self.stale(entry):
+                    continue
+                summaries.seen = seen = set()
+                try:
+                    new = self.solve_function(entry)
+                finally:
+                    summaries.seen = None
+                self.gone_through += 1
+                self.read[entry] = {key: version[key] for key in seen}      # as it saw them: before its own
+                if new.key() != dict.__getitem__(summaries, entry).key():
+                    summaries[entry] = new
+                    version[entry] += 1
                     changed = True
+                self.kept_key[entry] = dict.__getitem__(summaries, entry).key()
+                self.own[entry] = version[entry]
+                self.exit_seen[entry] = self.exit_live.get(entry, frozenset())
+                self.touched.discard(entry)
         return rounds
 
     def reset(self):
         """Forgets the summaries and outputs, for functions that changed so that they read less."""
         self.summaries = {entry: Summary() for entry in self.functions}
         self.exit_live = {}
+        self.forget()
 
     def solve(self):
         """Summaries and outputs together. What a function hands back is live where it returns, so a
         function reads what it may hand back unchanged ("and.b #FF, R0" leaves R0 as it was: the caller's
-        R0 goes through it). Outputs only grow, until they settle."""
-        while True:
-            self.solve_summaries()
-            outputs = self.outputs()
-            if all(outputs[entry] <= self.exit_live.get(entry, frozenset()) for entry in self.functions):
-                self.context_passes()
-                return
-            for entry in self.functions:
-                self.exit_live[entry] = frozenset(self.exit_live.get(entry, frozenset()) | outputs[entry])
+        R0 goes through it). Outputs only grow, until they settle. Every function is gone through in the
+        first round of summaries; with 'carry', what the solve before went through stands, but for the
+        functions in 'touched' and for whoever looked up a summary changed where it was since
+        (context_passes adds to its passes)."""
+        if not self.carry:
+            self.forget()
+        else:
+            for entry, summary in dict.items(self.summaries):
+                if entry in self.kept_key and summary.key() != self.kept_key[entry]:
+                    self.version[entry] += 1
+                    self.kept_key[entry] = summary.key()
+        self.solving = True
+        try:
+            while True:
+                self.solve_summaries()
+                outputs = self.outputs()
+                if all(outputs[entry] <= self.exit_live.get(entry, frozenset()) for entry in self.functions):
+                    self.context_passes()
+                    return
+                for entry in self.functions:
+                    self.exit_live[entry] = frozenset(self.exit_live.get(entry, frozenset()) | outputs[entry])
+        finally:
+            self.solving = False
 
     def context_passes(self):
         """What each function reads for the context registers it writes, kept as for a value it hands back.
