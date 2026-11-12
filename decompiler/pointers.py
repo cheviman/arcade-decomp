@@ -404,11 +404,45 @@ def narrow_count(node, size):
     return ir.op("mul", (kept, ir.Const(factor // size, POINTER_BITS)), POINTER_BITS)
 
 
+def signed_scaled(node, size):
+    """With SIGNED_RECORD_INDEXES, the 6809's signed index of a table of records 2^n bytes long, "LDA A,X" after ASLA
+    n times: the byte x << n taken as signed, (int8_t)(x << n), is that many records times the size, so the record's
+    number is (int8_t)(x << n) / size, exactly (its low n bits are 0); None for anything else."""
+    if not SIGNED_RECORD_INDEXES or size < 2 or size & (size - 1) or not isinstance(node, ir.Op) \
+            or node.name != "sext" or not isinstance(node.args[1], ir.Const) or node.args[1].value != 8:
+        return None
+    factor, base = 1, node.args[0]
+    while isinstance(base, ir.Op) and base.name in ("zext", "fits", "trunc"):
+        base = base.args[0]
+    while isinstance(base, ir.Op) and base.name == "shl" and isinstance(base.args[1], ir.Const):
+        factor, base = factor << base.args[1].value, base.args[0]
+    if factor != size:
+        return None
+    return ir.op("sdiv", (node, ir.Const(size, node.bits)), node.bits)
+
+
+def signed_field_part(node, size):
+    """With SIGNED_RECORD_INDEXES, (the record's index, the field's offset) for (int8_t)((x << n) + c), c below a
+    record's size 2^n: the low n bits are 0 before c is added, so c goes in without a carry and the sign stays the
+    record's (gauge_print_count's "ASLA; INCA; LDA A,Y": the second byte of record x); None for anything else."""
+    if not SIGNED_RECORD_INDEXES or not isinstance(node, ir.Op) or node.name != "sext":
+        return None
+    inner = node.args[0]
+    if not (isinstance(inner, ir.Op) and inner.name == "add" and isinstance(inner.args[1], ir.Const)
+            and 0 < inner.args[1].value < size):
+        return None
+    index = ir.op("sext", (inner.args[0], node.args[1]), node.bits)
+    return (index, inner.args[1].value) if signed_scaled(index, size) is not None else None
+
+
 def scaled_count(node, size, zeros=None):
     """The number of whole records of 'size' bytes 'node' is an offset of (x for "x * size", "x << n" with
     size 2^n, a constant's quotient), or None. Widenings are looked through, and a cut to fewer bits that
     keeps every bit the value can have (the Z80's byte arithmetic): an index cut for real wraps where a
     record number would not."""
+    signed = signed_scaled(node, size)
+    if signed is not None:
+        return signed
     narrow = narrow_count(node, size)
     if narrow is not None:
         return narrow
@@ -738,6 +772,13 @@ def kind_of(node, state, zeros):
 # whether a halfword or byte sign-extended (the 68000's index register as a word, (d8,An,Dn.w)) is a displacement as a
 # constant either way is: off by default; the 68000's (m68000/emit.py, the profile's SIGNED_OFFSETS)
 SIGNED_OFFSETS = False
+# whether a table of records read with the CPU's signed byte index (the 6809's "LDA A,X" after ASLA) takes the record by
+# its number, name[(int8_t)(x << 1) / 2].field (signed_scaled, signed_field_part), not the bytes from the table's
+# start; the Konami driver's
+SIGNED_RECORD_INDEXES = False
+# whether a byte of a structure's common view that no common field names but a family's view does is written
+# per_kind_XX (each kind uses it its own way) rather than unk_XX; the Konami driver's
+GAP_NAMES_BY_FAMILY = False
 
 
 def offset_sized(node, state=None):
@@ -1104,7 +1145,15 @@ def indexed_access(address, state, in_fields=True, zeros=None):
     if len(rest) > 1:
         return None
     size = STRUCTS[kind[0]]
+    # (the CPU's signed index only for a table at a fixed address, which is written name[i]: a pointer the code keeps
+    # is written STRUCT(p + bytes), where the number of records would only be multiplied back)
+    fixed = isinstance(pointer, ir.Const)
+    split = signed_field_part(rest[0], size) if rest and fixed else None
+    if split is not None:
+        rest, constant = [split[0]], constant + split[1]    # (the field the c of (int8_t)((x << n) + c) reaches)
     count = scaled_count(rest[0], size, zeros) if rest else None
+    if count is not None and not fixed and signed_scaled(rest[0], size) is not None:
+        count = None
     if rest and count is None:
         signed_word = SIGNED_OFFSETS and isinstance(rest[0], ir.Op) and rest[0].name == "sext" \
             and isinstance(rest[0].args[1], ir.Const) and rest[0].args[1].value <= 16
@@ -1577,7 +1626,12 @@ class Layouts:
                 if offset + bits // 8 > STRUCTS[struct]:
                     bits = 8
                 fields[offset] = bits
-                names_[offset] = f"unk_{offset:02X}"
+                # (with GAP_NAMES_BY_FAMILY, a byte of the common view that a family's own view names is each kind's
+                # own, per_kind_XX, not unknown)
+                own = GAP_NAMES_BY_FAMILY and names is not None and any(
+                    scoped_struct == struct and offset in found
+                    for (scoped_struct, _), found in names.scoped.items())
+                names_[offset] = f"per_kind_{offset:02X}" if own else f"unk_{offset:02X}"
                 signed[offset] = False
                 covered |= {offset + byte for byte in range(bits // 8)}
             self.fields[struct] = fields

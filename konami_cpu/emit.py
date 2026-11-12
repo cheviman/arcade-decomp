@@ -212,6 +212,8 @@ def use_memory_map(names):
     # (the profile's NESTED_FAMILIES, off by default: a family's view takes the fields of the families its name extends)
     pointers.NESTED_FAMILIES = getattr(game_profile, "NESTED_FAMILIES", False)
     pointers.SIGNED_OFFSETS = False
+    pointers.SIGNED_RECORD_INDEXES = True    # (a table of records by "LDA A,X" after ASLA: name[(int8_t)(x << 1) / 2])
+    pointers.GAP_NAMES_BY_FAMILY = True    # (the common view's bytes each kind uses its own way: per_kind_XX)
     # (the tables of records and what the tables lead to are keyed by place: a constant of the code is the place it
     # names in the bank of the function being walked)
     pointers.DATA_KEY = data_key

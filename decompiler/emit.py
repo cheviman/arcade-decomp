@@ -2224,6 +2224,23 @@ class FunctionWriter:
         if isinstance(index, ir.Const):
             value = index.value & 0xFFFFFFFF
             return str(value) if value < 0x80000000 else f"-{0x100000000 - value}"
+        if pointers.SIGNED_RECORD_INDEXES:
+            # (the CPU's signed byte index of a table of records, (int8_t)(x << 1) / 2, and a record after or before
+            # it: the signed byte is an int already)
+            def signed(node):
+                if isinstance(node, ir.Op) and node.name == "sdiv" and isinstance(node.args[0], ir.Op) \
+                        and node.args[0].name == "sext":
+                    inner = self.printer.any(node.args[0])
+                    return f"{cprint.Printer.wrap(inner, cprint.MULTIPLY)} / {node.args[1].value}"
+                return None
+            found = signed(index)
+            if found is not None:
+                return found
+            if isinstance(index, ir.Op) and index.name == "add" and isinstance(index.args[1], ir.Const):
+                found = signed(index.args[0])
+                if found is not None:
+                    step = index.args[1].value & 0xFFFFFFFF
+                    return f"{found} + {step}" if step < 0x80000000 else f"{found} - {0x100000000 - step}"
         if isinstance(index, ir.Op) and index.name == "add" and isinstance(index.args[1], ir.Const) \
                 and index.args[1].value & 0xFFFFFFFF >= 0x80000000:
             before = 0x100000000 - (index.args[1].value & 0xFFFFFFFF)
