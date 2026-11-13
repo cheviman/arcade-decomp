@@ -5,7 +5,7 @@ Name:        analysis.py
 Description: recursive-descent disassembly of a 68000 program without traces, into a listing and a report
 Version:     0.1.0
 Created:     29-10-2026
-Modified:    01-11-2026
+Modified:    13-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (the game's shim; default
@@ -41,6 +41,13 @@ first, or after one that is not) is an unused one (a state with no handler), but
 then jsr (Am), makes that offset a handler slot: an address stored in such a slot (move.l #code, or a
 register holding it) is code. symbols.txt keeps the V60's format (disassemble.load_symbols): func, code and
 data lines.
+
+A data table the code reads by an index it bounds is described as long as the bound says (bound_tables()): the
+index from a word ("move.w SOURCE, Dn", scaled by "add.w Dn, Dn" or "lsl.w #k, Dn"), the table's address
+("movea.l #TABLE, An" or "lea TABLE, An") and the read "(An,Dn)" right after; SOURCE a counter the code wraps
+("cmpi.w #N, SOURCE; blt; clr.w SOURCE": N entries) or a register a loop counts from 0 to N ("cmpi.w #N, Dk;
+blt" back around the read). Sonic Spinball's colour cycles and two pointer tables its collision code walks came
+out this way; TMNT and The Simpsons have none (their coverage the same before and after).
 """
 import sys
 from bisect import bisect_left, bisect_right
@@ -618,6 +625,149 @@ class Analysis:
                     if value and value < CODE_END:
                         self.data_fields[record + offset] = value
             self.described.append((address, address + layout.record * layout.count))
+        self.bound_tables()
+        for table, (entries, stride, size, _, _, _) in self.bounded_tables.items():
+            self.described.extend((table + stride * index, table + stride * index + size) for index in range(entries))
+
+    # ---- data tables whose length the code bounds ----
+
+    def bound_tables(self):
+        """The data tables the code reads by an index it bounds (bounded_tables: {table: (entries, stride, size of
+        an entry read, the read's address, the bound's address, "counter" or "loop")}):
+          the read   "move.w SOURCE, Dn", then "add.w Dn, Dn" (an entry every 2 bytes), "lsl.w #k, Dn" (every
+                     2^k) or nothing (every byte), "movea.l #TABLE, An" or "lea TABLE, An", and right after (or
+                     where the "bra" after it goes) an instruction that reads "(An,Dn)" with no displacement: an
+                     entry as big as it reads (lea takes the whole entry);
+          a counter  SOURCE an absolute word the code wraps: "cmpi.w #N, SOURCE; blt (or bcs); clr.w SOURCE"
+                     (the nearest before the read in its function, or else after it): N entries;
+          a loop     SOURCE a data register that counts from 0 (clr.w or moveq #0 before the loop) up to
+                     "cmpi.w #N, Dk; blt (or bcs) back" around the read: N entries.
+        A table the code already bounds otherwise (code tables, symbols.txt's) is left as it is."""
+        self.bounded_tables = {}
+        ordered = sorted(self.instructions.items())
+        position_of = {address: position for position, (address, _) in enumerate(ordered)}
+        starts = sorted(self.functions)
+
+        def function_of(address):
+            index = bisect_right(starts, address) - 1
+            return starts[index] if index >= 0 else None
+
+        known = set(self.code_tables) | set(self.table_ends) \
+            | {address for address, symbol in self.symbols.items() if symbol.kind == "data" and symbol.layout}
+        for position, (address, instruction) in enumerate(ordered):
+            found = self.indexed_read(ordered, position)
+            if found is None:
+                continue
+            table, stride, size, source, reader = found
+            if table in known or table in self.bounded_tables:
+                continue
+            if isinstance(source, int):
+                bound = self.counter_bound(ordered, position, source, function_of, position_of)
+                kind = "counter"
+            else:
+                bound = self.loop_bound(ordered, position, source, reader)
+                kind = "loop"
+            if bound is not None:
+                entries, at = bound
+                if 0 < entries and table + stride * entries <= CODE_END:
+                    self.bounded_tables[table] = (entries, stride, size, reader, at, kind)
+
+    @staticmethod
+    def indexed_read(ordered, position):
+        """(table, stride, size, source: an absolute address or a register's name, the read's address) for the
+        read at 'position' (bound_tables()), or None"""
+        instruction = ordered[position][1]
+        operands = instruction.operands
+        if position < 2 or position + 1 >= len(ordered) or len(operands) != 2 or operands[1].mode != "areg":
+            return None
+        if instruction.mnemonic == "movea" and instruction.size == "l" and operands[0].mode == "immediate":
+            table = operands[0].value & 0xFFFFFF
+        elif instruction.mnemonic == "lea" and operands[0].mode == "abs_long":
+            table = operands[0].value & 0xFFFFFF
+        else:
+            return None
+        register, at, stride = operands[1].reg, position - 1, 1
+        scale = ordered[at][1]
+        if scale.mnemonic == "add" and len(scale.operands) == 2 and scale.operands[0].mode == "dreg" \
+                and scale.operands[0].reg == scale.operands[1].reg:
+            stride, at = 2, at - 1
+        elif scale.mnemonic == "lsl" and scale.operands[0].mode in ("quick", "immediate") \
+                and 1 <= scale.operands[0].value <= 4 and scale.operands[1].mode == "dreg":
+            stride, at = 1 << scale.operands[0].value, at - 1
+        load = ordered[at][1]
+        if load.mnemonic != "move" or load.size != "w" or len(load.operands) != 2 or load.operands[1].mode != "dreg":
+            return None
+        index = load.operands[1].reg
+        if stride > 1 and scale.operands[-1].reg != index:
+            return None
+        if load.operands[0].mode == "abs_long":
+            source = load.operands[0].value & 0xFFFFFF
+        elif load.operands[0].mode == "dreg":
+            source = load.operands[0].reg
+        else:
+            return None
+        reader = ordered[position + 1][1]
+        if reader.mnemonic == "bra" and reader.target is not None:
+            reader = next((step for address, step in ordered if address == reader.target), None)
+            if reader is None:
+                return None
+        for operand in reader.operands:
+            if operand.mode == "index" and operand.reg == register and operand.index == index and not operand.disp:
+                size = stride if reader.mnemonic == "lea" else {"b": 1, "w": 2, "l": 4}.get(reader.size)
+                if size is None or size > stride:
+                    return None
+                return ordered[position][1].operands[0].value & 0xFFFFFF, stride, size, source, reader.address
+        return None
+
+    @staticmethod
+    def wraps(ordered, at, counter):
+        """N where the instructions at 'at' wrap 'counter' ("cmpi.w #N, COUNTER; blt or bcs; clr.w COUNTER")"""
+        if at + 2 >= len(ordered):
+            return None
+        compare, branch, clear = (ordered[at + step][1] for step in range(3))
+        if compare.mnemonic == "cmpi" and compare.size == "w" and compare.operands[1].mode == "abs_long" \
+                and compare.operands[1].value & 0xFFFFFF == counter and branch.mnemonic == "bcc" \
+                and branch.condition in ("lt", "cs") and clear.mnemonic == "clr" \
+                and clear.operands[0].mode == "abs_long" and clear.operands[0].value & 0xFFFFFF == counter:
+            return compare.operands[0].value
+        return None
+
+    def counter_bound(self, ordered, position, counter, function_of, position_of):
+        """(N, the bound's address) of the nearest wrap of 'counter' before 'position' in its function, or else
+        after it; None if it has none"""
+        function = function_of(ordered[position][0])
+        first = position_of.get(function, position)
+        last = position
+        while last + 3 < len(ordered) and function_of(ordered[last + 1][0]) == function:
+            last += 1
+        for at in list(range(position - 3, first - 1, -1)) + list(range(position, last - 1)):
+            entries = self.wraps(ordered, at, counter)
+            if entries is not None:
+                return entries, ordered[at][0]
+        return None
+
+    @staticmethod
+    def loop_bound(ordered, position, counter, reader):
+        """(N, the bound's address) of the loop around 'position' that counts 'counter' from 0: "cmpi.w #N,
+        COUNTER; blt or bcs" back to before the read, the counter cleared before the loop; None if none"""
+        for at in range(position + 1, min(position + 64, len(ordered) - 1)):
+            compare, branch = ordered[at][1], ordered[at + 1][1]
+            if compare.mnemonic != "cmpi" or compare.size != "w" or compare.operands[1].mode != "dreg" \
+                    or compare.operands[1].reg != counter:
+                continue
+            if branch.mnemonic != "bcc" or branch.condition not in ("lt", "cs") or branch.target is None \
+                    or not branch.target <= ordered[position][0]:
+                return None
+            top = next(index for index, (address, _) in enumerate(ordered) if address == branch.target)
+            for before in range(top - 1, max(top - 8, -1), -1):
+                step = ordered[before][1]
+                operands = step.operands
+                if (step.mnemonic == "clr" and step.size == "w" and operands[0].mode == "dreg"
+                        and operands[0].reg == counter) or (step.mnemonic == "moveq" and operands[0].value == 0
+                                                           and operands[1].reg == counter):
+                    return compare.operands[0].value, compare.address
+            return None
+        return None
 
 
 # What the coverage (the core's coverage.py) needs of the 68000: how its pointers are stored, where its functions
@@ -671,6 +821,9 @@ def write_report(analysis, path, executed=None):
              f"code tables: {len(analysis.code_tables)} ({sum(map(len, analysis.code_tables.values()))} entries), "
              f"tables of them: {len(analysis.table_tables)}",
              f"tables of records with a code field (symbols.txt): {len(analysis.field_tables)}",
+             f"data tables the code bounds by their index: {len(analysis.bounded_tables)} ("
+             + ", ".join(f"{table:06X} {entries} x {stride}" for table, (entries, stride, *_)
+                         in sorted(analysis.bounded_tables.items())) + ")",
              f"handler slots: {sorted(analysis.slots)}"]
     for table, offset in sorted(analysis.undescribed):
         lines.append(f"a table of records symbols.txt does not describe: {table:06X}, its code field at +{offset}")

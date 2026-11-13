@@ -3,7 +3,7 @@ Name:        coverage.py
 Description: byte map of the program ROM: decoded code, data the code points at, fill, and what is still unknown
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    05-11-2026
+Modified:    13-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/coverage.py [rom folder or .zip] [--trace executed.txt ...] [--reads FOLDER ...]
@@ -20,7 +20,9 @@ every byte of the program image one class:
                    each FOLDER ("PC FIRST-LAST" lines, as s32ref and kref write them). An instruction
                    that reads a whole area of the ROM is summing it (the memory test): its reads are left
                    out. Code that another one reads is listed: a table the analysis took for code, or a
-                   table the game reads on past its end
+                   table the game reads on past its end. With the profile's READERS ({name: [(first,
+                   stop)]}: the code that reads each kind of data), the report says, for each, the bytes it
+                   read that no table describes: every one of them is a format or a table still to find
   referenced data  from a place the code reads or takes the address of, a data symbol, or the first
                    byte of a run the reference read, up to the next known thing
   fill             what the analysis says only fills the program (the 68000's zeros between its vectors
@@ -307,6 +309,30 @@ def pointers_to(analysis, targets):
     return found
 
 
+def reader_reads(reads, classes):
+    """{name: (bytes read, those of them no table describes)} by the code the profile's READERS names ({name:
+    [(first, stop) of the instructions' addresses]}: the code that reads one kind of data, an engine, a
+    decompressor). Every byte a reader reads has to be described: one that is not is a format or a table still to
+    find. {} without READERS"""
+    found = {}
+    for name, ranges in getattr(game_profile, "READERS", {}).items():
+        read = {address for address, readers in reads.items()
+                if any(first <= pc < stop for pc in readers for first, stop in ranges)}
+        found[name] = (read, {address for address in read if classes[address] == READ})
+    return found
+
+
+def address_runs(addresses):
+    """[(first, last)] of the runs of consecutive addresses"""
+    runs = []
+    for address in sorted(addresses):
+        if runs and address == runs[-1][1] + 1:
+            runs[-1][1] = address
+        else:
+            runs.append([address, address])
+    return [tuple(run) for run in runs]
+
+
 def write_coverage(analysis, references, classes, path, reads=None, summing=None):
     image = analysis.image
     # (the read data only when the reference's reads were given)
@@ -352,6 +378,9 @@ def write_coverage(analysis, references, classes, path, reads=None, summing=None
         lines.append(f"  code read as data: {len(code_reads)} bytes"
                      + "".join(f", {address:06X} by " + " ".join(f"{pc:06X}" for pc in sorted(set(reads[address])))
                                for address in code_reads[:20]))
+        by_reader = reader_reads(reads, classes)
+        for name, (read, missing) in by_reader.items():
+            lines.append(f"  read by the {name}: {len(read)} bytes, {len(missing)} no table describes")
     lines += [
         f"unknown runs in the code chips: {len(rows)}, {sum(stop - first for first, stop, _, _ in rows)} bytes",
         f"  decoding as instructions from start to end: {len(as_code)} runs, "
@@ -378,6 +407,12 @@ def write_coverage(analysis, references, classes, path, reads=None, summing=None
             raw = image[first:min(stop, first + 12)].hex(" ")
             lines.append(f"{first:06X}  {stop - 1:06X}  {stop - first:6}  {' '.join(f'{pc:06X}' for pc in readers[:6])}"
                          f"{' ...' if len(readers) > 6 else ''}  {raw}")
+        if by_reader:
+            title = "Read data no table describes, by reader (the profile's READERS)"
+            lines += ["", title, "-" * len(title)]
+            for name, (read, missing) in by_reader.items():
+                lines.append(f"{name}: {len(read)} bytes read, {len(missing)} no table describes"
+                             + "".join(f"\n  {first:06X}-{last:06X}" for first, last in address_runs(missing)))
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
     return lines
 
