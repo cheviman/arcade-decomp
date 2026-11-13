@@ -3,7 +3,7 @@ Name:        disassemble.py
 Description: recursive-descent disassembly of the V70 program into a listing and a coverage report
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    30-10-2026
+Modified:    13-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (default ROM: rom/)
@@ -223,6 +223,10 @@ class Names(NamedTuple):
     target_arrays: set = None   # the (struct, offset) or ("global", address) of targets that point at an array of
                                 # their structure's records ('... u32 STRUCT[]': a car's torque curve, its points up
                                 # to the one that closes it), which its assets lay out; the C reads them as STRUCT
+    unaligned: set = None       # the arrays of values ('elements NAME TYPE [REGION] unaligned') the program keeps at
+                                # addresses that are not a multiple of their width and reads there whole (a list of
+                                # halfwords at an odd address in a table's piece): the C reads them through a type of
+                                # alignment 1 (unaligned_int16...), which any processor reads where they are
 
 
 def load_names(path, registers=None):
@@ -239,10 +243,12 @@ def load_names(path, registers=None):
         struct   NAME   SIZE rom         a record of the program ROM (read through rom(), never written)
         struct   NAME   SIZE board       a structure in a memory of the board the code uses as plain memory
                                          (the video RAM, the sprite RAM, the sound program's RAM: board())
-        elements NAME   TYPE [REGION] [STRUCT]  values a pointer walks (TYPE each), in the program ROM, or with
-                                         REGION in the work RAM ("ram") or a memory of the board ("board"):
-                                         what is read or written through one is NAME(p)[i] (STRUCT: what
-                                         each value points at)
+        elements NAME   TYPE [REGION] [unaligned] [STRUCT]  values a pointer walks (TYPE each), in the
+                                         program ROM, or with REGION in the work RAM ("ram") or a memory of
+                                         the board ("board"): what is read or written through one is
+                                         NAME(p)[i] (STRUCT: what each value points at); "unaligned" where the
+                                         program keeps them at addresses that are not a multiple of their
+                                         width (the C's type for them has an alignment of 1)
         field    STRUCT OFFSET NAME TYPE [STRUCT]  one of its fields (OFFSET in hexadecimal); TYPE[N] (N in
                                          hexadecimal) an array of N in the record, TYPE[] (a record of the
                                          program ROM) one that goes on past the record's end, read
@@ -292,7 +298,7 @@ def load_names(path, registers=None):
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {}, set(), set(), {}, {}, {}, set())
+                  set(), {}, set(), set(), {}, {}, {}, set(), set())
     registers = registers or {}
 
     def register_number(text):
@@ -362,9 +368,13 @@ def load_names(path, registers=None):
         if parts[0] == "elements":
             region = parts[3] if len(parts) > 3 and parts[3] in ("rom", "ram", "board") else None
             pointed = parts[4 if region else 3:]
-            if len(parts) < 3 or len(pointed) > 1 or not parts[1].isidentifier() or parts[2] not in VALUE_TYPES:
-                raise SystemExit(f"{where}: expected 'elements NAME TYPE [rom|ram|board] [STRUCT]' with TYPE in "
-                                 f"{VALUE_TYPES}")
+            unaligned = bool(pointed) and pointed[0] == "unaligned"
+            if unaligned:
+                pointed = pointed[1:]
+            if len(parts) < 3 or len(pointed) > 1 or not parts[1].isidentifier() or parts[2] not in VALUE_TYPES \
+                    or (unaligned and parts[2] in ("u8", "s8")):
+                raise SystemExit(f"{where}: expected 'elements NAME TYPE [rom|ram|board] [unaligned] [STRUCT]' with "
+                                 f"TYPE in {VALUE_TYPES} (wider than a byte when unaligned)")
             if parts[1] in names.structs:
                 raise SystemExit(f"{where}: '{parts[1]}' is a structure already")
             names.structs[parts[1]] = int(parts[2][1:]) // 8
@@ -372,6 +382,8 @@ def load_names(path, registers=None):
                 names.rom_structs.add(parts[1])
             elif region == "board":
                 names.board_structs.add(parts[1])
+            if unaligned:
+                names.unaligned.add(parts[1])
             names.arrays[parts[1]] = parts[2]
             names.fields[(parts[1], 0)] = ("element", parts[2])
             if pointed:
