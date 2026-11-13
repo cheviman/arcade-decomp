@@ -2,13 +2,15 @@
 Name:        big_endian_scenarios.py
 Description: runs control scripts on the game built for a big-endian processor, under an emulator, and compares
              its picture and its sound with the reference's, frame by frame
-Version:     0.1.0
+Version:     0.2.0
 Created:     11-11-2026
-Modified:    11-11-2026
+Modified:    13-11-2026
 Author:      Sebastian Toyos
 
-Usage: python tools/big_endian_scenarios.py [NAME ...] [--jobs N] [--bin DIR] [--out DIR]
+Usage: python tools/big_endian_scenarios.py [NAME ...] [--state] [--jobs N] [--bin DIR] [--out DIR]
   NAME       scripts of tests/controls to run (file names without .txt); all of them by default
+  --state    compare the state too: a build that hashes the memories as the V70 holds them (the game's
+             BIG_ENDIAN_STATE_BIN, build/bin-ppc-order by default, unless --bin)
   --jobs N   run N scripts at a time (half the processors by default)
   --bin DIR  the big-endian game's folder (build/bin-ppc by default)
   --out DIR  where the runs go (build/big-endian by default)
@@ -18,9 +20,11 @@ build/bin-ppc), which the emulator runs (qemu-ppc, or the profile's BIG_ENDIAN_E
 WSL). For every script it writes OUT/NAME/game_video_hashes.txt and game_sound_hashes.txt, which are compared
 with the reference's results already in build/scenarios/NAME/ (video_hashes.txt and sound_hashes.txt, which
 tools/check_scenarios.py --video --sound writes): the picture of every frame, and the sound's samples of every
-frame. The state's hash and the sound board's memory's are not compared: they are of the memory as its
-processor holds it, in another order than the PC's (tools/state_diff.py compares the state of a frame, each
-value at its width).
+frame. The state's hash and the sound board's memory's are of the memory as its processor holds it, in another
+order than the V70's, unless the game is built to keep where each byte is in the V70's order (the game's
+BIG_ENDIAN_STATE_BIN: OutRunners' ORUNNERS_BYTE_ORDER_CHECK, runtime/include/s32/byte_order.h); with --state
+they are compared too, with hashes.txt and sound_hashes.txt's third column (tools/state_diff.py compares the
+state of one frame of a build without it, each value at the width symbols.txt gives it).
 """
 import os
 import subprocess
@@ -36,6 +40,7 @@ CONTROLS = ROOT / "tests" / "controls"
 REFERENCE = ROOT / "build" / "scenarios"
 EMULATOR = getattr(game_profile, "BIG_ENDIAN_EMULATOR", "qemu-ppc")
 BIN = ROOT / getattr(game_profile, "BIG_ENDIAN_BIN", "build/bin-ppc")
+STATE_BIN = ROOT / getattr(game_profile, "BIG_ENDIAN_STATE_BIN", "build/bin-ppc-order")
 OUT = ROOT / "build" / "big-endian"
 SECONDS_A_FRAME = 0.2      # past this a run is taken as stuck (the emulator runs a frame in about 25 ms)
 
@@ -93,6 +98,10 @@ def compare(reference_file, game_file, count):
 def main():
     global BIN, OUT
     arguments = sys.argv[1:]
+    state = "--state" in arguments
+    if state:
+        arguments.remove("--state")
+        BIN = STATE_BIN
     for option in ("--bin", "--out"):
         if option in arguments:
             position = arguments.index(option)
@@ -127,12 +136,20 @@ def main():
         problem = run(name, game, OUT / name)
         frames, picture = compare(REFERENCE / name / "video_hashes.txt", OUT / name / "game_video_hashes.txt", 2)
         _, sound = compare(REFERENCE / name / "sound_hashes.txt", OUT / name / "game_sound_hashes.txt", 2)
+        work = sound_board = None
+        if state:
+            _, work = compare(REFERENCE / name / "hashes.txt", OUT / name / "game_hashes.txt", 2)
+            _, sound_board = compare(REFERENCE / name / "sound_hashes.txt", OUT / name / "game_sound_hashes.txt", 3)
         if frames is None or not (REFERENCE / name / "sound_hashes.txt").exists():
             verdict = "no reference to compare with (tools/check_scenarios.py --video --sound)"
         elif picture is not None:
             verdict = f"the picture differs from frame {picture}"
         elif sound is not None:
             verdict = f"the sound differs from frame {sound}"
+        elif work is not None:
+            verdict = f"the state differs from frame {work}"
+        elif sound_board is not None:
+            verdict = f"the sound board's memory differs from frame {sound_board}"
         else:
             verdict = "identical"
         if problem and verdict != "identical":
@@ -141,7 +158,7 @@ def main():
             verdict = problem
         return frames or 0, verdict
 
-    print(f"{'scenario':<16} {'frames':>7}  result (picture and sound, big-endian)")
+    print(f"{'scenario':<16} {'frames':>7}  result ({'state, ' if state else ''}picture and sound, big-endian)")
     failures = 0
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         for name, (frames, verdict) in zip(names, pool.map(check, names)):

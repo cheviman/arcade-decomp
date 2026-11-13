@@ -2066,9 +2066,11 @@ class FunctionWriter:
 
     def variable_at(self, address):
         """(C, bits, signed) of the variable that starts at a work RAM address, or of the element of an
-        array that does; None if none does."""
-        variables = self.emitter.memory.variables
-        scoped = self.emitter.memory.scoped.get(self.global_family) if self.global_family else None
+        array that does, or of the board's variable at an address of its plain memories (io lines there: the
+        bookkeeping's halfwords in the RAM the sound program shares); None if none does."""
+        board = memory.plain_hardware(address)
+        variables = self.emitter.memory.board if board else self.emitter.memory.variables
+        scoped = self.emitter.memory.scoped.get(self.global_family) if self.global_family and not board else None
         if scoped and address in scoped:
             item = scoped[address]
             return (f"{item.c}[0]" if item.indexed else item.c), item.bits, item.signed
