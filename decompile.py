@@ -3,7 +3,7 @@ Name:        decompile.py
 Description: decompiles the game's V70 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    30-10-2026
+Modified:    13-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--trace] [--checks] [--out DIR] [--symbols FILE]
@@ -944,6 +944,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     pointers.BOARD_STRUCTS = set(known.board_structs)
     # the program ROM's arrays of plain values a pointer walks, and its tables of records by name
     pointers.ELEMENTS = dict(known.arrays)
+    pointers.UNALIGNED = set(known.unaligned)    # (of those, the ones at addresses not a multiple of their width)
     pointers.RECORD_TABLES = dict(known.record_tables)
     pointers.FIELD_ARRAYS = {key: (int(known.fields[key][1][1:]), count) for key, count in known.field_arrays.items()}
     pointers.SCOPED_ARRAYS = {(struct, family, offset): (int(known.scoped[(struct, family)][offset][1][1:]), count)

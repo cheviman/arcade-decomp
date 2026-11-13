@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    06-11-2026
+Modified:    13-11-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -2066,9 +2066,11 @@ class FunctionWriter:
 
     def variable_at(self, address):
         """(C, bits, signed) of the variable that starts at a work RAM address, or of the element of an
-        array that does; None if none does."""
-        variables = self.emitter.memory.variables
-        scoped = self.emitter.memory.scoped.get(self.global_family) if self.global_family else None
+        array that does, or of the board's variable at an address of its plain memories (io lines there: the
+        bookkeeping's halfwords in the RAM the sound program shares); None if none does."""
+        board = memory.plain_hardware(address)
+        variables = self.emitter.memory.board if board else self.emitter.memory.variables
+        scoped = self.emitter.memory.scoped.get(self.global_family) if self.global_family and not board else None
         if scoped and address in scoped:
             item = scoped[address]
             return (f"{item.c}[0]" if item.indexed else item.c), item.bits, item.signed
@@ -3539,10 +3541,9 @@ class Emitter:
 
     def pointer_ctype(self, struct):
         """The C type of a pointer the C keeps to a 'struct': const for the program ROM's records; to one of
-        an array of plain values ("elements" lines), the values' type."""
+        an array of plain values ("elements" lines), the values' type (pointers.element_ctype)."""
         if struct in pointers.ELEMENTS:
-            bits, signed = self.layouts.TYPES[pointers.ELEMENTS[struct]]
-            value = f"{'' if signed else 'u'}int{bits}_t *"
+            value = f"{pointers.element_ctype(struct, self.layouts.TYPES)} *"
             return f"const {value}" if struct in pointers.ROM_STRUCTS else value
         return f"const struct {struct} *" if struct in pointers.ROM_STRUCTS else f"struct {struct} *"
 

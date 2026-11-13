@@ -4,7 +4,7 @@ Description: works out which registers point at which of the game's structures, 
              through them reads as a field: OBJECT(r20)->unk_30 instead of mem_read32(r20 + 0x30u)
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    06-11-2026
+Modified:    13-11-2026
 Author:      Sebastian Toyos
 
 The structures (STRUCTS) are OutRunners': the game objects (0x100 bytes, 124 of them below each screen's
@@ -137,6 +137,8 @@ RUNS = set()                   # structures laid one after another wherever a po
 ELEMENTS = {}                  # structure -> element type: an array of one value per element (symbols.txt
                                # "elements"), read as NAME(p)[i] rather than through a field; in the program
                                # ROM, the work RAM or a memory of the board
+UNALIGNED = set()              # of those, the ones the program keeps at addresses that are not a multiple of
+                               # their width ("elements ... unaligned"): read through a type of alignment 1
 RECORD_TABLES = {}             # program ROM address -> (name, ROM structure): a table of records, name[i].field
 SCOPED_ARRAYS = {}             # (struct, family, offset) -> (bits, count): a family's field that is an array
 FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that is an array of 'count' elements
@@ -144,6 +146,15 @@ FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that
 
 
 BASES = {}                     # name -> address of the program's data, for "STRUCT@NAME" (decompile.py)
+
+
+def element_ctype(struct, types):
+    """The C type of one value of an array of plain values ('struct' in ELEMENTS; 'types' the layouts' TYPES):
+    uint16_t, or unaligned_uint16 (game/support.h: the same with an alignment of 1) where the program keeps
+    them at addresses that are not a multiple of their width (UNALIGNED)."""
+    bits, signed = types[ELEMENTS[struct]]
+    name = f"{'' if signed else 'u'}int{bits}"
+    return f"unaligned_{name}" if struct in UNALIGNED else f"{name}_t"
 
 
 def link_kind(link, offset=0):
@@ -1726,8 +1737,8 @@ class Layouts:
         """The cast and function that give a pointer to one of 'struct' from its address: "(const struct
         floor_block *)rom", "(const uint16_t *)rom" for an array of plain values, "(struct object *)ram"."""
         if struct in ELEMENTS:
-            bits, signed = self.TYPES[ELEMENTS[struct]]
-            value = f"{'' if signed else 'u'}int{bits}_t"
+            bits, _ = self.TYPES[ELEMENTS[struct]]
+            value = element_ctype(struct, self.TYPES)
             if struct in ROM_STRUCTS:
                 return f"(const {value} *){ROM_FUNCTION}"
             if struct in BOARD_STRUCTS:
