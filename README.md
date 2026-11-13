@@ -46,6 +46,15 @@ Nothing here is a game's: no ROM, no names, no data.
 - `check_scenarios.py`: every control script of the game's `tests/controls/` run on the reference and on the
   game (or the translation scaffold), compared frame by frame (state, and with `--video` and `--sound` the
   pictures and the sound), and the static analysis checked against all the code the reference ran.
+- `select_scenarios.py`: which scenarios a change has to run again, the working tree against the state last
+  verified (a copy in the game's `build/verified/`, or a commit): the C function by function, comments and
+  names apart, with the declarations and the structures' members; the loaded data, by its bytes and by where
+  the loader lays out its values; the runtime and the build's files by their hashes. A function that changed
+  needs the scenarios whose reference run executed it, data that changed the ones in which the original read
+  it (`width_census.py run`), the runtime every one. `--run` runs them, `--big-endian` for a big-endian build.
+- `big_endian_scenarios.py`: the control scripts on the game built for a big-endian processor, under an
+  emulator (`qemu-ppc`, or the profile's `BIG_ENDIAN_EMULATOR`; through WSL on Windows), each frame's picture
+  and sound samples against the reference's results.
 - `verify_rom.py`: the player's ROM set checked file by file (CRC32 and SHA-1).
 - `render_state.py`: a board state the reference saved, its text layer and tilemap pages drawn as PNG.
 - `memory_census.py`: which of the board's memories each line of the C that reaches memory through an
@@ -138,8 +147,8 @@ functions and lines of code with none of it.
 
 The game's scripts in `tools/` (`decompile.py`, `decompile_sound.py`, `recompile.py`, `disassemble.py`,
 `check_structure.py`, `noise_report.py`, `coverage.py`, `check_scenarios.py`, `verify_rom.py`,
-`render_state.py`, `memory_census.py`) run the core's with the core and the game's tools on
-the path; the game's other tools add `tools/core` to their path to import the core's modules. A game takes
+`render_state.py`, `memory_census.py`, `select_scenarios.py`, `big_endian_scenarios.py`) run the core's with
+the core and the game's tools on the path; the game's other tools add `tools/core` to their path to import the core's modules. A game takes
 the core with
 
 ```bash
