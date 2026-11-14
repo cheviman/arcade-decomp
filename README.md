@@ -165,6 +165,28 @@ git submodule update --remote tools/core
 and a commit of `tools/core`. A clone of a game takes its core with `git clone --recursive`, or
 `git submodule update --init` in a clone made without it.
 
+## Projects built with it
+
+Each decompilation verified frame by frame against MAME, and its native port:
+
+- **SegaSonic The Hedgehog** (Sega System 32):
+  [segasonic-decomp](https://github.com/cheviman/segasonic-decomp) and
+  [segasonic-port](https://github.com/cheviman/segasonic-port).
+- **OutRunners** (Sega System Multi 32): [outrunners-decomp](https://github.com/cheviman/outrunners-decomp) and
+  [outrunners-port](https://github.com/cheviman/outrunners-port).
+- **Teenage Mutant Ninja Turtles** (Konami's 68000 board):
+  [tmntarcade-decomp](https://github.com/cheviman/tmntarcade-decomp) and
+  [tmnt-port](https://github.com/cheviman/tmnt-port).
+- **The Simpsons** (Konami's 053248 board): [simpsons-decomp](https://github.com/cheviman/simpsons-decomp) and
+  [simpsons-port](https://github.com/cheviman/simpsons-port).
+
+And by others:
+
+- **DonPachi** (Cave, 68000): [DonPachi Recomp](https://github.com/CapsLock4284/DonPachi-Recomp) by CapsLock4284,
+  for Windows and Linux, with the board's slowdown put back cycle for cycle.
+
+Made something with it? Open an issue and it goes on this list.
+
 ## Legal
 
 BSD 3-Clause License (see `LICENSE`). `system32/reference/mame/`, `system32/reference/ymfm/`,
