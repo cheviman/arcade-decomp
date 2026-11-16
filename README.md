@@ -113,6 +113,15 @@ for byte with the original's. `src/ram.h` declares it, with static asserts on it
 places. A structure inside another is a member of it (`member STRUCT OFFSET NAME INNER[N]` in
 `symbols.txt`: `&screen->car`).
 
+The first step out of that model: a profile that sets `memory.HOST` (OutRunners: `"world"`) keeps the variables
+`memory.HOST_VARIABLES` names in a structure of their own in the host's memory (`world->game_frame_count`), the
+ones the code reaches only by name. The state's structure keeps their places, where the generated
+`world_project` puts them (`table.c`: the runtime calls it for the state's hash each frame) and `world_unproject`
+takes them back; the functions `memory.HOST_SYNCED` names, which reach memory by its address, open the runtime's
+window around their body (`world_ram_begin`, `world_ram_end`), while which the variables are in the work RAM. Such
+a variable has no `NAME_ADDRESS`, so that a use of its address does not compile, and the decompiler stops when one
+is read or written with the next ones at once (`AS16`).
+
 Where the code reaches a structure the C keeps a pointer, not an address: in the registers the whole
 program shares (`pointers.CONTEXT_KINDS`: `current_object->state`); in a function's own variables,
 parameters and results that point at one structure of the state or one record of the program ROM (`struct

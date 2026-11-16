@@ -85,6 +85,14 @@ NAMED_BASES = {}
 STATE = None
 # (address, member, structure or None, count of structures or bytes) of the blocks of STATE's structure
 STATE_BLOCKS = ()
+# The game's variables the C keeps in a structure of their own in the host's memory, reached through a pointer of
+# this name (world->frame_count), instead of in STATE's: the ones HOST_VARIABLES names, which the code reaches only
+# by name. STATE's structure keeps their places, where the generated HOST_project puts them (the state's hash,
+# the routines that reach memory by its address) and HOST_unproject takes them back from. None: none
+HOST = None
+HOST_VARIABLES = frozenset()
+# the generated functions whose body HOST_project and HOST_unproject bracket (they reach memory by its address)
+HOST_SYNCED = frozenset()
 HARDWARE = [(0x300000, 0x320000, "VIDEO"), (0x400000, 0x420000, "SPRITE_RAM"), (0x500000, 0x500010, "SPRITE_CONTROL"),
             (0x600000, 0x610000, "PALETTE"), (0x610000, 0x620000, "MIXER"), (0x700000, 0x702000, "SOUND"),
             (0xC00000, 0xC00080, "IO"), (0xD00000, 0xD00010, "IRQ"), (0xD80000, 0xD80010, "RANDOM")]
@@ -252,11 +260,14 @@ class Item:
         self.count = None     # an array's number of elements (symbols.txt: var NAME[COUNT])
         self.unnamed = False  # a name the decompiler made up for an address symbols.txt names nothing at
         self.state = False    # a variable of the game's state, a field of STATE's structure
+        self.host = False     # ... kept in the host's memory, a field of HOST's structure
 
     @property
     def c(self):
         """The item as the C names it: a variable of the game's state as its field (game->frame_count),
         anything else by its name."""
+        if self.host:
+            return f"{HOST}->{self.name}"
         return f"{STATE}->{self.name}" if self.state else self.name
 
 
@@ -359,6 +370,8 @@ class Memory:
         if STATE is not None:
             for item in self.state_items():
                 item.state = True
+        if HOST is not None:
+            self.mark_host()
 
     def state_items(self):
         """The work RAM's variables under every name: the program's, the narrower ones over their first
@@ -367,6 +380,23 @@ class Memory:
         for items in list(self.scoped.values()) + list(self.scoped_overlays.values()):
             found += list(items.values())
         return [item for item in found if work_ram(item.address)]
+
+    def mark_host(self):
+        """The variables HOST_VARIABLES names as kept in the host's memory: each a variable of the work RAM that
+        shares no byte with another name (a narrower one over it, a family's own)."""
+        items = self.state_items()
+        size = lambda item: item.bits // 8 * ((item.count or 1) if item.indexed else 1)
+        for name in sorted(HOST_VARIABLES):
+            item = next((item for item in items if item.name == name), None)
+            if item is None:
+                raise SystemExit(f"HOST_VARIABLES: no variable {name} in the work RAM")
+            if item.indexed and item.count is None:
+                raise SystemExit(f"HOST_VARIABLES: {name} is an array with no count of its own")
+            for other in items:
+                if other is not item and other.address < item.address + size(item) \
+                        and item.address < other.address + size(other):
+                    raise SystemExit(f"HOST_VARIABLES: {name} shares bytes with {other.name}")
+            item.host = True
 
     def add_unnamed(self, items, widths, name_of):
         for address, counts in sorted(widths.items()):
@@ -576,6 +606,8 @@ class Memory:
 
     @staticmethod
     def declare(item, macro, function):
+        if item.host:
+            return []    # (in the host's memory: no address, which nothing may reach it by)
         kind = TYPES[item.bits]
         if item.signed:
             kind = kind[1:]
@@ -679,6 +711,45 @@ class Memory:
         lines += [f"_Static_assert(offsetof(struct {STATE}, {member}) == 0x{address - start:X}, "
                   f"\"{member} at its place in the work RAM\");" for address, _, _, member in blocks]
         return lines + [f"extern struct {STATE} *{STATE};"]
+
+    def host_items(self):
+        return sorted((item for item in self.state_items() if item.host), key=lambda item: item.address)
+
+    def host_declaration(self):
+        """C lines for the game's variables in the host's memory (HOST): their structure, its pointer, and the
+        functions that put them into the work RAM at their places (HOST_project) and take them back."""
+        if HOST is None:
+            return []
+        lines = NOTES.get("host", []) + [f"struct {HOST}", "{"]
+        for item in self.host_items():
+            kind = TYPES[item.bits][1:] if item.signed else TYPES[item.bits]
+            lines.append(f"\t{kind} {item.name}" + (f"[0x{item.count:X}]" if item.indexed else "") + ";")
+        return lines + ["};", f"extern struct {HOST} *{HOST};", f"void {HOST}_project(void);",
+                        f"void {HOST}_unproject(void);",
+                        f"void {HOST}_clear(void);"]
+
+    def host_projection(self):
+        """C lines of the variables' structure (the runtime's one world: HOST points at it), HOST_clear, which
+        clears them with the work RAM, HOST_project and HOST_unproject."""
+        if HOST is None:
+            return []
+        lines = [f"/* the game's variables the C keeps in the host's memory (struct {HOST}), the runtime's one world's */",
+                 f"static struct {HOST} first_{HOST};", f"struct {HOST} *{HOST} = &first_{HOST};", "",
+                 "/* cleared with the work RAM */", f"void {HOST}_clear(void)", "{",
+                 f"\tmemset({HOST}, 0, sizeof *{HOST});", "}", ""]
+        comments = {f"{HOST}_project": "/* into the work RAM at their places, where the state's hash and the code that "
+                                       "reaches memory by its\n   address read them */",
+                    f"{HOST}_unproject": "/* back from the work RAM, after code that reaches memory by its address */"}
+        for function, to, source in ((f"{HOST}_project", STATE, HOST), (f"{HOST}_unproject", HOST, STATE)):
+            lines += [comments[function], f"void {function}(void)", "{"]
+            for item in self.host_items():
+                if item.indexed:
+                    lines += [f"\tfor (size_t index = 0; index < 0x{item.count:X}; index++)",
+                              f"\t\t{to}->{item.name}[index] = {source}->{item.name}[index];"]
+                else:
+                    lines.append(f"\t{to}->{item.name} = {source}->{item.name};")
+            lines += ["}", ""]
+        return lines[:-1]
 
     def loaded_tables(self):
         """[(address, name)] of the tables the game loads (LOADED_TABLES): the plain ones and the tables of

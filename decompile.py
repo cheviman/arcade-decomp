@@ -1203,7 +1203,18 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         + "\n".join(numbers) + "\n\n/* the game's structures in work RAM */\n"
         + "\n".join(emitter.layouts.declarations()) + "\n\n"
         + ("\n".join(memory.NOTES.get("state", []) + named.state_declaration()) + "\n\n" if memory.STATE else "")
+        + ("\n".join(named.host_declaration()) + "\n\n" if memory.HOST else "")
         + "#endif\n", encoding="ascii")
+    if memory.HOST:
+        # (a variable read or written with the next ones at once, AS16(world->x), would take another's bytes in
+        # the host's memory: it stays in the work RAM)
+        wide = sorted({found for text in texts.values()
+                       for found in re.findall(rf"\b(?:AS|AT)\d+S?\(\s*{memory.HOST}->(\w+)", text)})
+        if wide:
+            raise SystemExit("HOST_VARIABLES: reached with the next variables at once: " + ", ".join(wide))
+    for entry, text in texts.items():
+        if memory.HOST and names.get(entry) in memory.HOST_SYNCED:
+            texts[entry] = host_synced(text, names[entry])
     write_sources(out_dir, files, texts, "game.h", keep=("sound",))
 
     wrappers = []
@@ -1232,7 +1243,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         f"const size_t game_context_count = {len(signatures.CONTEXT)};\n\n" + "\n".join(wrappers) + "\n"
         "/* the code calls through memory slots and interrupts can reach, by address */\n"
         "const game_code_entry game_code[] =\n{\n" + "\n".join(rows) + "\n};\n\n"
-        f"const size_t game_code_count = {len(rows)};\n\n" + registry + entry_text, encoding="ascii")
+        f"const size_t game_code_count = {len(rows)};\n\n" + registry
+        + ("\n".join(named.host_projection()) + "\n\n" if memory.HOST else "") + entry_text, encoding="ascii")
     branches = sum(isinstance(block.end, ir.Branch) for function in built.values() for block in function.blocks.values())
     gotos = sum(text.count("goto ") for text in texts.values())
     with_gotos = sum(1 for text in texts.values() if "goto " in text)
@@ -1275,6 +1287,30 @@ def write_variables(path, writers, names, texts):
                              for spot, value, how in sorted(set(sites), key=lambda site: (str(site[0]), site[1])))
             lines.append(f"{names[entry]}  {name}  {spots}")
     Path(path).write_text("\n".join(lines) + "\n", encoding="ascii")
+
+
+def host_synced(text, name):
+    """A function that reaches memory by its address (memory.HOST_SYNCED), with the game's variables the C keeps in
+    the host's memory in the work RAM while it runs (HOST_ram_begin, HOST_ram_end: the runtime's)."""
+    lines = text.split("\n")
+    out = []
+    started = False
+    for number, line in enumerate(lines):
+        stripped = line.strip()
+        if started and re.match(r"return\b", stripped):
+            before = next((earlier for earlier in reversed(lines[:number]) if earlier.strip()), "")
+            if before.rstrip().endswith(")") and not before.rstrip().endswith(("{", ";")):
+                raise SystemExit(f"{name}: a return under an if with no braces, which HOST_unproject would leave out")
+            out.append(line[:len(line) - len(line.lstrip())] + f"{memory.HOST}_ram_end();")
+        out.append(line)
+        if not started and line == "{":
+            out.append(f"\t{memory.HOST}_ram_begin();")
+            started = True
+    last = max(number for number, line in enumerate(out) if line == "}")
+    before = next(line for line in reversed(out[:last]) if line.strip())
+    if not re.match(r"\treturn\b", before):
+        out.insert(last, f"\t{memory.HOST}_ram_end();")
+    return "\n".join(out)
 
 
 def main():
