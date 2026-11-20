@@ -34,6 +34,7 @@ finds nothing to do, where the runtime moves the board to its next VBLANK when t
 interrupt the board raised is taken after that instruction, as MAME's core takes it; after an instruction
 that writes the status register too, which may unmask one. Instructions take no time.
 """
+import importlib
 import sys
 from pathlib import Path
 
@@ -41,16 +42,27 @@ import game_profile  # noqa: E402  (the game's: its root, its ROM set, its setti
 import recompile  # noqa: E402  (the V60's scaffold: how functions are split, named and shared)
 from v60 import ir  # noqa: E402
 
-from . import analysis  # noqa: E402
 from . import disassembler as dis  # noqa: E402
 from . import emit_c  # noqa: E402
 from . import lift  # noqa: E402
 
+# the static analysis: the profile's ANALYSIS (the core's, or the core's with a compiler's ways), as the
+# disassembly and the coverage take it
+analysis = importlib.import_module(getattr(game_profile, "ANALYSIS", "m68000.analysis"))
+
 ROOT = game_profile.ROOT
 FUNCTIONS_PER_FILE = 120
 VECTORS = range(1, 48)
-# the main loop's idle point: the instruction that finds nothing to do (TMNT: 0013CE, the empty command queue)
+# the main loop's idle point: the instruction that finds nothing to do (TMNT: 0013CE, the empty command queue),
+# where the runtime asks whether the program is idle (program_frame_wait); or a tuple of the backward branches
+# (or bra) of the loops that wait until an interrupt changes what they read (Spinball: the frame count, the
+# requests the VBLANK serves, a timer it counts down), where the runtime asks the game whether the program has
+# nothing to do when it takes the branch (program_frame_wait_at(BRANCH): a loop that only reads and tests always)
+# and moves the board on if so; the interrupt comes after the loop's first instruction, as MAME's core takes one
+# raised before an instruction after it
 FRAME_WAIT = getattr(game_profile, "FRAME_WAIT", None)
+FRAME_WAITS = () if FRAME_WAIT is None else (FRAME_WAIT,) if isinstance(FRAME_WAIT, int) else tuple(FRAME_WAIT)
+SPIN_WAITS = isinstance(FRAME_WAIT, (tuple, list))
 # the game's code the board's runtime puts its own in place of: {start: (the runtime's function, where the
 # game's code goes on)} (TMNT: the boot's ROM test, which sums chips the game does not have)
 REPLACED_CODE = getattr(game_profile, "REPLACED_CODE", {})
@@ -129,6 +141,10 @@ class Program(recompile.Program):
             self.bodies[starts[0]] = self.walk(starts[0])
         self.split_shared_code()
         self.names = self.choose_names()
+        # where an interrupt raised at a frame wait is taken: after that instruction, or with spin waits after the
+        # first instruction of the loop
+        self.wait_points = set(FRAME_WAITS) if not SPIN_WAITS else {
+            key(instructions[wait].target) for wait in FRAME_WAITS if wait in instructions}
 
     def successors(self, instruction):
         """Addresses execution can go on at inside the same function"""
@@ -203,8 +219,15 @@ class FunctionWriter:
             lines.append(printer.statement(statement))
 
         control = lifter.control
-        if control.kind == "goto":
+        if control.kind == "goto" and SPIN_WAITS and address in FRAME_WAITS:
+            # the loop goes round: the board moves on to its next frame if the program has nothing to do
+            lines += [f"program_frame_wait_at({const(address)});", self.transfer(control.target)]
+        elif control.kind == "goto":
             lines.append(self.transfer(control.target))
+        elif control.kind == "branch" and SPIN_WAITS and address in FRAME_WAITS:
+            # the loop goes round: the program has nothing to do, and the board moves on to its next frame
+            lines += [f"if ({printer.expr(control.condition)})", "{", f"\tprogram_frame_wait_at({const(address)});",
+                      f"\t{self.transfer(control.target)}", "}"]
         elif control.kind == "branch":
             lines += [f"if ({printer.expr(control.condition)})", f"\t{self.transfer(control.target)}"]
         elif control.kind == "call":
@@ -213,10 +236,10 @@ class FunctionWriter:
             lines += [f"m68k_jump({printer.expr(control.address)}, {const(address)});", "return;"]
         elif control.kind == "return":
             lines += [f"cpu.pc = {printer.expr(control.address)};", "return;"]
-        elif writes_sr or address == FRAME_WAIT:
+        elif writes_sr or address in self.program.wait_points:
             # an interrupt the board raised (or one the new mask lets through) comes after the instruction
             lines.append(f"m68k_take_interrupts({const(next_address)});")
-        if address == FRAME_WAIT:
+        if address in FRAME_WAITS and not SPIN_WAITS:
             # the main loop finds nothing to do: the board moves on to its next frame
             lines.insert(0, "program_frame_wait();")
         if not lines:
@@ -255,8 +278,13 @@ def main(arguments):
     image = game_profile.rom.build_program(game_profile.rom.load_set(source))
     symbols = analysis.load_symbols(ROOT / "symbols.txt")
     program = Program(image, symbols)
-    if FRAME_WAIT not in program.analysis.instructions:
-        raise SystemExit(f"game_profile.py: FRAME_WAIT {FRAME_WAIT:06X} is no instruction of the program")
+    for wait in FRAME_WAITS:
+        if wait not in program.analysis.instructions:
+            raise SystemExit(f"game_profile.py: FRAME_WAIT {wait:06X} is no instruction of the program")
+        instruction = program.analysis.instructions[wait]
+        if SPIN_WAITS and (instruction.flow not in (dis.FLOW_BRANCH, dis.FLOW_JUMP) or instruction.target is None
+                           or key(instruction.target) >= wait):
+            raise SystemExit(f"game_profile.py: FRAME_WAIT {wait:06X} is no branch back to a loop")
 
     out_dir = ROOT / "build" / "generated"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -267,7 +295,9 @@ def main(arguments):
     prototypes = [f"void {program.names[entry]}(void);" for entry in entries]
     (out_dir / "program.h").write_text(
         HEADER + f"#ifndef {game_profile.GUARD}_PROGRAM_H\n#define {game_profile.GUARD}_PROGRAM_H\n\n"
-        + f"#define PROGRAM_FRAME_WAIT {const(FRAME_WAIT)}\n\n"
+        + (f"#define PROGRAM_FRAME_WAIT {const(FRAME_WAIT)}\n\n" if isinstance(FRAME_WAIT, int) else
+           "/* the frame waits: the branches of the loops that spin (program_frame_wait_at) */\n"
+           + "".join(f"#define PROGRAM_FRAME_WAIT_{wait:06X} {const(wait)}\n" for wait in FRAME_WAITS) + "\n")
         + "".join(f"void {function}(void);    /* the runtime's, in place of {start:06X} */\n"
                   for start, (function, _) in sorted(REPLACED_CODE.items()))
         + "\n" + "\n".join(prototypes) + "\n\n#endif\n",

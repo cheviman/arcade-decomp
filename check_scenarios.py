@@ -61,6 +61,9 @@ CONTROLS = ROOT / "tests" / "controls"
 RESULTS = ROOT / "build" / "scenarios"
 BIN = ROOT / "build" / "bin"
 SOUND_TIMING = ROOT / "build" / "sound" / "timing.txt"
+# what the reference takes to run as the game runs, for the comparison (mdref: --timing frames; kref and s32ref
+# do by default); the runs on the reference alone keep its own pace
+REFERENCE_OPTIONS = list(getattr(game_profile, "REFERENCE_OPTIONS", []))
 
 
 def executable(name):
@@ -68,9 +71,9 @@ def executable(name):
     return path if path.exists() else BIN / name
 
 
-def run_reference(script, out, video, sound=False, timing=True):
+def run_reference(script, out, video, sound=False, timing=True, options=()):
     out.mkdir(parents=True, exist_ok=True)
-    extra = ["--video-hashes", str(out / "video_hashes.txt")] if video else []
+    extra = list(options) + (["--video-hashes", str(out / "video_hashes.txt")] if video else [])
     if sound:
         extra += (["--sound-timing", str(SOUND_TIMING)] if timing else []) + ["--sound-hashes", str(out / "sound_hashes.txt"),
                                                                              "--sound-trace", str(out / "sound_executed.txt")]
@@ -220,7 +223,7 @@ def main():
         out = RESULTS / name
         reused = native_only and (out / "hashes.txt").exists() and (not video or (out / "video_hashes.txt").exists()) \
             and (not sound or (out / "sound_hashes.txt").exists())
-        stopped = None if reused else run_reference(script, out, video, sound)
+        stopped = None if reused else run_reference(script, out, video, sound, options=REFERENCE_OPTIONS)
         problem = run_native(script, out, game, video, sound)
         frames, differs = compare(out / "hashes.txt", out / GAMES[game][1])
         video_differs = compare(out / "video_hashes.txt", out / "game_video_hashes.txt")[1] if video else None
