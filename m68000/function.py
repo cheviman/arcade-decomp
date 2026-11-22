@@ -36,13 +36,16 @@ The status register's mode bit swaps the stack pointers on the 68000: the C has 
 slots), so a write of the status register is the interrupt mask and the flags (write_sr), and USP is never read
 but in the stretch left out.
 """
+import importlib
+
 from decompiler.function import Block, Function
 from v60 import ir
 
 import game_profile
 import recompile
 
-from . import analysis
+# the static analysis with the game's compiler's ways (the profile's ANALYSIS, as the scaffold's translate.py takes it)
+analysis = importlib.import_module(getattr(game_profile, "ANALYSIS", "m68000.analysis"))
 from . import disassembler as dis
 from . import lift
 
@@ -55,6 +58,10 @@ INTERRUPT_STACK_SWITCH = getattr(game_profile, "INTERRUPT_STACK_SWITCH", None)
 # stretches where a privileged instruction needs no check of the mode
 SUPERVISOR_CODE = getattr(game_profile, "SUPERVISOR_CODE", ())
 REPLACED_CODE = getattr(game_profile, "REPLACED_CODE", {})
+# whether a place symbols.txt names as a function, or the analysis enters as one, that only branches, jumps and a
+# switch's cases reach (no call) is a place in the code that goes there instead (the profile's LABELS_NOT_ENTRIES:
+# Sonic Spinball's symbols.txt names every piece the translation scaffold split its C functions into)
+LABELS_NOT_ENTRIES = getattr(game_profile, "LABELS_NOT_ENTRIES", False)
 # the devices that do something when read (TMNT's K051960 in its ROM readback mode): a read there stays, its value
 # used or not
 EFFECT_READ_AREAS = list(getattr(game_profile, "EFFECT_READ_AREAS", ()))
@@ -90,7 +97,8 @@ class Found(analysis.Analysis):
         values = state.get(operand.reg) if operand.mode in ("indirect", "disp") else None
         found = self.computed_values.setdefault(instruction.address, set())
         found.update(analysis.known(values))
-        self.in_computed = True
+        # (a switch's cases are places in its function, not code reached as a function)
+        self.in_computed = self.switch_table(instruction) is None
         try:
             super().computed(instruction, state, block)
         finally:
@@ -105,6 +113,9 @@ class Found(analysis.Analysis):
         """The code a jump or call through a register at 'address' can reach (sorted), from what the register can
         hold: addresses, entries of tables of code, entries of tables of tables, fields of tables of records"""
         instruction = self.instructions[address]
+        table = self.switch_table(instruction)
+        if table is not None:
+            return sorted(target for target in set(self.switch_tables.get(table, ())) if target in self.instructions)
         operand = instruction.operands[0]
         offset = operand.disp if operand.mode == "disp" else 0
         found = set()
@@ -147,7 +158,22 @@ class Program(recompile.Program):
             entries.update(table)
         for table in self.analysis.field_tables.values():
             entries.update(table)
-        entries.update(address for address, symbol in symbols.items() if symbol.kind in ("func", "code"))
+        named = {address for address, symbol in symbols.items() if symbol.kind in ("func", "code")}
+        if LABELS_NOT_ENTRIES:
+            # a place symbols.txt names that only a branch, a jump or a switch's case reaches is a place in the
+            # function that goes there, not a function of its own
+            called = {key(instruction.target) for instruction in instructions.values()
+                      if instruction.flow == dis.FLOW_CALL and instruction.target is not None}
+            for address, instruction in instructions.items():
+                if instruction.flow == dis.FLOW_CALL and instruction.target is None:
+                    called.update(self.analysis.targets(address))
+            branched = {key(instruction.target) for instruction in instructions.values()
+                        if instruction.flow in (dis.FLOW_JUMP, dis.FLOW_BRANCH) and instruction.target is not None}
+            for cases in getattr(self.analysis, "switch_tables", {}).values():
+                branched.update(cases)
+            entries = {address for address in entries if address in called or address not in branched}
+            named = {address for address in named if address in called or address not in branched}
+        entries.update(named)
         entries -= set(self.return_points)
         entries |= set(self.register_routines)
         self.entries = {address for address in entries if address in instructions}
@@ -235,6 +261,11 @@ class Program(recompile.Program):
             following.append(key(address + instruction.length))
         if flow in (dis.FLOW_BRANCH, dis.FLOW_JUMP) and instruction.target is not None:
             following.append(key(instruction.target))
+        if flow == dis.FLOW_JUMP and instruction.target is None:
+            # a compiler's switch: its cases (the game's analysis reads them)
+            table = self.analysis.switch_table(instruction)
+            if table is not None:
+                following += [case for case in self.analysis.switch_tables.get(table, ()) if case in self.analysis.instructions]
         return following
 
     def choose_names(self):
