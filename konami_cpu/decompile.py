@@ -787,6 +787,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     emitter.param_kinds = hints
     emitter.flow = flow
     emitter.result_bits = dict(cleanup.RESULT_BITS)
+    emitter.windows = dict(known.windows)
     emitter.code_addresses = {}
     emitter.data_labels = {key: name for key, name in data_names.items() if key not in named.tables}
     emitter.code_labels = {}
@@ -907,8 +908,16 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     labels = [f"#define {name}_ADDRESS 0x{emit.cpu_of_key(key):04X}u    /* {key - emit.PLACES:06X} */"
               for key, name in sorted(emitter.data_labels.items())
               if emit.PLACES <= key < emit.PLACES + emit.PROGRAM_SIZE and name not in declared]
+    unused = sorted([f"constant {function} {value:X} {name}" for (function, value), name in emitter.constants.items()
+                     if (function, value) not in emitter.constants_used]
+                    + [f"window {function} {low:X} {high:X}" for function, low, high in emitter.windows
+                       if (function, low, high) not in emitter.windows_used])
+    if unused:
+        raise SystemExit(f"{SYMBOLS.name} names numbers the C does not use: " + ", ".join(unused))
+    # (a macro of the runtime's, NAME(ARGS), is the runtime's to define)
     numbers = [f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
-                                                                          in emitter.constants.items()})]
+                                                                          in emitter.constants.items()})
+               if "(" not in name]
     (out_dir / "ram.h").write_text(
         file_header("ram.h", "the game's variables, tables, board registers and structures")
         + f"#ifndef {guard}_RAM_H\n#define {guard}_RAM_H\n\n"

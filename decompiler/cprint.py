@@ -550,6 +550,10 @@ class Printer:
         """The name a constant compared as a signed number has (a table's address), or None."""
         return None
 
+    def number_name(self, node):
+        """The name the function gives the number 'node' (a symbols.txt constant line), or None."""
+        return None
+
     def signed_compare(self, node):
         name, (left_node, right_node) = node.name, node.args
         width = left_node.bits
@@ -557,6 +561,9 @@ class Printer:
 
         def side(operand):
             if isinstance(operand, ir.Const):
+                number = self.number_name(operand)
+                if number is not None:
+                    return number    # a number of the function by its name (a screen's edge)
                 named = self.constant_name(operand)
                 if named is not None:
                     return f"({SIGNED[width]}){named}"    # (an address compared as a signed number)
