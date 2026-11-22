@@ -82,6 +82,11 @@ FIELD2 = "field of what an entry points at"     # (FIELD2, (table, offset))
 # the register that holds the object a handler runs on (TMNT's A0), if the game's profile says: a long the
 # code stores in one of its fields is what a long read from that field gives, wherever the object is
 OBJECT_REGISTER = getattr(game_profile, "OBJECT_REGISTER", None)
+# whether a function leaves alone the address registers it saves on entry ("movem.l LIST, -(A7)", after a
+# "link An" if it has one, whose An unlk gives back): the compiler's convention, whatever the function does to
+# them before it puts them back (the profile's CALLEE_SAVED; Sonic Spinball's C keeps its function pointers in
+# A3-A5 across its calls)
+CALLEE_SAVED = getattr(game_profile, "CALLEE_SAVED", False)
 TABLE_BASES = (CONSTANT, CURSOR)    # what a table is read from: its address, or a place in it
 # whether a table stops at a place the code names as data even where that place holds a zero, which would otherwise
 # be taken for an unused state first (the profile's TABLE_ENDS_BEFORE_UNUSED: TMNT's 049BC8 went on past the arc at
@@ -424,6 +429,11 @@ class Analysis:
             if held is not None and held != TOO_MANY:
                 self.fields_found.setdefault(operands[1].disp, set()).update(held)
 
+    def switch_table(self, instruction):
+        """The table of a compiler's switch the jump 'instruction' goes through, where the game's analysis reads
+        them (its switch_tables: {table: the cases' code}); None for any other jump"""
+        return None
+
     def computed(self, instruction, state, block):
         """A jump or call through a register: where it can go"""
         operand = instruction.operands[0]
@@ -555,18 +565,31 @@ class Analysis:
                 elif instruction.flow != dis.FLOW_RETURN:
                     work.append(after)
             own[function], calls[function] = written, callees
-        changed = {function: set(written) for function, written in own.items()}
+        saved = {function: self.saved_on_entry(function) for function in own} if CALLEE_SAVED else {}
+        changed = {function: set(written) - saved.get(function, frozenset()) for function, written in own.items()}
         growing = True
         while growing:
             growing = False
             for function, callees in calls.items():
                 for callee in callees:
-                    more = changed.get(callee, ADDRESS_REGISTERS) - changed[function]
+                    more = changed.get(callee, ADDRESS_REGISTERS) - changed[function] - saved.get(function, frozenset())
                     if more:
                         changed[function] |= more
                         growing = True
         return {function: frozenset(ADDRESS_REGISTERS - written) for function, written in changed.items()
                 if not ADDRESS_REGISTERS <= written}
+
+    def saved_on_entry(self, function):
+        """The address registers a function saves as it starts (CALLEE_SAVED): a "link An" first (An, which unlk
+        gives back), then a "movem.l LIST, -(A7)"'s"""
+        found = set()
+        instruction = self.instructions.get(function)
+        if instruction is not None and instruction.mnemonic == "link":
+            found.add(instruction.operands[0].reg)
+            instruction = self.instructions.get(function + instruction.length)
+        if instruction is not None and instruction.mnemonic == "movem" and instruction.operands[0].mode == "reglist"                 and instruction.operands[1].mode == "predec" and instruction.operands[1].reg == "A7":
+            found.update(instruction.operands[0].registers)
+        return frozenset(found & ADDRESS_REGISTERS) - {"A7"}
 
     def walk_all(self):
         for vector in VECTORS:
