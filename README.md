@@ -9,8 +9,9 @@ ROM, which this is made for (a PC or console game, with an operating system and 
 
 The root holds what any arcade game uses; a family of boards gets a folder of its own: `system32/` holds
 Sega's System 32 and Multi 32 (the reference that runs the original on MAME's cores; the board in C will
-follow), `konami/` Konami's 68000 boards (MAME's `tmnt.cpp` family: TMNT, Cue Brick, M.I.A. and their
-successors), and the CPUs and boards of the next families come the same way (Konami's 053248 boards).
+follow), `konami/` Konami's boards (the 68000's of MAME's `tmnt.cpp` family: TMNT, Cue Brick, M.I.A. and
+their successors; and the 053248's of `simpsons.cpp`, whose CPU is in `konami_cpu/`), with what Konami's
+games have in common in [konami/README.md](konami/README.md).
 
 Each game keeps this repository in its `tools/core/` (a git submodule: the game's repository holds which
 commit of the core it uses, not the core), and its own `tools/game_profile.py` tells the core about it.
