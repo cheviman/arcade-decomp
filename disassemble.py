@@ -131,7 +131,7 @@ def parse_layout(attributes, where):
 
 
 NAME_KINDS = ("var", "io", "table", "struct", "field", "register", "scoped", "param", "result", "local", "port",
-              "file", "anchor", "comment", "elements", "constant", "task", "unread", "exit", "member")    # names for the decompiled C (load_names; file lines:
+              "file", "anchor", "comment", "elements", "constant", "window", "task", "unread", "exit", "member")    # names for the decompiled C (load_names; file lines:
                                               # decompile.source_files)
 
 
@@ -227,6 +227,9 @@ class Names(NamedTuple):
                                 # addresses that are not a multiple of their width and reads there whole (a list of
                                 # halfwords at an odd address in a table's piece): the C reads them through a type of
                                 # alignment 1 (unaligned_int16...), which any processor reads where they are
+    windows: dict = None    # (function name, low, high) -> (macro, its other arguments): the function's
+                            # unsigned test of a value against that range, as the runtime's
+                            # MACRO(value, ...) (window lines)
 
 
 def load_names(path, registers=None):
@@ -286,7 +289,13 @@ def load_names(path, registers=None):
                                          follows), so the C writes it as VARIABLE's address less OFFSET
         comment  FUNCTION TEXT           what the C says about the function, in a /* */ block above it
         constant FUNCTION VALUE NAME     a number the function uses (VALUE in hexadecimal), by name: a
-                                         divisor, a count, a code the program compares with
+                                         divisor, a count, a code the program compares with; NAME(ARGS)
+                                         is a macro of the runtime's (its value VALUE in the original, a
+                                         port's own in a build of its), which ram.h does not define
+        window   FUNCTION LOW HIGH MACRO ARG...   the function's unsigned test of a 16-bit value against
+                                         the range LOW-HIGH (HIGH not in it; hexadecimal) written as the
+                                         runtime's MACRO(value, ARG, ...) (!MACRO when the test is that the
+                                         value is outside): a screen's edges a port's wider screen moves
         task     FUNCTION                a task starts there, from an interrupt frame the game writes (the
                                          runtime runs it by its address)
         unread   FUNCTION RN             the function reads RN before it sets it only on a path the game
@@ -298,7 +307,7 @@ def load_names(path, registers=None):
     'registers' ({name: number}) lets param and local lines name a register by its name (hl, iy) on a
     processor whose registers have names; RN works on any."""
     names = Names({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, set(), {}, {}, {}, {}, {}, {}, {}, {},
-                  set(), {}, set(), set(), {}, {}, {}, set(), set())
+                  set(), {}, set(), set(), {}, {}, {}, set(), set(), {})
     registers = registers or {}
 
     def register_number(text):
@@ -326,14 +335,28 @@ def load_names(path, registers=None):
             continue
         where = f"{path.name}:{number}"
         if parts[0] == "constant":
-            if len(parts) != 4 or not parts[1].isidentifier() or not re.fullmatch(r"[0-9A-Fa-f]+", parts[2]) \
-                    or not re.fullmatch(r"[A-Z][A-Z0-9_]*", parts[3]):
-                raise SystemExit(f"{where}: expected 'constant FUNCTION VALUE NAME' (NAME in capitals)")
+            # NAME, or a macro of the runtime's with its arguments (spaces in them kept)
+            named = " ".join(parts[3:])
+            if len(parts) < 4 or not parts[1].isidentifier() or not re.fullmatch(r"[0-9A-Fa-f]+", parts[2]) \
+                    or not re.fullmatch(r"[A-Z][A-Z0-9_]*(\(.*\))?", named) or len(parts) > 4 and "(" not in named:
+                raise SystemExit(f"{where}: expected 'constant FUNCTION VALUE NAME' (NAME in capitals, or a "
+                                 f"macro NAME(ARGS))")
             value = int(parts[2], 16)
             for (_, other), name in names.constants.items():
-                if name == parts[3] and other != value:
-                    raise SystemExit(f"{where}: {parts[3]} is 0x{other:X} already")
-            names.constants[(parts[1], value)] = parts[3]
+                if name == named and other != value:
+                    raise SystemExit(f"{where}: {named} is 0x{other:X} already")
+            names.constants[(parts[1], value)] = named
+            continue
+        if parts[0] == "window":
+            if len(parts) < 5 or not parts[1].isidentifier() \
+                    or not all(re.fullmatch(r"[0-9A-Fa-f]+", part) for part in parts[2:4]) \
+                    or not re.fullmatch(r"[A-Z][A-Z0-9_]*", parts[4]):
+                raise SystemExit(f"{where}: expected 'window FUNCTION LOW HIGH MACRO ARG...' (MACRO in capitals)")
+            low, high = int(parts[2], 16), int(parts[3], 16)
+            if not low < high <= 0x10000 or high - low >= 0x10000:
+                raise SystemExit(f"{where}: the range {parts[2]}-{parts[3]} is no 16-bit range")
+            names.windows[(parts[1], low, high)] = (parts[4], parts[5:])
+            continue
 
 
         if parts[0] == "task":
