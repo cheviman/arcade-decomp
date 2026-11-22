@@ -78,18 +78,45 @@
 #include "emu.h"
 #include "m68000.h"
 
+// The board whose model this runs against: K_BOARD is the prefix of its names (tmnt_read16, "tmnt/machine.h")
+// and K_BOARD_UPPER the one of its constants (TMNT_LINE_CYCLES). KB(read16), KBC(LINE_CYCLES) and
+// KB_HEADER(machine.h) write them. The game's CMakeLists.txt sets both; unset, the board is TMNT's
+#ifndef K_BOARD
+#define K_BOARD tmnt
+#define K_BOARD_UPPER TMNT
+#endif
+#define KB_JOIN2(prefix, name) prefix##_##name
+#define KB_JOIN(prefix, name) KB_JOIN2(prefix, name)
+#define KB(name) KB_JOIN(K_BOARD, name)
+#define KBC(name) KB_JOIN(K_BOARD_UPPER, name)
+#define KB_TEXT2(text) #text
+#define KB_TEXT(text) KB_TEXT2(text)
+#define KB_HEADER(file) KB_TEXT(K_BOARD/file)
+
+#ifndef K_NO_ASSETS // kref: assets
 #include "game/assets.h"
+#endif // kref: assets
 #include "game/data.h"
 #include "game/extract.h"
+#ifndef K_NO_SOUND // kref: sound
 #include "ksound.h"
+#endif // kref: sound
+#ifndef K_NO_VIDEO // kref: video
 #include "kvideo.h"
-#include "tmnt/frame.h"
-#include "tmnt/machine.h"
-#include "tmnt/script.h"
-#include "tmnt/video.h"
+#endif // kref: video
+#ifndef K_NO_FRAME_WAIT // kref: frame-wait
+#include KB_HEADER(frame.h)
+#endif // kref: frame-wait
+#include KB_HEADER(machine.h)
+#include KB_HEADER(script.h)
+#ifndef K_NO_VIDEO // kref: video
+#include KB_HEADER(video.h)
+#endif // kref: video
+#ifndef K_NO_SOUND // kref: sound
 #ifdef K_GAME_SOUND_BOARD
-#include "tmnt/sound_board.h"
+#include KB_HEADER(sound_board.h)
 #endif
+#endif // kref: sound
 
 #include <cinttypes>
 #include <cstdio>
@@ -107,7 +134,7 @@ namespace {
 class reference_cpu : public m68000_device
 {
 public:
-	reference_cpu() : m68000_device(m_config, "maincpu", nullptr, TMNT_CPU_CLOCK) {}
+	reference_cpu() : m68000_device(m_config, "maincpu", nullptr, KBC(CPU_CLOCK)) {}
 	u32 pc() const { return m_ipc; }
 
 private:
@@ -125,7 +152,7 @@ uint64_t g_irq_frames = 0;
 // The board's interrupt line as the 68000 sees it, after anything that can change it
 void sync_irq()
 {
-	const int level = tmnt_irq_level();
+	const int level = KB(irq_level)();
 	if (level == g_irq_level)
 		return;
 	if (g_irq_level)
@@ -139,19 +166,33 @@ void sync_irq()
 std::set<uint64_t> g_rom_reads;
 bool g_record_rom_reads = false;
 
+#ifndef K_NO_SOUND // kref: sound
 // --sound-commands: the commands the 68000 gives the sound board, with the frame they come in
 std::vector<std::pair<uint64_t, uint8_t>> g_sound_commands;
 void (*g_raise_sound_irq)(void) = nullptr;
+#endif // kref: sound
 uint64_t g_frame = 0;
+#ifndef K_NO_SOUND // kref: sound
 
 void log_sound_command()
 {
-	g_sound_commands.emplace_back(g_frame, tmnt_board.sound_latch);
+	g_sound_commands.emplace_back(g_frame, KB(board).sound_latch);
 	g_raise_sound_irq();
+}
+#endif // kref: sound
+
+// The 68000's present within its slice (run_until): a board model that keeps a 'now' (its EEPROM's timing, its
+// VBLANK line) gets it before every access; one without the field is left as it is
+uint64_t present_cycle();
+template <typename Board> void tell_present(Board &board)
+{
+	if constexpr (requires { board.now = uint64_t(0); })
+		board.now = present_cycle();
 }
 
 u16 bus_read(offs_t address, u16 mem_mask)
 {
+	tell_present(KB(board));
 	if (g_record_rom_reads && !g_reading_instructions && (address & 0xFFFFFF) < GAME_PROGRAM_SIZE)
 	{
 		const uint64_t pc = uint64_t(g_cpu->pc()) << 24;
@@ -160,7 +201,7 @@ u16 bus_read(offs_t address, u16 mem_mask)
 		if (mem_mask & 0x00FF)
 			g_rom_reads.insert(pc | ((address & 0xFFFFFE) + 1));
 	}
-	return tmnt_read16(address, mem_mask);
+	return KB(read16)(address, mem_mask);
 }
 
 // The ROM reads as "PC FIRST-LAST" lines: by instruction, runs of consecutive bytes
@@ -195,7 +236,8 @@ void write_rom_reads(const std::string &path)
 
 void bus_write(offs_t address, u16 data, u16 mem_mask)
 {
-	tmnt_write16(address, data, mem_mask);
+	tell_present(KB(board));
+	KB(write16)(address, data, mem_mask);
 	sync_irq();
 }
 
@@ -233,15 +275,19 @@ bool is_computed_jump(uint32_t pc)
 
 std::set<std::pair<uint32_t, uint32_t>> g_jumps;    // --jumps: where each computed jump went
 
+#ifndef K_NO_FRAME_WAIT // kref: frame-wait
 // With frame timing: the board's next frame, when the program has nothing to do (tmnt/frame.h); a program
 // that stops getting there has stopped making frames
+#endif // kref: frame-wait
 bool g_frame_timing = true;
+#ifndef K_NO_FRAME_WAIT // kref: frame-wait
 std::function<void()> g_frame_wait;
 uint64_t g_instructions_at_frame = 0;
 constexpr uint64_t kInstructionsPerFrameLimit = 200000000;    // the boot's tests run some millions at once
 
 // The frames asked for are done (frame timing)
 struct frames_done {};
+#endif // kref: frame-wait
 
 void on_instruction(offs_t pc)
 {
@@ -252,9 +298,10 @@ void on_instruction(offs_t pc)
 	if (g_previous_pc != 0xFFFFFFFF && is_computed_jump(g_previous_pc))
 		g_jumps.emplace(g_previous_pc, pc & 0xFFFFFF);
 	g_previous_pc = pc;
+#ifndef K_NO_FRAME_WAIT // kref: frame-wait
 	if (g_frame_timing)
 	{
-		if ((pc & 0xFFFFFF) == TMNT_FRAME_WAIT && tmnt_frame_idle())
+		if ((pc & 0xFFFFFF) == KBC(FRAME_WAIT) && KB(frame_idle)())
 		{
 			g_instructions_at_frame = g_instructions;
 			g_frame_wait();
@@ -262,6 +309,7 @@ void on_instruction(offs_t pc)
 		else if (g_instructions - g_instructions_at_frame > kInstructionsPerFrameLimit)
 			throw std::runtime_error("the program no longer reaches its frame loop");
 	}
+#endif // kref: frame-wait
 }
 
 void write_addresses(const std::string &path, const std::vector<uint8_t> &bits, const char *title)
@@ -282,20 +330,26 @@ uint64_t g_slice_start = 0;
 int g_slice_budget = 0;
 bool g_in_slice = false;
 
+uint64_t present_cycle()
+{
+	return g_in_slice ? g_slice_start + uint64_t(g_slice_budget - g_cpu->cycles_left()) : KB(board).cycles;
+}
+
 // The 68000 runs until the board's clock reaches 'cycle', a line at a time at most
 void run_until(reference_cpu &cpu, uint64_t cycle)
 {
-	while (tmnt_board.cycles < cycle)
+	while (KB(board).cycles < cycle)
 	{
-		const uint64_t slice = std::min<uint64_t>(cycle - tmnt_board.cycles, TMNT_LINE_CYCLES);
-		g_slice_start = tmnt_board.cycles;
+		const uint64_t slice = std::min<uint64_t>(cycle - KB(board).cycles, KBC(LINE_CYCLES));
+		g_slice_start = KB(board).cycles;
 		g_slice_budget = int(slice);
 		g_in_slice = true;
-		tmnt_board.cycles += uint64_t(cpu.run(int(slice)));
+		KB(board).cycles += uint64_t(cpu.run(int(slice)));
 		g_in_slice = false;
 	}
 }
 
+#ifndef K_NO_SOUND // kref: sound
 // --sound-board-check: the game's own sound board runs beside the reference's, on the same commands
 bool g_sound_board = false;
 void (*g_reference_sound_irq)(void) = nullptr;
@@ -304,21 +358,23 @@ void raise_both_sound_irqs()
 {
 	g_reference_sound_irq();
 #ifdef K_GAME_SOUND_BOARD
-	tmnt_sound_irq();
+	KB(sound_irq)();
 #endif
 }
 
 // The sound board catches up with the 68000's present, as MAME synchronizes the latch and the Z80's IRQ
 void sound_sync()
 {
-	const uint64_t now = g_in_slice ? g_slice_start + uint64_t(g_slice_budget - g_cpu->cycles_left()) : tmnt_board.cycles;
+	const uint64_t now = present_cycle();
 	ks_run_until(now);
 #ifdef K_GAME_SOUND_BOARD
 	if (g_sound_board)
-		tmnt_sound_run(now);
+		KB(sound_run)(now);
 #endif
 }
+#endif // kref: sound
 
+#ifndef K_NO_SOUND // kref: sound
 void write_wav(const std::string &path, const std::vector<int16_t> &samples, uint32_t rate)
 {
 	std::vector<uint8_t> file(44 + samples.size() * 2, 0);
@@ -341,7 +397,9 @@ void write_wav(const std::string &path, const std::vector<int16_t> &samples, uin
 	std::ofstream out(path, std::ios::binary);
 	out.write(reinterpret_cast<const char *>(file.data()), std::streamsize(file.size()));
 }
+#endif // kref: sound
 
+#ifndef K_NO_VIDEO // kref: video
 // The last frame the reference video drew (or 'frame' when given), as a 24-bit BMP
 void write_bmp(const std::string &path, const uint32_t *frame = nullptr)
 {
@@ -371,19 +429,20 @@ void write_bmp(const std::string &path, const uint32_t *frame = nullptr)
 	std::ofstream out(path, std::ios::binary);
 	out.write(reinterpret_cast<const char *>(file.data()), std::streamsize(file.size()));
 }
+#endif // kref: video
 
 // The board's memories at the end of a frame, a file each: DIR/FRAME_work_ram.bin...
 void dump_frame(const std::string &folder, uint64_t frame)
 {
 	// (the work RAM in the order of its addresses: the board keeps it the other way round)
-	uint8_t work_ram[TMNT_WORK_RAM_SIZE];
-	for (uint32_t offset = 0; offset < TMNT_WORK_RAM_SIZE; offset++)
-		work_ram[offset] = *tmnt_work_ram_byte(TMNT_WORK_RAM + offset);
+	uint8_t work_ram[KBC(WORK_RAM_SIZE)];
+	for (uint32_t offset = 0; offset < KBC(WORK_RAM_SIZE); offset++)
+		work_ram[offset] = *KB(work_ram_byte)(KBC(WORK_RAM) + offset);
 	const struct { const char *name; const uint8_t *data; size_t size; } memories[] = {
 		{ "work_ram", work_ram, sizeof(work_ram) },
-		{ "palette", tmnt_board.palette, sizeof(tmnt_board.palette) },
-		{ "tile_ram", tmnt_board.tile_ram, sizeof(tmnt_board.tile_ram) },
-		{ "sprite_ram", tmnt_board.sprite_ram, sizeof(tmnt_board.sprite_ram) },
+		{ "palette", KB(board).palette, sizeof(KB(board).palette) },
+		{ "tile_ram", KB(board).tile_ram, sizeof(KB(board).tile_ram) },
+		{ "sprite_ram", reinterpret_cast<const uint8_t *>(KB(board).sprite_ram), sizeof(KB(board).sprite_ram) },
 	};
 	for (const auto &memory : memories)
 	{
@@ -403,7 +462,7 @@ void print_text(uint64_t frame)
 		std::string line;
 		for (int column = 0; column < 64; column++)
 		{
-			const int character = tmnt_board.tile_ram[0x2000 + row * 64 + column] + 0x30;
+			const int character = KB(board).tile_ram[0x2000 + row * 64 + column] + 0x30;
 			line += character == '@' ? ' ' : (character < 0x7F ? char(character) : '.');
 		}
 		while (!line.empty() && (line.back() == ' ' || line.back() == '.'))
@@ -414,6 +473,7 @@ void print_text(uint64_t frame)
 
 } // namespace
 
+#ifndef K_NO_ASSETS // kref: assets
 // --assets-check: the assets' regions against the ROM set's, and both programs' data where a piece gives it
 static int check_assets(const std::string &folder)
 {
@@ -470,16 +530,26 @@ static int check_assets(const std::string &folder)
 	}
 	return differ ? 1 : 0;
 }
+#endif // kref: assets
 
 int main(int argc, char **argv)
 {
 	const char *usage = "Usage: kref [--timing frames|cycles] [--frames N] [--hashes FILE] [--trace FILE] [--calls FILE] [--jumps FILE]"
+#ifndef K_NO_VIDEO // kref: video
 		" [--rom-reads FILE] [--text FRAME ...]"
 		" [--dump FRAME ... --dump-dir DIR] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
 		" [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE] [--sound-rom-reads FILE]"
 		" [--sound-commands FILE] [--script FILE] [--service] [--rom FOLDER] [--video-check FILE] [--graphics-uses FILE]"
 		" [--sound-check]"
 		" [--assets-check FOLDER] [--sound-timing FILE] [--sound-board-check FILE] [--assets FOLDER]\n";
+#else // kref: video
+		" [--rom-reads FILE] [--text FRAME ...]"
+		" [--dump FRAME ... --dump-dir DIR]"
+		" [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE] [--sound-rom-reads FILE]"
+		" [--sound-commands FILE] [--script FILE] [--service] [--rom FOLDER]"
+		" [--sound-check]"
+		" [--assets-check FOLDER] [--sound-timing FILE] [--sound-board-check FILE] [--assets FOLDER]\n";
+#endif // kref: video
 	std::string rom_folder = "rom";
 	std::string hashes_path, trace_path, calls_path, dump_folder = ".", video_hashes_path, video_folder = ".";
 	std::string video_check_path, assets_folder;
@@ -532,27 +602,36 @@ int main(int argc, char **argv)
 				dump_frames.insert(std::strtoull(argv[++index], nullptr, 10));
 		else if (argument == "--dump-dir" && has_value)
 			dump_folder = argv[++index];
+#ifndef K_NO_VIDEO // kref: video
 		else if (argument == "--video-hashes" && has_value)
 			video_hashes_path = argv[++index];
 		else if (argument == "--video-check" && has_value)
 			video_check_path = argv[++index];
 		else if (argument == "--graphics-uses" && has_value)
 			graphics_uses_path = argv[++index];
+#endif // kref: video
 		else if (argument == "--sound-check")
 			sound_check = true;
+#ifndef K_NO_ASSETS // kref: assets
 		else if (argument == "--assets-check" && has_value)
 			assets_folder = argv[++index];
+#endif // kref: assets
+#ifndef K_NO_SOUND // kref: sound
 		else if (argument == "--sound-timing" && has_value)
 			sound_timing_path = argv[++index];
 		else if (argument == "--sound-board-check" && has_value)
 			sound_board_path = argv[++index];
+#endif // kref: sound
 		else if (argument == "--assets" && has_value)
 			own_assets_folder = argv[++index];
+#ifndef K_NO_VIDEO // kref: video
 		else if (argument == "--video-dump" && has_value)
 			while (index + 1 < argc && argv[index + 1][0] != '-')
 				video_dump_frames.insert(std::strtoull(argv[++index], nullptr, 10));
 		else if (argument == "--video-dir" && has_value)
 			video_folder = argv[++index];
+#endif // kref: video
+#ifndef K_NO_SOUND // kref: sound
 		else if (argument == "--sound-hashes" && has_value)
 			sound_hashes_path = argv[++index];
 		else if (argument == "--sound-wav" && has_value)
@@ -563,6 +642,7 @@ int main(int argc, char **argv)
 			sound_rom_reads_path = argv[++index];
 		else if (argument == "--sound-commands" && has_value)
 			sound_commands_path = argv[++index];
+#endif // kref: sound
 		else if (argument == "--service")
 			service = true;
 		else if (argument == "--rom" && has_value)
@@ -579,8 +659,11 @@ int main(int argc, char **argv)
 		std::cerr << "The ROM set in " << rom_folder << " cannot be read: " << problem << '\n';
 		return 1;
 	}
+#ifndef K_NO_ASSETS // kref: assets
 	if (!assets_folder.empty())
 		return check_assets(assets_folder);
+#endif // kref: assets
+#ifndef K_NO_SOUND // kref: sound
 	if (!sound_board_path.empty())
 	{
 #ifdef K_GAME_SOUND_BOARD
@@ -602,22 +685,27 @@ int main(int argc, char **argv)
 		return 1;
 #endif
 	}
-	tmnt_reset();
+#endif // kref: sound
+	KB(reset)();
 	if (service)
-		tmnt_board.dsw[2] &= uint8_t(~TMNT_DSW3_SERVICE);
-	tmnt_script *script = nullptr;
+#ifndef K_NO_DIP // kref: dip
+		KB(board).dsw[2] &= uint8_t(~KBC(DSW3_SERVICE));
+#else // kref: dip
+		KB(board).test_switch = 0;
+#endif // kref: dip
+	KB(script) *script = nullptr;
 	if (!script_path.empty())
 	{
 		char error[256];
-		script = tmnt_script_load(script_path.c_str(), error, sizeof(error));
+		script = KB(script_load)(script_path.c_str(), error, sizeof(error));
 		if (!script)
 		{
 			std::cerr << error << '\n';
 			return 1;
 		}
-		if (!frames_given && tmnt_script_frames(script))
-			frames = tmnt_script_frames(script);
-		tmnt_script_apply(script, 0);
+		if (!frames_given && KB(script_frames)(script))
+			frames = KB(script_frames)(script);
+		KB(script_apply)(script, 0);
 	}
 
 	reference_cpu cpu;
@@ -639,13 +727,14 @@ int main(int argc, char **argv)
 	std::ofstream hashes, video_hashes;
 	if (!hashes_path.empty())
 		hashes.open(hashes_path);
+#ifndef K_NO_VIDEO // kref: video
 	if (!video_hashes_path.empty())
 		video_hashes.open(video_hashes_path);
 	// --video-check: the game's own video (runtime/src/video.c) draws every frame too, and the two are compared
 	std::ofstream video_check;
 	if (!video_check_path.empty())
 		video_check.open(video_check_path);
-	static tmnt_frame own_frame;
+	static KB(frame) own_frame;
 	uint64_t video_differences = 0, first_difference = 0;
 	const bool video = video_hashes.is_open() || !video_dump_frames.empty() || video_check.is_open();
 	if (video)
@@ -662,14 +751,16 @@ int main(int argc, char **argv)
 			" PALETTE FRAME KEY or sprite CODE PALETTE FRAME KEY; LAYERS bit 0 the fixed layer, 1 layer A, 2 layer B;"
 			" PALETTE the palette RAM's palette (0-63) it showed with; KEY the work RAM's 060001 060003 060005 060120"
 			" (the game's state, the attract mode's step, the scene, the area)\n";
-		tmnt_video_tiles_shown = tiles_shown;
-		tmnt_video_sprites_shown = sprites_shown;
-		tmnt_video_tile_palettes = tile_palettes;
-		tmnt_video_sprite_palettes = sprite_palettes;
+		KB(video_tiles_shown) = tiles_shown;
+		KB(video_sprites_shown) = sprites_shown;
+		KB(video_tile_palettes) = tile_palettes;
+		KB(video_sprite_palettes) = sprite_palettes;
 	}
 	const bool own_video = video_check.is_open() || graphics_uses.is_open();
 	if (own_video)
-		tmnt_video_reset();
+		KB(video_reset)();
+#endif // kref: video
+#ifndef K_NO_SOUND // kref: sound
 	std::ofstream sound_hashes;
 	if (!sound_hashes_path.empty())
 		sound_hashes.open(sound_hashes_path);
@@ -691,44 +782,48 @@ int main(int argc, char **argv)
 #ifdef K_GAME_SOUND_BOARD
 		if (g_sound_board)
 		{
-			if (const char *problem = tmnt_sound_init())
+			if (const char *problem = KB(sound_init)())
 			{
 				std::cerr << "The game's sound board does not start: " << problem << '\n';
 				return 1;
 			}
 			sound_board.open(sound_board_path);
-			g_reference_sound_irq = tmnt_board.sound_irq;
-			tmnt_board.sound_irq = raise_both_sound_irqs;
+			g_reference_sound_irq = KB(board).sound_irq;
+			KB(board).sound_irq = raise_both_sound_irqs;
 		}
 #endif
-		tmnt_board.sound_sync = sound_sync;
+		KB(board).sound_sync = sound_sync;
 		if (!sound_rom_reads_path.empty())
 			ks_record_rom_reads();
 		if (!sound_commands_path.empty())
 		{
-			g_raise_sound_irq = tmnt_board.sound_irq;
-			tmnt_board.sound_irq = log_sound_command;
+			g_raise_sound_irq = KB(board).sound_irq;
+			KB(board).sound_irq = log_sound_command;
 		}
 	}
+#endif // kref: sound
 
 	int status = 0;
 	uint64_t frame = 0;
 	// VBLANK ends (line 16): the video takes the scroll
 	auto vblank_end = [&]() {
+#ifndef K_NO_VIDEO // kref: video
 		if (video)
 			kv_vblank_end();
 		if (own_video)
-			tmnt_video_vblank_end();
+			KB(video_vblank_end)();
+#endif // kref: video
 	};
 	// VBLANK begins (line 240): the frame is drawn, the board takes its events and the controls change, and
 	// the frame's hashes are taken
 	auto vblank_start = [&]() {
+#ifndef K_NO_VIDEO // kref: video
 		if (video)
 			kv_vblank_start(video_hashes.is_open() || video_dump_frames.count(frame) != 0 || video_check.is_open());
 		if (video_check.is_open())
 		{
-			tmnt_video_vblank_start(&own_frame);
-			const uint64_t reference = kv_frame_hash(), own = tmnt_video_hash(&own_frame);
+			KB(video_vblank_start)(&own_frame);
+			const uint64_t reference = kv_frame_hash(), own = KB(video_hash)(&own_frame);
 			char line[64];
 			std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", frame, reference, own);
 			video_check << line;
@@ -740,11 +835,11 @@ int main(int argc, char **argv)
 			}
 		}
 		else if (graphics_uses.is_open())
-			tmnt_video_vblank_start(&own_frame);
+			KB(video_vblank_start)(&own_frame);
 		if (graphics_uses.is_open())
 		{
 			char key[16], line[64];
-			std::snprintf(key, sizeof(key), "%02X%02X%02X%02X", *tmnt_work_ram_byte(0x060001), *tmnt_work_ram_byte(0x060003),
+			std::snprintf(key, sizeof(key), "%02X%02X%02X%02X", *KB(work_ram_byte)(0x060001), *KB(work_ram_byte)(0x060003),
 				*tmnt_work_ram_byte(0x060005), *tmnt_work_ram_byte(0x060120));
 			for (size_t code = 0; code < std::size(tiles_shown); code++)
 				if (tiles_shown[code] & ~tiles_written[code])
@@ -763,12 +858,14 @@ int main(int argc, char **argv)
 					sprites_written[code] = 1;
 				}
 		}
-		tmnt_vblank_start();
-		tmnt_script_apply(script, tmnt_board.frame);
+#endif // kref: video
+		KB(vblank_start)();
+		KB(script_apply)(script, KB(board).frame);
 		sync_irq();
+#ifndef K_NO_SOUND // kref: sound
 		if (sound)
 		{
-			ks_end_frame(tmnt_board.cycles);
+			ks_end_frame(KB(board).cycles);
 			if (sound_hashes.is_open())
 			{
 				char line[64];
@@ -780,9 +877,9 @@ int main(int argc, char **argv)
 			if (g_sound_board)
 			{
 				// the game's own sound board's frame against the reference's
-				tmnt_sound_end_frame(tmnt_board.cycles);
+				KB(sound_end_frame)(KB(board).cycles);
 				const uint64_t samples = ks_frame_samples_hash(), ram = ks_state_hash();
-				const uint64_t own_samples = tmnt_sound_samples_hash(), own_ram = tmnt_sound_state_hash();
+				const uint64_t own_samples = KB(sound_samples_hash)(), own_ram = KB(sound_state_hash)();
 				char line[96];
 				std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 "\n",
 					frame, samples, ram, own_samples, own_ram);
@@ -792,22 +889,22 @@ int main(int argc, char **argv)
 					sound_board_first = frame;
 					std::cerr << "sound board check, frame " << frame << ": the " << (samples != own_samples ? "samples" : "")
 						<< (samples != own_samples && ram != own_ram ? " and the " : "") << (ram != own_ram ? "Z80's RAM" : "")
-						<< " differ; Z80 cycles " << ks_z80_cycles() << " and " << tmnt_sound_z80_cycles() << '\n';
+						<< " differ; Z80 cycles " << ks_z80_cycles() << " and " << KB(sound_z80_cycles)() << '\n';
 					static const char *const sources[4] = { "YM2151", "K007232", "uPD7759", "title music" };
 					uint64_t reference_sources[4], own_sources[4];
 					ks_frame_source_hashes(reference_sources);
-					tmnt_sound_source_hashes(own_sources);
+					KB(sound_source_hashes)(own_sources);
 					for (int source = 0; source < 4; source++)
 						if (reference_sources[source] != own_sources[source])
 							std::cerr << "  the " << sources[source] << "'s samples differ\n";
 					int shown = 0;
-					for (size_t at = 0; at < sizeof(tmnt_board.sound_ram) && shown < 16; at++)
-						if (tmnt_board.sound_ram[at] != tmnt_sound.ram[at]
-							&& (0x8000u + at < TMNT_SOUND_STACK_START || 0x8000u + at >= TMNT_SOUND_STACK_END))
+					for (size_t at = 0; at < sizeof(KB(board).sound_ram) && shown < 16; at++)
+						if (KB(board).sound_ram[at] != KB(sound).ram[at]
+							&& (0x8000u + at < KBC(SOUND_STACK_START) || 0x8000u + at >= KBC(SOUND_STACK_END)))
 						{
 							char bytes[48];
 							std::snprintf(bytes, sizeof(bytes), "  %04X: %02X and %02X\n", unsigned(0x8000u + at),
-								tmnt_board.sound_ram[at], tmnt_sound.ram[at]);
+								KB(board).sound_ram[at], KB(sound).ram[at]);
 							std::cerr << bytes;
 							shown++;
 						}
@@ -821,18 +918,20 @@ int main(int argc, char **argv)
 				sound_mix.insert(sound_mix.end(), mix, mix + count);
 			}
 		}
+#endif // kref: sound
 		if (g_irq_level)
 			g_irq_frames++;
 		if (hashes.is_open())
 		{
 			char line[48];
-			std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 "\n", frame, tmnt_state_hash());
+			std::snprintf(line, sizeof(line), "%" PRIu64 " %016" PRIx64 "\n", frame, KB(state_hash)());
 			hashes << line;
 		}
 		if (text_frames.count(frame))
 			print_text(frame);
 		if (dump_frames.count(frame))
 			dump_frame(dump_folder, frame);
+#ifndef K_NO_VIDEO // kref: video
 		if (video_hashes.is_open())
 		{
 			char line[48];
@@ -841,19 +940,21 @@ int main(int argc, char **argv)
 		}
 		if (video_dump_frames.count(frame))
 			write_bmp(video_folder + "/frame_" + std::to_string(frame) + ".bmp");
+#endif // kref: video
 	};
 	try
 	{
+#ifndef K_NO_FRAME_WAIT // kref: frame-wait
 		if (g_frame_timing)
 		{
 			// the board's next frame where the program has nothing to do, as the translated program has it
 			frame = 1;
 			g_frame = frame;
 			g_frame_wait = [&]() {
-				const uint64_t start = (frame - 1) * TMNT_FRAME_CYCLES;
-				tmnt_board.cycles = start + uint64_t(TMNT_VBLANK_END) * TMNT_LINE_CYCLES;
+				const uint64_t start = (frame - 1) * KBC(FRAME_CYCLES);
+				KB(board).cycles = start + uint64_t(KBC(VBLANK_END)) * KBC(LINE_CYCLES);
 				vblank_end();
-				tmnt_board.cycles = start + uint64_t(TMNT_VBLANK_START) * TMNT_LINE_CYCLES;
+				KB(board).cycles = start + uint64_t(KBC(VBLANK_START)) * KBC(LINE_CYCLES);
 				vblank_start();
 				if (frame == frames)
 					throw frames_done();
@@ -870,14 +971,15 @@ int main(int argc, char **argv)
 			}
 		}
 		else
+#endif // kref: frame-wait
 		{
 			for (frame = 1; frame <= frames; frame++)
 			{
 				g_frame = frame;
-				const uint64_t start = (frame - 1) * TMNT_FRAME_CYCLES;
-				run_until(cpu, start + uint64_t(TMNT_VBLANK_END) * TMNT_LINE_CYCLES);
+				const uint64_t start = (frame - 1) * KBC(FRAME_CYCLES);
+				run_until(cpu, start + uint64_t(KBC(VBLANK_END)) * KBC(LINE_CYCLES));
 				vblank_end();
-				run_until(cpu, start + uint64_t(TMNT_VBLANK_START) * TMNT_LINE_CYCLES);
+				run_until(cpu, start + uint64_t(KBC(VBLANK_START)) * KBC(LINE_CYCLES));
 				vblank_start();
 			}
 			frame--;
@@ -898,9 +1000,12 @@ int main(int argc, char **argv)
 		<< "instructions:      " << g_instructions << '\n'
 		<< "unique addresses:  " << unique << '\n'
 		<< "frames with IRQ5:  " << g_irq_frames << '\n'
-		<< "sound commands:    " << tmnt_board.sound_irqs << '\n'
-		<< "watchdog resets:   " << tmnt_board.watchdog_resets << '\n'
+#ifndef K_NO_SOUND // kref: sound
+		<< "sound commands:    " << KB(board).sound_irqs << '\n'
+#endif // kref: sound
+		<< "watchdog resets:   " << KB(board).watchdog_resets << '\n'
 		<< "final PC:          " << std::hex << cpu.pc() << std::dec << '\n';
+#ifndef K_NO_VIDEO // kref: video
 	if (video_check.is_open())
 	{
 		std::cout << "video check:       " << video_differences << " frames differ";
@@ -908,6 +1013,8 @@ int main(int argc, char **argv)
 			std::cout << ", the first " << first_difference;
 		std::cout << '\n';
 	}
+#endif // kref: video
+#ifndef K_NO_SOUND // kref: sound
 	if (sound_check)
 	{
 		static const char *const chips[4] = { "YM2151", "K007232", "uPD7759", "title music" };
@@ -923,6 +1030,7 @@ int main(int argc, char **argv)
 				std::cout << '\n';
 			}
 	}
+#endif // kref: sound
 	if (!trace_path.empty())
 		write_addresses(trace_path, g_executed, "68000 addresses executed by kref");
 	if (!calls_path.empty())
@@ -940,6 +1048,7 @@ int main(int argc, char **argv)
 	}
 	if (!rom_reads_path.empty())
 		write_rom_reads(rom_reads_path);
+#ifndef K_NO_SOUND // kref: sound
 	if (sound)
 		std::cout << "Z80 cycles:        " << ks_z80_cycles() << '\n';
 	if (g_sound_board)
@@ -992,6 +1101,7 @@ int main(int argc, char **argv)
 			out << line;
 		}
 	}
-	tmnt_script_free(script);
+#endif // kref: sound
+	KB(script_free)(script);
 	return status;
 }

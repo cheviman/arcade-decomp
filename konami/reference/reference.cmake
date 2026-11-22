@@ -14,10 +14,28 @@
 #                        CPU, a 6809 with Konami's opcodes: The Simpsons, Vendetta...)
 #   K_GAME_RUNTIME       the board runtime's library (the board model and the ROM set's reader: tmnt_runtime)
 #   K_RUNTIME_INCLUDE    the board runtime's headers (default: the game's runtime/include)
+# and may set:
+#   K_BOARD              the prefix of the board model's names (ssriders: ssriders_read16, "ssriders/machine.h");
+#                        unset, TMNT's (kref.cpp's KB macros)
+#   K_REFERENCE_VIDEO    OFF for a board whose chips kvideo (K052109 + K051960) does not draw: kref then runs
+#                        without the video reference and without the game's own video (default ON)
+#   K_REFERENCE_SOUND    OFF for a board whose sound ksound (Z80, YM2151, K007232, uPD7759) does not model: kref
+#                        then runs without the sound board (default ON)
+#   K_GAME_ASSETS        OFF for a game without game/assets.h yet: no --assets check (default ON)
+#   K_GAME_FRAME_WAIT    OFF for a board without <board>/frame.h (the address of the program's wait for the
+#                        frame): --timing runs the CPU's cycles only (default ON)
+#   K_GAME_DIP           OFF for a board with a test switch (<board>_board.test_switch) instead of DIP switches
+#                        (default ON)
 #   K_GAME_SOUND         (optional) the game's own sound board's library, for kref --sound-board-check
 # MAME's sources are MAME 0.289's (mame/, BSD-3-Clause, mame/LICENSE); ymfm's are in ymfm/ (ymfm/LICENSE).
 
 set(K_REFERENCE ${CMAKE_CURRENT_LIST_DIR})
+if(NOT DEFINED K_REFERENCE_VIDEO)
+	set(K_REFERENCE_VIDEO ON)
+endif()
+if(NOT DEFINED K_REFERENCE_SOUND)
+	set(K_REFERENCE_SOUND ON)
+endif()
 if(NOT K_RUNTIME_INCLUDE)
 	set(K_RUNTIME_INCLUDE ${CMAKE_SOURCE_DIR}/runtime/include)
 endif()
@@ -163,6 +181,19 @@ if(K_LIFT_CASES)
 	endif()
 endif()
 
+set(K_KREF_LIBRARIES m68000_reference)
+set(K_KREF_DEFINITIONS "")
+foreach(K_PART ASSETS FRAME_WAIT DIP)
+	if(DEFINED K_GAME_${K_PART} AND NOT K_GAME_${K_PART})
+		list(APPEND K_KREF_DEFINITIONS K_NO_${K_PART})
+	endif()
+endforeach()
+if(K_BOARD)
+	string(TOUPPER ${K_BOARD} K_BOARD_UPPER)
+	list(APPEND K_KREF_DEFINITIONS K_BOARD=${K_BOARD} K_BOARD_UPPER=${K_BOARD_UPPER})
+endif()
+
+if(K_REFERENCE_VIDEO)
 # MAME's K052109 and K051960 drawing the board model's frames: the frames the game's video has to match
 add_library(kvideo_reference STATIC ${K_REFERENCE}/video/kvideo.cpp)
 target_include_directories(kvideo_reference
@@ -172,7 +203,12 @@ target_compile_features(kvideo_reference PUBLIC cxx_std_20)
 if(MSVC)
 	target_compile_options(kvideo_reference PRIVATE /bigobj /wd4244 /wd4267 /wd4100 /wd4146 /wd4127 /wd4018)
 endif()
+list(APPEND K_KREF_LIBRARIES kvideo_reference)
+else()
+list(APPEND K_KREF_DEFINITIONS K_NO_VIDEO)
+endif()
 
+if(K_REFERENCE_SOUND)
 # The sound board: MAME's Z80 (system32/reference's copy of the core), K007232 and uPD7759, ymfm's YM2151
 add_library(ksound_reference STATIC
 	${K_REFERENCE}/sound/ksound.cpp
@@ -187,10 +223,15 @@ target_compile_features(ksound_reference PUBLIC cxx_std_20)
 if(MSVC)
 	target_compile_options(ksound_reference PRIVATE /bigobj /wd4244 /wd4267 /wd4100 /wd4146 /wd4127 /wd4018)
 endif()
+list(APPEND K_KREF_LIBRARIES ksound_reference)
+else()
+list(APPEND K_KREF_DEFINITIONS K_NO_SOUND)
+endif()
 
 add_executable(kref ${K_REFERENCE}/kref.cpp)
 target_include_directories(kref PRIVATE ${K_RUNTIME_INCLUDE})
-target_link_libraries(kref PRIVATE m68000_reference kvideo_reference ksound_reference ${K_GAME_RUNTIME})
+target_compile_definitions(kref PRIVATE ${K_KREF_DEFINITIONS})
+target_link_libraries(kref PRIVATE ${K_KREF_LIBRARIES} ${K_GAME_RUNTIME})
 # the game's own sound board, when it has one (K_GAME_SOUND: the decompiled sound program on the board's own
 # chips), which kref --sound-board-check runs beside MAME's
 if(K_GAME_SOUND)
