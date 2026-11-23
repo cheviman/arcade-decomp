@@ -124,6 +124,7 @@ def slots(function):
     restarts = {label for label, block in function.blocks.items() if sets_sp_first(block)} if RESTARTS else set()
     start = {function.entry: 0}
     start_frames = {function.entry: {}}
+    originals = {label: list(block.statements) for label, block in function.blocks.items()}
     pending = [function.entry]
     done = set()
     while pending:
@@ -202,6 +203,8 @@ def slots(function):
         for successor in block.successors():
             if successor in start and start[successor] != sp and successor in restarts:
                 continue
+            if successor in start and start[successor] != sp and frames                     and start_frames.get(successor) == frames and resets_sp_from_frame(function, successor, frames, originals):
+                continue    # (SP where it is does not matter: the frame gives it back before anything uses it)
             if successor in start_frames and start_frames[successor] != frames:
                 raise StackError(f"{function.name}: frames {start_frames[successor]} and {frames} meet at {successor}")
             start_frames[successor] = dict(frames)
@@ -222,6 +225,32 @@ def slots(function):
             start[successor] = sp
             pending.append(successor)
     return start
+
+
+def resets_sp_from_frame(function, label, frames, originals):
+    """True when the code from block 'label' on sets SP from a frame register (UNLK) before anything reads SP or
+    calls: the compiler's epilogue after calls whose arguments it never popped (0F7804's movem (-$18,A6), unlk)"""
+    seen = set()
+    while label not in seen and label in function.blocks:
+        seen.add(label)
+        block = function.blocks[label]
+        for statement in originals.get(label, block.statements):
+            if isinstance(statement, ir.SetReg) and statement.index == cpu.current.sp:
+                return offset_of(statement.value, 0, None, frames) is not None and not any(
+                    isinstance(node, ir.Reg) and node.index == cpu.current.sp for node in ir.walk(statement.value))
+            found = []
+
+            def look(node):
+                if isinstance(node, ir.Reg) and node.index == cpu.current.sp:
+                    found.append(node)
+                return None
+            ir.map_statement(statement, look)
+            if isinstance(statement, ir.Call) or found:
+                return False
+        if not isinstance(block.end, ir.Goto):
+            return False
+        label = block.end.target
+    return False
 
 
 def sets_sp_first(block):
