@@ -131,6 +131,8 @@ class Analysis:
     """The program's code, found from its entry points. Attributes: instructions ({address: Instruction}),
     functions (call targets), labels (branch and jump targets), code_tables ({address: entries}),
     table_tables ({address: entries}), slots (handler slots' offsets), mem."""
+    # the rounds of the walk in which what a call leaves alone may grow (followed_targets()); 0: it only shrinks
+    GROWING_ROUNDS = 0
 
     def __init__(self, image, symbols, executed=None):
         self.image = image
@@ -484,7 +486,7 @@ class Analysis:
                 else:
                     self.computed(instruction, state, block)
                 # what the call leaves: the registers no way through the function changes (an earlier walk's)
-                kept = self.preserved.get(instruction.target, ())
+                kept = self.kept_by_call(instruction)
                 state = {register: values for register, values in state.items() if register in kept}
             elif flow == dis.FLOW_BRANCH:
                 self.enter(instruction.target, state, "loc")
@@ -505,6 +507,7 @@ class Analysis:
 
     def run(self):
         first = True
+        rounds = 0
         while True:
             self.walk_all()
             # a place the code names as data inside a table read without symbols.txt: the table stops there, and
@@ -522,7 +525,10 @@ class Analysis:
             # the registers a call leaves alone, from the functions this walk found: the walk starts again with
             # them (each time with no more than the time before, so it ends)
             preserved = self.leaves_alone()
-            if not first:
+            rounds += 1
+            # (where calls through registers are followed, what a call leaves grows with the targets each walk finds:
+            # the walks start from no more than this one's, for a few rounds, then shrink as below so that they end)
+            if not first and not (self.GROWING_ROUNDS and rounds <= self.GROWING_ROUNDS):
                 preserved = {function: registers & self.preserved.get(function, frozenset())
                              for function, registers in preserved.items()}
                 preserved = {function: registers for function, registers in preserved.items() if registers}
@@ -550,12 +556,21 @@ class Analysis:
                     continue
                 seen.add(address)
                 instruction = self.instructions.get(address)
-                if instruction is None or instruction.flow in (dis.FLOW_CALL, dis.FLOW_JUMP) and instruction.target is None:
+                followed = None if instruction is None else self.followed_targets(instruction)
+                if instruction is None or instruction.flow in (dis.FLOW_CALL, dis.FLOW_JUMP) \
+                        and instruction.target is None and followed is None:
                     written = set(ADDRESS_REGISTERS)
                     break
                 written |= writes(instruction)
                 after = address + instruction.length
-                if instruction.flow == dis.FLOW_CALL:
+                if followed is not None:
+                    # (through a register, to the code found there: what that code changes)
+                    if instruction.flow == dis.FLOW_CALL:
+                        callees.update(followed)
+                        work.append(after)
+                    else:
+                        work += followed
+                elif instruction.flow == dis.FLOW_CALL:
                     callees.add(instruction.target)
                     work.append(after)
                 elif instruction.flow == dis.FLOW_BRANCH:
@@ -578,6 +593,15 @@ class Analysis:
                         growing = True
         return {function: frozenset(ADDRESS_REGISTERS - written) for function, written in changed.items()
                 if not ADDRESS_REGISTERS <= written}
+
+    def followed_targets(self, instruction):
+        """The code a call or jump through a register goes to, for leaves_alone() to follow; None where it is not
+        followed (it may change every address register)"""
+        return None
+
+    def kept_by_call(self, instruction):
+        """The address registers a call leaves alone (preserved: an earlier walk's)"""
+        return self.preserved.get(instruction.target, ())
 
     def saved_on_entry(self, function):
         """The address registers a function saves as it starts (CALLEE_SAVED): a "link An" first (An, which unlk

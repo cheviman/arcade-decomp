@@ -64,8 +64,20 @@ REPLACED_CODE = getattr(game_profile, "REPLACED_CODE", {})
 LABELS_NOT_ENTRIES = getattr(game_profile, "LABELS_NOT_ENTRIES", False)
 # a call through a register whose targets the analysis does not find (a callback the caller hands in, a pointer
 # read from the game's data) becomes call_code(address), the runtime's call by address, as the V60's slots do
-# (the profile's DYNAMIC_CALLS; off, such a call stops the decompiler)
+# (the profile's DYNAMIC_CALLS; off, such a call stops the decompiler). call_code() runs the target with 0 for what it
+# takes (decompiler/emit.py's wrapper, made for the V60's slots): only for targets that take nothing from their
+# caller, which a 68000 compiler's function pointers seldom are (their arguments are on the stack): those calls want
+# their targets found (FOLLOWED_REGISTER_CALLS, CALL_TARGETS)
 DYNAMIC_CALLS = getattr(game_profile, "DYNAMIC_CALLS", False)
+# whether a call or jump through a register whose targets the analysis finds changes what those targets change, not
+# every address register (the profile's FOLLOWED_REGISTER_CALLS; off, such a call or a switch loses them all, and the
+# function pointers a compiler keeps in A3-A5 are lost after a call to a function that calls through one: Sonic
+# Spinball's 0F7DDC, whose "jsr (A2)" goes to 0F7D8E, lost 0F7E8E's A5 = 0D560E before its "jsr (A5)" at 0F8024)
+FOLLOWED_REGISTER_CALLS = getattr(game_profile, "FOLLOWED_REGISTER_CALLS", False)
+# the code calls through registers reach where the address comes from the game's data, which the analysis does not
+# follow (a script's operand, a list the code links up): {address of the call: (targets)} (the profile's
+# CALL_TARGETS, found by the game's data walks and the reference's --jumps)
+CALL_TARGETS = getattr(game_profile, "CALL_TARGETS", {})
 # a hand-written routine that builds its caller's frame (pops its return address, LINK and saves on the caller's
 # stack, pushes the address back, goes on as a routine of its own): {routine: (first, end, rest)} lifts a call to it
 # as the instructions from first to end in the caller, then a call to rest, so that the caller's own UNLK (in the
@@ -90,6 +102,7 @@ def key(address):
 
 class Found(analysis.Analysis):
     """The static analysis, keeping what each jump or call through a register can reach"""
+    GROWING_ROUNDS = 16 if FOLLOWED_REGISTER_CALLS else 0
 
     def reset(self):
         super().reset()
@@ -112,6 +125,10 @@ class Found(analysis.Analysis):
         values = state.get(operand.reg) if operand.mode in ("indirect", "disp") else None
         found = self.computed_values.setdefault(instruction.address, set())
         found.update(analysis.known(values))
+        if instruction.flow == dis.FLOW_CALL:
+            for target in CALL_TARGETS.get(instruction.address, ()):
+                self.computed_targets.add(target)
+                self.enter(target, state, "func")
         # (a switch's cases are places in its function, not code reached as a function)
         self.in_computed = self.switch_table(instruction) is None
         try:
@@ -145,7 +162,23 @@ class Found(analysis.Analysis):
                     found.update(self.code_tables.get(table, ()))
             elif kind == analysis.FIELD and offset == 0:
                 found.update(self.field_tables.get(value, ()))
+        found.update(CALL_TARGETS.get(address, ()))
         return sorted(target for target in found if target in self.instructions)
+
+    def followed_targets(self, instruction):
+        if not FOLLOWED_REGISTER_CALLS or instruction.target is not None \
+                or instruction.flow not in (dis.FLOW_CALL, dis.FLOW_JUMP):
+            return None
+        return self.targets(instruction.address) or None
+
+    def kept_by_call(self, instruction):
+        if not FOLLOWED_REGISTER_CALLS or instruction.target is not None:
+            return super().kept_by_call(instruction)
+        kept = None
+        for target in self.targets(instruction.address):
+            left = frozenset(self.preserved.get(target, ()))
+            kept = left if kept is None else kept & left
+        return kept or ()
 
 
 class Program(recompile.Program):
