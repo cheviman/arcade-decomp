@@ -62,6 +62,10 @@ REPLACED_CODE = getattr(game_profile, "REPLACED_CODE", {})
 # switch's cases reach (no call) is a place in the code that goes there instead (the profile's LABELS_NOT_ENTRIES:
 # Sonic Spinball's symbols.txt names every piece the translation scaffold split its C functions into)
 LABELS_NOT_ENTRIES = getattr(game_profile, "LABELS_NOT_ENTRIES", False)
+# a call through a register whose targets the analysis does not find (a callback the caller hands in, a pointer
+# read from the game's data) becomes call_code(address), the runtime's call by address, as the V60's slots do
+# (the profile's DYNAMIC_CALLS; off, such a call stops the decompiler)
+DYNAMIC_CALLS = getattr(game_profile, "DYNAMIC_CALLS", False)
 # the devices that do something when read (TMNT's K051960 in its ROM readback mode): a read there stays, its value
 # used or not
 EFFECT_READ_AREAS = list(getattr(game_profile, "EFFECT_READ_AREAS", ()))
@@ -461,9 +465,10 @@ class Builder:
             target = lifter.bound(lifter.address_only(instruction.operands[0], "target"), "target")
             statements += lifter.statements
             choices = tuple(self.analysis.targets(address))
-            if not choices:
+            if not choices and not DYNAMIC_CALLS:
                 raise lift.Unsupported(f"{address:06X}: {instruction.text} goes to no code the analysis finds")
-            statements.append(ir.Call(address=target, choices=choices, return_address=following))
+            statements.append(ir.Call(address=target, choices=choices, return_address=following,
+                                      slot=None if choices else 0))
             return None
         if mnemonic == "jmp":
             lifter = lift.Lifter(instruction, prefix=f"t{address:06X}_")
