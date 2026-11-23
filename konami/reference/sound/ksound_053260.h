@@ -9,15 +9,16 @@
  *
  *    license:BSD-3-Clause
  *    A development tool, never part of the game: the sound the game's own sound board has to make, and the Z80
- *    the 053248's program talks to (its RAM and ROM test asks the Z80 for its own). ks_attach() hooks it to the
- *    board (simpsons_board's sound chips, the Z80's IRQ and its NMI's arming): the Z80 runs the sound program
+ *    the main CPU's program talks to (its RAM and ROM test asks the Z80 for its own). ks_attach() hooks it to the
+ *    board (the board model's sound chips, the Z80's IRQ and its NMI's arming): the Z80 runs the sound program
  *    cycle by cycle against the board's Z80 side (runtime/src/sound.c) whenever the board's time moves on
  *    (ks_run_until), and each chip makes its samples up to every moment something changes it.
  *
- *    Time is the board's (053248 cycles, SIMPSONS_CPU_CLOCK), kept from the Z80's own cycle count (3.579545
- *    MHz) so that nothing drifts. The YM2151 and the K053260 make a sample every 64 Z80 clocks; the K053260's
- *    timer steps every 16 and pulses SH1 every 64, which raises the Z80's NMI unless the program armed it in the
- *    last 4 cycles (simpsons.cpp's z80_nmi_w and z80_arm_nmi_w).
+ *    Time is the board's (the main CPU's cycles, <BOARD>_CPU_CLOCK), kept from the Z80's own cycle count (its
+ *    clock, 3.579545 MHz on The Simpsons, 8 MHz on Sunset Riders) so that nothing drifts. The YM2151 and the
+ *    K053260 make a sample every 64 of their clocks (3.579545 MHz); the K053260's timer steps every 16 and
+ *    pulses SH1 every 64, which raises the Z80's NMI unless the program armed it in the
+ *    last 4 cycles (the driver's z80_nmi_w and its arming).
  */
 #ifndef KONAMI_REFERENCE_SOUND_053260_H
 #define KONAMI_REFERENCE_SOUND_053260_H
@@ -30,7 +31,8 @@
 extern "C" {
 #endif
 
-/* Hooks the sound board to simpsons_board (after simpsons_reset and the ROM set) */
+/* Hooks the sound board to the board model (K_BOARD's: simpsons_board, ssriders_board), after its reset and the
+   ROM set */
 void ks_attach(void);
 
 /* Keeps the Z80's time with the timing model of the game's own sound board (runtime/src/sound_cpu.c): the

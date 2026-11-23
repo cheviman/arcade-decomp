@@ -99,7 +99,11 @@
 #include "game/data.h"
 #include "game/extract.h"
 #ifndef K_NO_SOUND // kref: sound
+#ifdef K_SOUND_053260
+#include "ksound_053260.h"
+#else
 #include "ksound.h"
+#endif
 #endif // kref: sound
 #ifndef K_NO_VIDEO // kref: video
 #include "kvideo.h"
@@ -176,7 +180,12 @@ uint64_t g_frame = 0;
 
 void log_sound_command()
 {
+#ifdef K_SOUND_053260
+	// (the K053260's first port: what the 68000 wrote for the Z80 before raising its IRQ)
+	g_sound_commands.emplace_back(g_frame, KB(board).sound_ports[0]);
+#else
 	g_sound_commands.emplace_back(g_frame, KB(board).sound_latch);
+#endif
 	g_raise_sound_irq();
 }
 #endif // kref: sound
@@ -375,6 +384,13 @@ void sound_sync()
 #endif // kref: sound
 
 #ifndef K_NO_SOUND // kref: sound
+// (ksound_053260's mix is stereo, left and right interleaved; ksound's is mono)
+#ifdef K_SOUND_053260
+constexpr uint16_t kWavChannels = 2;
+#else
+constexpr uint16_t kWavChannels = 1;
+#endif
+
 void write_wav(const std::string &path, const std::vector<int16_t> &samples, uint32_t rate)
 {
 	std::vector<uint8_t> file(44 + samples.size() * 2, 0);
@@ -385,10 +401,10 @@ void write_wav(const std::string &path, const std::vector<int16_t> &samples, uin
 	std::memcpy(&file[8], "WAVEfmt ", 8);
 	put32(16, 16);
 	put16(20, 1);
-	put16(22, 1);
+	put16(22, kWavChannels);
 	put32(24, rate);
-	put32(28, rate * 2);
-	put16(32, 2);
+	put32(28, rate * 2 * kWavChannels);
+	put16(32, uint16_t(2 * kWavChannels));
 	put16(34, 16);
 	std::memcpy(&file[36], "data", 4);
 	put32(40, uint32_t(samples.size() * 2));
@@ -1017,6 +1033,9 @@ int main(int argc, char **argv)
 #ifndef K_NO_SOUND // kref: sound
 	if (sound_check)
 	{
+#ifdef K_SOUND_053260
+		ks_check_print();
+#else
 		static const char *const chips[4] = { "YM2151", "K007232", "uPD7759", "title music" };
 		uint64_t compared[4], differences[4], first[4];
 		ks_chip_report(compared, differences, first);
@@ -1029,6 +1048,7 @@ int main(int argc, char **argv)
 					std::cout << ", the first " << first[chip];
 				std::cout << '\n';
 			}
+#endif
 	}
 #endif // kref: sound
 	if (!trace_path.empty())
@@ -1063,6 +1083,19 @@ int main(int argc, char **argv)
 	if (!sound_trace_path.empty())
 	{
 		std::ofstream out(sound_trace_path);
+#ifdef K_SOUND_053260
+		// (ksound_053260's places: the sound ROM's region offsets, 30000 plus the address above BFFF)
+		out << "# Z80 places executed by kref (sound ROM region offsets; 30000 plus the address above BFFF), one per line\n";
+		size_t count = 0;
+		const uint8_t *executed = ks_executed(&count);
+		for (size_t place = 0; place < count; place++)
+			if (executed[place])
+			{
+				char line[16];
+				std::snprintf(line, sizeof(line), "%05zX\n", place);
+				out << line;
+			}
+#else
 		out << "# Z80 addresses executed by kref, one per line\n";
 		for (uint32_t address = 0; address < 0x10000; address++)
 			if (ks_executed()[address >> 3] & (1u << (address & 7)))
@@ -1071,6 +1104,7 @@ int main(int argc, char **argv)
 				std::snprintf(line, sizeof(line), "%04X\n", address);
 				out << line;
 			}
+#endif
 	}
 	if (!sound_rom_reads_path.empty())
 	{
@@ -1078,6 +1112,20 @@ int main(int argc, char **argv)
 		std::ofstream out(sound_rom_reads_path);
 		out << "# Z80 sound program bytes read as data by kref: PC FIRST-LAST\n";
 		size_t count = 0;
+#ifdef K_SOUND_053260
+		// (ksound_053260's: each instruction place << 32 | region offset)
+		const uint64_t *reads = ks_rom_reads(&count);
+		for (size_t index = 0; index < count;)
+		{
+			const uint32_t pc = uint32_t(reads[index] >> 32), first = uint32_t(reads[index]);
+			uint32_t last = first;
+			while (++index < count && uint32_t(reads[index] >> 32) == pc && uint32_t(reads[index]) == last + 1)
+				last++;
+			char line[32];
+			std::snprintf(line, sizeof(line), "%05X %05X-%05X\n", unsigned(pc), unsigned(first), unsigned(last));
+			out << line;
+		}
+#else
 		const uint32_t *reads = ks_rom_reads(&count);
 		for (size_t index = 0; index < count;)
 		{
@@ -1089,6 +1137,7 @@ int main(int argc, char **argv)
 			std::snprintf(line, sizeof(line), "%04X %04X-%04X\n", unsigned(pc), unsigned(first), unsigned(last));
 			out << line;
 		}
+#endif
 	}
 	if (!sound_commands_path.empty())
 	{

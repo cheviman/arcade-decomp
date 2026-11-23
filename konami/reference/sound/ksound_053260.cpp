@@ -1,24 +1,29 @@
 /**
  *    Name:        ksound_053260.cpp
- *    Description: reference sound board of The Simpsons: MAME's Z80 and K053260 and ymfm's YM2151, on the board
- *                 model
- *    Version:     0.1.0
+ *    Description: reference sound board of Konami's boards with a Z80, a YM2151 and a K053260 (The Simpsons,
+ *                 Sunset Riders): MAME's Z80 and K053260 and ymfm's YM2151, on the board model
+ *    Version:     0.2.0
  *    Created:     05-11-2026
- *    Modified:    06-11-2026
+ *    Modified:    23-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
  *    MAME's files are compiled here, unchanged, inside a namespace of their own (ks), over the stand-ins of
  *    this folder (emu.h, dirom.h, machine/z80daisy.h, logmacro.h): the Z80 core is system32/reference/mame/z80's
  *    (MAME's, as 0.289 has it but for its debugger's IR register), the K053260 MAME 0.289's. ymfm is a library
- *    of its own and builds as it is. What simpsons.cpp adds (MAME 0.289, Ernesto Corvi, BSD-3-Clause) is
- *    written below as it has it: the Z80's NMI from the K053260's SH1 and its arming (z80_nmi_w,
- *    z80_arm_nmi_w), the NMI held from the reset (machine_reset), and the routes' gains.
+ *    of its own and builds as it is. What the board's driver adds (MAME 0.289's simpsons.cpp, Ernesto Corvi, and
+ *    tmnt2.cpp, Nicola Salmoria; BSD-3-Clause) is written below as they have it: the Z80's NMI from the
+ *    K053260's SH1 and its arming (z80_nmi_w, z80_arm_nmi_w or sound_arm_nmi_w), the NMI held from the reset
+ *    (machine_reset), and the routes' gains (K_MIX_*). The board is K_BOARD's (The Simpsons' by default): its
+ *    model's Z80 map, chips and constants through KB() and KBC(). The Z80 may have a clock of its own
+ *    (K_SOUND_CPU_CLOCK: Sunset Riders' 8 MHz): every time here is in its cycles, and the chips' samples, the
+ *    K053260's timer steps and the YM2151's timers, on the chips' clock, fall on the first Z80 cycle at or
+ *    after theirs.
  *
  *    The Z80's time is kept one of two ways:
  *      - free: the Z80 runs cycle by cycle in slices that end where the board's time asks, at the K053260's
  *        timer steps (every 16 clocks, from 16 clocks after the reset, as its device_reset sets it) or at the
- *        YM2151's timers (a timer set while it runs cuts its slice short), and takes the 053248's IRQ as MAME's
+ *        YM2151's timers (a timer set while it runs cuts its slice short), and takes the main CPU's IRQ as MAME's
  *        HOLD_LINE does: the line stays up until the Z80 takes it;
  *      - the timing model (ks_use_timing, the table tools/decompile_sound.py writes): the rules of the game's own
  *        sound board (runtime/src/sound_cpu.c), kept around MAME's core by its instruction hook, as TMNT's
@@ -29,9 +34,10 @@
  *        HALT waits for the first SH1 pulse 4 cycles after the write of FA00 or later, in halted NOPs of 4
  *        cycles, and the NMI is this code's too (11 cycles, to 0066: the core never sees its line either); an
  *        LDIR's every repeat adds 21; the board stops the Z80 where the main loop's top finds its time past the
- *        board's. The game's own sound board keeps the same rules, so the two compare sample for sample.
- *    The Z80's RAM is hashed without its stack (SIMPSONS_SOUND_STACK_START-END, simpsons/sound_board.h), which the
- *    decompiled program does not keep, and with the two ports the Z80 writes (its answers to the 053248).
+ *        board's. The game's own sound board keeps the same rules, so the two compare sample for sample. Only
+ *        on a board whose Z80 runs on the chips' clock.
+ *    The Z80's RAM is hashed without its stack (<BOARD>_SOUND_STACK_START-END, <board>/sound_board.h), which the
+ *    decompiled program does not keep, and with the two ports the Z80 writes (its answers to the main CPU).
  *
  *    --sound-check (ks_check_chips) runs the game's own chips (runtime/src/ym2151.c and k053260.c) beside
  *    MAME's: each gets the same writes and reads at the same times, makes its samples where MAME's does, and has
@@ -41,11 +47,44 @@
  */
 #include "ksound_053260.h"
 
+// The board whose model this runs on: K_BOARD is the prefix of its names (simpsons_z80_read, "simpsons/machine.h")
+// and K_BOARD_UPPER the one of its constants (SIMPSONS_SOUND_CLOCK), as in kref.cpp. KB(z80_read),
+// KBC(SOUND_CLOCK) and KB_HEADER(machine.h) spell them
+#ifndef K_BOARD
+#define K_BOARD simpsons
+#define K_BOARD_UPPER SIMPSONS
+#endif
+#define KB_JOIN2(a, b) a##_##b
+#define KB_JOIN(a, b) KB_JOIN2(a, b)
+#define KB(name) KB_JOIN(K_BOARD, name)
+#define KBC(name) KB_JOIN(K_BOARD_UPPER, name)
+#define KB_TEXT2(x) #x
+#define KB_TEXT(x) KB_TEXT2(x)
+#define KB_HEADER(file) KB_TEXT(K_BOARD/file)
+
+// The Z80's clock: K_SOUND_CPU_CLOCK for a board whose Z80 has one of its own (Sunset Riders: 8 MHz, the chips
+// on 3.579545 MHz); unset, the chips' (The Simpsons). The routes to the stereo speaker, as the board's driver
+// has them: the YM2151's outputs 0 and 1 to the left and to the right (K_MIX_FM0_LEFT...) and the K053260's
+// two each to its side (K_MIX_PCM); unset, The Simpsons' (the YM2151's first output to both sides at 0.5, its
+// second nowhere, the K053260's at 0.5)
+#ifndef K_SOUND_CPU_CLOCK
+#define K_SOUND_CPU_CLOCK KBC(SOUND_CLOCK)
+#endif
+#ifndef K_MIX_FM0_LEFT
+#define K_MIX_FM0_LEFT 0.5f
+#define K_MIX_FM0_RIGHT 0.5f
+#define K_MIX_FM1_LEFT 0.0f
+#define K_MIX_FM1_RIGHT 0.0f
+#endif
+#ifndef K_MIX_PCM
+#define K_MIX_PCM 0.5f
+#endif
+
 #include "game/data.h"
-#include "simpsons/k053260.h"
-#include "simpsons/machine.h"
-#include "simpsons/sound_board.h"
-#include "simpsons/ym2151.h"
+#include KB_HEADER(k053260.h)
+#include KB_HEADER(machine.h)
+#include KB_HEADER(sound_board.h)
+#include KB_HEADER(ym2151.h)
 
 #include "ymfm_opm.h"
 
@@ -84,11 +123,12 @@ namespace ks
 namespace
 {
 
-constexpr uint64_t kBoardClock = SIMPSONS_CPU_CLOCK;
-constexpr uint64_t kSoundClock = SIMPSONS_SOUND_CLOCK;
-constexpr uint64_t kSampleClocks = 64;      // the YM2151's and the K053260's samples, both on the Z80's clock
-constexpr uint64_t kTimerClocks = 16;       // the K053260's timer step
-constexpr uint64_t kNmiBlock = 4;           // z80_arm_nmi_w: an SH1 pulse within 4 cycles does not raise the NMI
+constexpr uint64_t kBoardClock = KBC(CPU_CLOCK);
+constexpr uint64_t kSoundClock = K_SOUND_CPU_CLOCK;  // the Z80's: every time here is in its cycles
+constexpr uint64_t kChipClock = KBC(SOUND_CLOCK);    // the YM2151's and the K053260's
+constexpr uint64_t kSampleClocks = 64;      // the YM2151's and the K053260's samples, on the chips' clock
+constexpr uint64_t kTimerClocks = 16;       // the K053260's timer step, on its clock
+constexpr uint64_t kNmiBlock = 4;           // z80_arm_nmi_w: an SH1 pulse within 4 Z80 cycles does not raise the NMI
 
 // the first Z80 cycle at or after board time 'time'
 uint64_t z80_time(uint64_t time)
@@ -96,10 +136,16 @@ uint64_t z80_time(uint64_t time)
 	return (time * kSoundClock + kBoardClock - 1) / kBoardClock;
 }
 
-// how many samples start before Z80 cycle 'cycle'
+// the first Z80 cycle at or after the chips' clock 'clocks' (the same number when the two clocks are one)
+uint64_t chip_to_z80(uint64_t clocks)
+{
+	return (clocks * kSoundClock + kChipClock - 1) / kChipClock;
+}
+
+// how many samples start before Z80 cycle 'cycle' (sample n starts at the chips' clock 64 n)
 uint64_t samples_before(uint64_t cycle)
 {
-	return (cycle + kSampleClocks - 1) / kSampleClocks;
+	return cycle == 0 ? 0 : (cycle - 1) * kChipClock / (kSampleClocks * kSoundClock) + 1;
 }
 
 // ---- time: the Z80's cycles, and while the Z80 runs, where its slice started and how long it is ----
@@ -144,7 +190,7 @@ struct
 	uint64_t until = 0;             // where the board stops the Z80 (board cycles)
 	bool stop = false;              // the hook stopped the core at the loop's top
 	bool rewind = false;            // the core fetched the loop top's opcode before it stopped
-	bool line = false;              // the 053248's IRQ, held until the Z80 takes it
+	bool line = false;              // the main CPU's IRQ, held until the Z80 takes it
 	int previous = -1;              // the instruction before this one
 	uint8_t previous_opcode = 0;
 	const block_timing *current = nullptr;
@@ -153,7 +199,7 @@ struct
 class sound_cpu : public ks::z80_device
 {
 public:
-	explicit sound_cpu(const ks::machine_config &config) : ks::z80_device(config, "audiocpu", nullptr, SIMPSONS_SOUND_CLOCK) {}
+	explicit sound_cpu(const ks::machine_config &config) : ks::z80_device(config, "audiocpu", nullptr, K_SOUND_CPU_CLOCK) {}
 
 	// how many of the slice's cycles have gone by
 	int cycles_done() const { return g_slice_budget - cycles_left(); }
@@ -182,9 +228,9 @@ public:
 	{
 		m_pc.w = back;
 		m_sp.w = uint16_t(m_sp.w - 1);
-		simpsons_z80_write(m_sp.w, m_pc.b.h);
+		KB(z80_write)(m_sp.w, m_pc.b.h);
 		m_sp.w = uint16_t(m_sp.w - 1);
-		simpsons_z80_write(m_sp.w, m_pc.b.l);
+		KB(z80_write)(m_sp.w, m_pc.b.l);
 		m_pc.w = handler;
 		m_iff1 = false;
 		if (!nmi)
@@ -249,8 +295,8 @@ samples g_pcm_samples(2);
 // ---- --sound-check: the game's own chips fed what MAME's get, at the same times, and compared with them ----
 
 bool g_check = false;
-simpsons_ym2151 g_own_fm;
-simpsons_k053260 g_own_pcm;
+KB(ym2151) g_own_fm;
+KB(k053260) g_own_pcm;
 uint64_t g_own_fm_deadline[2] = { UINT64_MAX, UINT64_MAX };    // the own YM2151's timers, in Z80 cycles
 uint64_t g_own_fm_busy_until = 0;
 
@@ -321,15 +367,16 @@ void close_check_frame()
 	g_frame_first.clear();
 }
 
-// The own YM2151's host: its timers and its busy flag on the Z80's clock, as fm_chip keeps MAME's
+// The own YM2151's host: its timers and its busy flag (in the chip's clocks) kept in Z80 cycles, as fm_chip
+// keeps MAME's
 void own_fm_set_timer(void *, int timer, int32_t clocks)
 {
-	g_own_fm_deadline[timer] = clocks < 0 ? UINT64_MAX : now() + uint64_t(clocks);
+	g_own_fm_deadline[timer] = clocks < 0 ? UINT64_MAX : now() + chip_to_z80(uint64_t(clocks));
 }
 
 void own_fm_set_busy_end(void *, uint32_t clocks)
 {
-	g_own_fm_busy_until = now() + clocks;
+	g_own_fm_busy_until = now() + chip_to_z80(clocks);
 }
 
 bool own_fm_is_busy(void *)
@@ -355,7 +402,7 @@ public:
 			if (g_check)
 			{
 				int32_t own[2];
-				simpsons_ym2151_generate(&g_own_fm, own);
+				KB(ym2151_generate)(&g_own_fm, own);
 				check(kFmSamples, own[0] == output.data[0] && own[1] == output.data[1],
 					"YM2151 sample %llu (the frame's %llu): own %d %d, reference %d %d",
 					(unsigned long long)g_fm_samples.made, (unsigned long long)(g_fm_samples.made - g_fm_samples.first),
@@ -371,7 +418,7 @@ public:
 		const uint8_t value = m_chip.read(uint32_t(offset));
 		if (g_check)
 		{
-			const uint8_t own = simpsons_ym2151_read(&g_own_fm, offset);
+			const uint8_t own = KB(ym2151_read)(&g_own_fm, offset);
 			check(kFmReads, own == value, "YM2151 read of %d at Z80 cycle %llu: own %02X, reference %02X", offset,
 				(unsigned long long)now(), own, value);
 		}
@@ -383,7 +430,7 @@ public:
 		m_chip.write(uint32_t(offset), data);
 		if (g_check)
 		{
-			simpsons_ym2151_write(&g_own_fm, offset, data);
+			KB(ym2151_write)(&g_own_fm, offset, data);
 			check_timers("write");
 		}
 	}
@@ -409,7 +456,7 @@ public:
 			m_engine->engine_timer_expired(uint32_t(number));
 			if (g_check)
 			{
-				simpsons_ym2151_timer_expired(&g_own_fm, number);
+				KB(ym2151_timer_expired)(&g_own_fm, number);
 				check_timers("timer");
 			}
 			g_now_override = UINT64_MAX;
@@ -424,7 +471,7 @@ public:
 			m_deadline[number] = UINT64_MAX;
 			return;
 		}
-		m_deadline[number] = now() + uint64_t(clocks);
+		m_deadline[number] = now() + chip_to_z80(uint64_t(clocks));
 		// free timing: a running Z80 stops by then, for the timer to run out on time
 		if (!g_model.on && g_running && g_now_override == UINT64_MAX
 			&& m_deadline[number] < g_slice_start + uint64_t(g_slice_budget))
@@ -435,7 +482,7 @@ public:
 	}
 	void ymfm_set_busy_end(uint32_t clocks) override
 	{
-		m_busy_until = now() + clocks;
+		m_busy_until = now() + chip_to_z80(clocks);
 	}
 	bool ymfm_is_busy() override
 	{
@@ -455,7 +502,7 @@ std::unique_ptr<fm_chip> g_fm;
 class pcm_chip : public ks::k053260_device
 {
 public:
-	pcm_chip(const ks::machine_config &config) : ks::k053260_device(config, "k053260", nullptr, SIMPSONS_SOUND_CLOCK)
+	pcm_chip(const ks::machine_config &config) : ks::k053260_device(config, "k053260", nullptr, KBC(SOUND_CLOCK))
 	{
 		this->stream().m_before_change = [this]() { catch_up(now()); };
 	}
@@ -473,7 +520,7 @@ public:
 			{
 				// the own chip's sample as MAME's stream puts it (put_int_clamp: the value / 32768)
 				int32_t own[2];
-				simpsons_k053260_generate(&g_own_pcm, own);
+				KB(k053260_generate)(&g_own_pcm, own);
 				const float own_values[2] = { float(own[0]) * (1.0f / 32768.0f), float(own[1]) * (1.0f / 32768.0f) };
 				if (own_values[0] == values[0] && own_values[1] == values[1])
 					check(kPcmSamples, true, "");
@@ -490,7 +537,7 @@ public:
 		const uint8_t value = ks::k053260_device::read(offset);
 		if (g_check)
 		{
-			const uint8_t own = simpsons_k053260_read(&g_own_pcm, int(offset));
+			const uint8_t own = KB(k053260_read)(&g_own_pcm, int(offset));
 			check(kPcmReads, own == value, "K053260 read of %02X at Z80 cycle %llu: own %02X, reference %02X",
 				unsigned(offset), (unsigned long long)now(), own, value);
 		}
@@ -500,13 +547,13 @@ public:
 	{
 		ks::k053260_device::write(offset, data);
 		if (g_check)
-			simpsons_k053260_write(&g_own_pcm, int(offset), data);
+			KB(k053260_write)(&g_own_pcm, int(offset), data);
 	}
 	// the own chip's voices, for a difference: playing, start, length, pitch, position, output
 	static std::string voices()
 	{
 		std::string text;
-		for (const simpsons_k053260_voice &voice : g_own_pcm.voices)
+		for (const KB(k053260_voice) &voice : g_own_pcm.voices)
 		{
 			char one[96];
 			std::snprintf(one, sizeof(one), "[%d %06X %04X %03X %X %d]", int(voice.playing), unsigned(voice.start),
@@ -521,14 +568,14 @@ public:
 
 std::unique_ptr<pcm_chip> g_pcm;
 
-// ---- the K053260's timer and the Z80's NMI (simpsons.cpp: z80_nmi_w, z80_arm_nmi_w) ----
+// ---- the K053260's timer and the Z80's NMI (the driver's z80_nmi_w, and z80_arm_nmi_w or sound_arm_nmi_w) ----
 
-uint64_t g_timer_steps = 0;             // the steps taken: step n is at Z80 cycle 16 x (n + 1)
+uint64_t g_timer_steps = 0;             // the steps taken: step n is at the chip's clock 16 x (n + 1)
 uint64_t g_nmi_blocked_until = 0;       // the Z80 cycle the arming's block ends
 
 uint64_t next_step()
 {
-	return kTimerClocks * (g_timer_steps + 1);
+	return chip_to_z80(kTimerClocks * (g_timer_steps + 1));
 }
 
 // the timer's steps due by Z80 cycle 'cycle': SH1 goes up at every fourth, from the first
@@ -542,7 +589,7 @@ void step_timer(uint64_t cycle)
 		g_pcm->step_timer();
 		if (g_check)
 		{
-			const bool own_up = simpsons_k053260_step_timer(&g_own_pcm);
+			const bool own_up = KB(k053260_step_timer)(&g_own_pcm);
 			check(kPcmTimer, own_up == sh1_up, "K053260 timer step %llu: own SH1 %s, reference %s",
 				(unsigned long long)g_timer_steps, own_up ? "up" : "not up", sh1_up ? "up" : "not up");
 		}
@@ -564,18 +611,18 @@ void arm_nmi()
 
 uint8_t chip_read(int chip, int offset)
 {
-	return chip == SIMPSONS_CHIP_FM ? g_fm->read(offset) : g_pcm->read(ks::offs_t(offset));
+	return chip == KBC(CHIP_FM) ? g_fm->read(offset) : g_pcm->read(ks::offs_t(offset));
 }
 
 void chip_write(int chip, int offset, uint8_t data)
 {
-	if (chip == SIMPSONS_CHIP_FM)
+	if (chip == KBC(CHIP_FM))
 		g_fm->write(offset, data);
 	else
 		g_pcm->write(ks::offs_t(offset), data);
 }
 
-// the 053248 raises the Z80's IRQ, held until the Z80 takes it
+// the main CPU raises the Z80's IRQ, held until the Z80 takes it
 void raise_irq()
 {
 	g_irq_held = true;
@@ -587,7 +634,7 @@ void raise_irq()
 
 uint32_t place_of(uint16_t address)
 {
-	const int32_t offset = simpsons_sound_offset(address);
+	const int32_t offset = KB(sound_offset)(address);
 	return offset >= 0 ? uint32_t(offset) : kRamPlaces + address;
 }
 
@@ -673,7 +720,7 @@ void on_instruction(ks::offs_t address)
 		}
 		start_block(pc);
 	}
-	g_model.previous_opcode = simpsons_z80_read(pc);
+	g_model.previous_opcode = KB(z80_read)(pc);
 	if (g_model.previous_opcode == 0x76)
 		halt_until_nmi(pc);
 }
@@ -683,8 +730,8 @@ void on_instruction(ks::offs_t address)
 uint8_t data_read(ks::offs_t address)
 {
 	if (g_record_rom_reads && address < 0xC000u)
-		g_rom_read_set.insert(uint64_t(g_instruction) << 32 | uint32_t(simpsons_sound_offset(uint16_t(address))));
-	return simpsons_z80_read(uint16_t(address));
+		g_rom_read_set.insert(uint64_t(g_instruction) << 32 | uint32_t(KB(sound_offset)(uint16_t(address))));
+	return KB(z80_read)(uint16_t(address));
 }
 
 // the Z80, the K053260's timer and the YM2151's timers up to Z80 cycle 'until'
@@ -764,8 +811,8 @@ extern "C" void ks_attach(void)
 	ks::set_region("k053260", game_samples, GAME_SAMPLES_SIZE);
 
 	g_z80 = std::make_unique<sound_cpu>(g_config);
-	g_z80->space(ks::AS_PROGRAM).read = [](ks::offs_t address) { return simpsons_z80_read(uint16_t(address)); };
-	g_z80->space(ks::AS_PROGRAM).write = [](ks::offs_t address, uint8_t data) { simpsons_z80_write(uint16_t(address), data); };
+	g_z80->space(ks::AS_PROGRAM).read = [](ks::offs_t address) { return KB(z80_read)(uint16_t(address)); };
+	g_z80->space(ks::AS_PROGRAM).write = [](ks::offs_t address, uint8_t data) { KB(z80_write)(uint16_t(address), data); };
 	g_z80->space(ks::AS_PROGRAM).data_read = data_read;
 	g_z80->space(ks::AS_IO).read = [](ks::offs_t) { return uint8_t(0); };
 	g_z80->space(ks::AS_IO).write = [](ks::offs_t, uint8_t) {};
@@ -789,16 +836,19 @@ extern "C" void ks_attach(void)
 	g_pcm->start();
 	g_pcm->reset();
 
-	simpsons_board.sound_chip_read = chip_read;
-	simpsons_board.sound_chip_write = chip_write;
-	simpsons_board.sound_irq = raise_irq;
-	simpsons_board.sound_nmi_arm = arm_nmi;
-	g_z80_time = z80_time(simpsons_board.cycles);
+	KB(board).sound_chip_read = chip_read;
+	KB(board).sound_chip_write = chip_write;
+	KB(board).sound_irq = raise_irq;
+	KB(board).sound_nmi_arm = arm_nmi;
+	g_z80_time = z80_time(KB(board).cycles);
 	g_model.clock = g_model.access = g_z80_time;
 }
 
 extern "C" bool ks_use_timing(const char *path)
 {
+	// (the model counts the K053260's timer in the Z80's cycles: a board whose Z80 has a clock of its own has none)
+	if (kSoundClock != kChipClock)
+		return false;
 	std::ifstream file(path);
 	if (!file)
 		return false;
@@ -855,14 +905,14 @@ extern "C" void ks_end_frame(uint64_t time)
 	g_source_hashes[0] = hash_bytes(fm.data(), fm.size() * sizeof(float), 0xcbf29ce484222325ull);
 	g_source_hashes[1] = hash_bytes(pcm.data(), pcm.size() * sizeof(float), 0xcbf29ce484222325ull);
 
-	// the mix (simpsons.cpp's routes to its stereo speaker): the YM2151's first output to both sides at 0.5,
-	// the K053260's two to theirs at 0.5
+	// the mix (the driver's routes to its stereo speaker: K_MIX_FM0_LEFT... and K_MIX_PCM)
 	g_mix.clear();
 	const size_t count = std::min(fm.size(), pcm.size()) / 2;
 	for (size_t index = 0; index < count; index++)
 	{
-		g_mix.push_back(to_sample(0.5f * fm[index * 2] + 0.5f * pcm[index * 2]));
-		g_mix.push_back(to_sample(0.5f * fm[index * 2] + 0.5f * pcm[index * 2 + 1]));
+		const float fm0 = fm[index * 2], fm1 = fm[index * 2 + 1];
+		g_mix.push_back(to_sample(K_MIX_FM0_LEFT * fm0 + K_MIX_FM1_LEFT * fm1 + K_MIX_PCM * pcm[index * 2]));
+		g_mix.push_back(to_sample(K_MIX_FM0_RIGHT * fm0 + K_MIX_FM1_RIGHT * fm1 + K_MIX_PCM * pcm[index * 2 + 1]));
 	}
 	if (g_check)
 		close_check_frame();
@@ -870,12 +920,12 @@ extern "C" void ks_end_frame(uint64_t time)
 
 extern "C" void ks_check_chips(void)
 {
-	g_own_fm = simpsons_ym2151{};
+	g_own_fm = KB(ym2151){};
 	g_own_fm.set_timer = own_fm_set_timer;
 	g_own_fm.set_busy_end = own_fm_set_busy_end;
 	g_own_fm.is_busy = own_fm_is_busy;
-	simpsons_ym2151_init(&g_own_fm);
-	simpsons_k053260_init(&g_own_pcm, game_samples, GAME_SAMPLES_SIZE);
+	KB(ym2151_init)(&g_own_fm);
+	KB(k053260_init)(&g_own_pcm, game_samples, GAME_SAMPLES_SIZE);
 	g_check = true;
 }
 
@@ -907,11 +957,11 @@ extern "C" void ks_frame_source_hashes(uint64_t hashes[2])
 extern "C" uint64_t ks_state_hash(void)
 {
 	// (the Z80's stack left out: the decompiled program keeps what it pushes in variables of its own; the two
-	// ports the Z80 writes, its answers to the 053248, in)
-	constexpr size_t stack = SIMPSONS_SOUND_STACK_START - 0xF000u, above = SIMPSONS_SOUND_STACK_END - 0xF000u;
-	uint64_t hash = hash_bytes(simpsons_board.sound_ram, stack, 0xcbf29ce484222325ull);
-	hash = hash_bytes(simpsons_board.sound_ram + above, sizeof(simpsons_board.sound_ram) - above, hash);
-	return hash_bytes(simpsons_board.sound_ports + 2, 2, hash);
+	// ports the Z80 writes, its answers to the main CPU, in)
+	constexpr size_t stack = KBC(SOUND_STACK_START) - 0xF000u, above = KBC(SOUND_STACK_END) - 0xF000u;
+	uint64_t hash = hash_bytes(KB(board).sound_ram, stack, 0xcbf29ce484222325ull);
+	hash = hash_bytes(KB(board).sound_ram + above, sizeof(KB(board).sound_ram) - above, hash);
+	return hash_bytes(KB(board).sound_ports + 2, 2, hash);
 }
 
 extern "C" const int16_t *ks_frame_mix(size_t *count)
@@ -922,7 +972,7 @@ extern "C" const int16_t *ks_frame_mix(size_t *count)
 
 extern "C" uint32_t ks_mix_rate(void)
 {
-	return uint32_t(kSoundClock / kSampleClocks);
+	return uint32_t(kChipClock / kSampleClocks);
 }
 
 extern "C" uint64_t ks_z80_cycles(void)

@@ -19,8 +19,14 @@
 #                        unset, TMNT's (kref.cpp's KB macros)
 #   K_REFERENCE_VIDEO    OFF for a board whose chips kvideo (K052109 + K051960) does not draw: kref then runs
 #                        without the video reference and without the game's own video (default ON)
-#   K_REFERENCE_SOUND    OFF for a board whose sound ksound (Z80, YM2151, K007232, uPD7759) does not model: kref
-#                        then runs without the sound board (default ON)
+#   K_REFERENCE_SOUND    OFF for a board whose sound neither ksound (Z80, YM2151, K007232, uPD7759) nor
+#                        ksound_053260 (Z80, YM2151, K053260) models: kref then runs without the sound board
+#                        (default ON)
+#   K_SOUND_CHIPS        the sound board's chips beside the Z80 and the YM2151: 007232 (the default: TMNT's,
+#                        sound/ksound.cpp) or 053260 (Sunset Riders', sound/ksound_053260.cpp, on the board model's
+#                        <board>/k053260.h, ym2151.h and sound_board.h)
+#   K_SOUND_DEFINITIONS  (optional) the sound board's own definitions: K_SOUND_CPU_CLOCK (the Z80's clock when it
+#                        is not the chips') and the routes' gains (K_MIX_FM0_LEFT..., K_MIX_PCM)
 #   K_GAME_ASSETS        OFF for a game without game/assets.h yet: no --assets check (default ON)
 #   K_GAME_FRAME_WAIT    OFF for a board without <board>/frame.h (the address of the program's wait for the
 #                        frame): --timing runs the CPU's cycles only (default ON)
@@ -41,6 +47,9 @@ if(NOT K_RUNTIME_INCLUDE)
 endif()
 if(NOT K_CPU)
 	set(K_CPU 68000)
+endif()
+if(NOT K_SOUND_CHIPS)
+	set(K_SOUND_CHIPS 007232)
 endif()
 
 # The sound boards' Z80: system32/reference's copy of MAME's core, whose steps are written from z80.lst at build
@@ -209,12 +218,26 @@ list(APPEND K_KREF_DEFINITIONS K_NO_VIDEO)
 endif()
 
 if(K_REFERENCE_SOUND)
+if(K_SOUND_CHIPS STREQUAL "053260")
+# The sound board: MAME's Z80 and K053260, ymfm's YM2151 (sound/ksound_053260.cpp), on the board model's names
+add_library(ksound_reference STATIC
+	${K_REFERENCE}/sound/ksound_053260.cpp
+	${K_REFERENCE}/ymfm/ymfm_opm.cpp
+	${K_Z80_STEPS}
+)
+if(K_BOARD)
+	target_compile_definitions(ksound_reference PRIVATE K_BOARD=${K_BOARD} K_BOARD_UPPER=${K_BOARD_UPPER})
+endif()
+list(APPEND K_KREF_DEFINITIONS K_SOUND_053260)
+else()
 # The sound board: MAME's Z80 (system32/reference's copy of the core), K007232 and uPD7759, ymfm's YM2151
 add_library(ksound_reference STATIC
 	${K_REFERENCE}/sound/ksound.cpp
 	${K_REFERENCE}/ymfm/ymfm_opm.cpp
 	${K_Z80_STEPS}
 )
+endif()
+target_compile_definitions(ksound_reference PRIVATE ${K_SOUND_DEFINITIONS})
 target_include_directories(ksound_reference
 	PUBLIC ${K_REFERENCE}/sound
 	PRIVATE ${K_RUNTIME_INCLUDE} ${K_REFERENCE}/ymfm ${K_Z80} ${K_REFERENCE}/mame/sound
