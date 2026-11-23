@@ -57,6 +57,7 @@ from decompiler import pointers  # noqa: E402
 from decompiler import preserved  # noqa: E402
 from decompiler import signatures  # noqa: E402
 from decompiler import stack  # noqa: E402
+from decompiler import stackargs  # noqa: E402
 from decompiler import structure  # noqa: E402
 from decompiler import variables  # noqa: E402
 from decompiler.gotos import GotoError  # noqa: E402
@@ -97,6 +98,9 @@ def configure():
     dataflow.PASSES_BY_PART = getattr(game_profile, "PASSES_BY_PART", False)
     # LINK A6's frames (the compiler's) followed as the stack's slots (the profile's LINK_FRAMES; off, a LINK stops the function)
     stack.FRAME_REGISTERS = frozenset({14}) if getattr(game_profile, "LINK_FRAMES", False) else frozenset()
+    # the arguments the compiler's functions pass on the stack are registers of the data flow (the profile's STACK_ARGUMENTS,
+    # off by default: decompiler/stackargs.py)
+    stack.STACK_ARGUMENTS = getattr(game_profile, "STACK_ARGUMENTS", False)
     # (and UNCHANGED_PARTS: "bset #7, D7" writes D7's low byte only)
     dataflow.UNCHANGED_PARTS = getattr(game_profile, "UNCHANGED_PARTS", False)
     # (and NARROW_OUTPUTS: what a function hands back is what its callers read once everything is known)
@@ -174,6 +178,8 @@ def analyse(program, built):
     """Stack slots, preserved registers and the data flow summaries, in place"""
     for function in built.values():
         stack.analyse(function)
+    if stack.STACK_ARGUMENTS:
+        stackargs.apply(built)
     stack.link_caller_exits(built)
     flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
     signatures.OPEN = open_entries(program, built)
@@ -277,6 +283,10 @@ def check(program):
         left = stack.leftovers(function)
         if left:
             failures.append((entry, f"{len(left)} statements still use SP, the first: {left[0]}"))
+    if stack.STACK_ARGUMENTS:
+        failed = {entry for entry, _ in failures}
+        model = stackargs.apply({entry: function for entry, function in built.items() if entry not in failed})
+        failures.extend(sorted(model.problems.items()))
     ends = Counter(type(block.end).__name__ for function in built.values() for block in function.blocks.values())
     print(f"functions:  {len(built)}")
     print(f"blocks:     {sum(ends.values())}")

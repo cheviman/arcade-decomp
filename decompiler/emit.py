@@ -40,6 +40,7 @@ from . import floats
 from . import memory
 from . import pointers
 from . import signatures
+from . import stack
 from . import structure
 from . import variables
 
@@ -1329,10 +1330,11 @@ class FunctionWriter:
             if self.entry not in self.emitter.needs_return_address:
                 raise EmitError(f"{self.function.name}: reads its return address")
             return "return_address"
-        if node.offset > 0:
+        if node.offset > 0 and not stack.STACK_ARGUMENTS:
             raise EmitError(f"{self.function.name}: reads its caller's stack at {node.offset:+d}")
+        # (with STACK_ARGUMENTS the slots at a positive offset are the copies of the arguments' registers: stackargs.py)
         name = self.slots.get(node.offset) or self.slot_chosen(node.offset) or self.slot_hint(node.offset) \
-            or f"stack_{-node.offset:X}"
+            or (f"stack_{-node.offset:X}" if node.offset < 0 else f"argument_{node.offset:X}")
         self.slots[node.offset] = name
         bits = self.slot_widths.setdefault(node.offset, node.bits)
         if bits != node.bits:
@@ -2498,7 +2500,7 @@ class FunctionWriter:
         if isinstance(statement, ir.SetFlag):
             return [f"{self.use(('f', statement.name))} = {self.exact(statement.value)};"]
         if isinstance(statement, ir.SetStack):
-            if statement.offset >= 0:
+            if statement.offset >= 0 and not (stack.STACK_ARGUMENTS and statement.offset >= cpu.current.return_address_bytes):
                 raise EmitError(f"{self.function.name}: writes its caller's stack at {statement.offset:+d}")
             name = self.slot_name(ir.Stack(statement.offset, statement.bits))
             return [f"{name} = {self.stored(statement.value, statement.bits)};"]
@@ -3266,6 +3268,8 @@ class FunctionWriter:
 
     def write(self):
         """The function's C. Written again (once emitter.shared_results is known), only its last steps run."""
+        if getattr(self.function, "argument_problem", None):
+            raise EmitError(self.function.argument_problem)    # (its stack arguments, decompiler/stackargs.py)
         if self.written is None:
             tree, self.labels = structure.structured(self.function, self.control_name)
             self.written = self.name_controls(self.nodes(tree, 1))

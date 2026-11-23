@@ -30,6 +30,9 @@ MEMORY_SP = 32           # the register SP becomes in a function whose stack sta
 # one set to a stack address is followed as that offset, its loads and stores are slots; empty (the V60, the Z80,
 # Konami's) such a register is not followed (m68000/decompile.py sets it from the profile's LINK_FRAMES)
 FRAME_REGISTERS = frozenset()
+# the stack's temporaries are followed where memory is read and written too, not only where a stack address is
+# computed (the 68000's pushes and "($n,A7)" reads go through one); off, as before (decompiler/stackargs.py)
+STACK_ARGUMENTS = False
 LEFT_CALLER = 33         # a register the V60 does not have: set when the function just called returned for
                          # its caller too (link_caller_exits)
 
@@ -70,11 +73,11 @@ def redirect(end, old, new):
         end.cases = {case: new if target == old else target for case, target in end.cases.items()}
 
 
-def slot_reader(sp, frames=None):
+def slot_reader(sp, frames=None, temps=None):
     """A rebuild() change that turns reads of stack memory into slots."""
     def change(node):
         if isinstance(node, ir.Load):
-            offset = offset_of(node.address, sp, None, frames)
+            offset = offset_of(node.address, sp, temps, frames)
             if offset is not None:
                 return ir.Stack(offset, node.bits)
         return None
@@ -137,6 +140,7 @@ def slots(function):
         frames = dict(start_frames[label])
         statements = []
         temps = {}
+        known = temps if STACK_ARGUMENTS else None    # (the temporaries the 68000's lift reaches memory through)
         for statement in block.statements:
             if isinstance(statement, ir.SetTemp):
                 offset = offset_of(statement.value, sp, temps, frames)
@@ -149,7 +153,7 @@ def slots(function):
                 if offset is not None:
                     frames[statement.index] = offset    # (a frame: its places are slots, the register drops out)
                     continue
-                ir.map_statement(statement, slot_reader(sp, frames))
+                ir.map_statement(statement, slot_reader(sp, frames, known))
                 statements.append(statement)
                 frames.pop(statement.index, None)
                 continue
@@ -171,18 +175,22 @@ def slots(function):
                 sp += 8 + frame.value
                 continue
             if isinstance(statement, ir.Store):
-                offset = offset_of(statement.address, sp, None, frames)
+                offset = offset_of(statement.address, sp, known, frames)
                 if offset is not None:
-                    value = ir.rebuild(statement.value, slot_reader(sp, frames))
+                    value = ir.rebuild(statement.value, slot_reader(sp, frames, known))
                     slot = ir.SetStack(offset, value, statement.bits)
                     if hasattr(statement, "origin"):
                         slot.origin = statement.origin    # the instruction that stores it ("local" lines)
                     statements.append(slot)
                     continue
-            ir.map_statement(statement, slot_reader(sp, frames))
+            if STACK_ARGUMENTS and isinstance(statement, ir.Call):
+                statement.sp = sp    # where the stack stood at the call: its arguments are the slots from here up
+            ir.map_statement(statement, slot_reader(sp, frames, known))
             statements.append(statement)
         block.statements = statements
-        ir.map_statement(block.end, slot_reader(sp, frames))
+        if STACK_ARGUMENTS and isinstance(block.end, ir.TailCall):
+            block.end.sp = sp
+        ir.map_statement(block.end, slot_reader(sp, frames, known))
         # a stack address that still serves as a value (the flags of "add.w #4, SP") has none in C: it
         # becomes a marker the C writer refuses, so it has to turn out unused
         def opaque(node):
