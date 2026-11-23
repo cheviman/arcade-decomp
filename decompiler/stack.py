@@ -26,6 +26,10 @@ NEW_STACK = -0x100000    # slot offsets after code sets SP itself: far from anyt
 # ways are an error (decompile_sound.py sets it from the profile's SOUND_STACK_RESTARTS)
 RESTARTS = False
 MEMORY_SP = 32           # the register SP becomes in a function whose stack stays in memory (V60 only)
+# the registers a frame may go through (the 68000's LINK An: An = SP, the frame's places An+n, UNLK gives SP back):
+# one set to a stack address is followed as that offset, its loads and stores are slots; empty (the V60, the Z80,
+# Konami's) such a register is not followed (m68000/decompile.py sets it from the profile's LINK_FRAMES)
+FRAME_REGISTERS = frozenset()
 LEFT_CALLER = 33         # a register the V60 does not have: set when the function just called returned for
                          # its caller too (link_caller_exits)
 
@@ -34,18 +38,21 @@ class StackError(Exception):
     pass
 
 
-def offset_of(expression, sp, temps=None):
+def offset_of(expression, sp, temps=None, frames=None):
     """The stack offset 'expression' computes when SP is 'sp' bytes from the start, or None.
-    'temps' maps temporaries already known to hold stack addresses to their offsets."""
+    'temps' maps temporaries already known to hold stack addresses to their offsets, 'frames' the frame
+    registers (FRAME_REGISTERS) that hold one."""
     bits = cpu.current.address_bits
     if isinstance(expression, ir.Reg) and expression.index == cpu.current.sp:
         return sp
+    if isinstance(expression, ir.Reg) and frames and expression.index in frames:
+        return frames[expression.index]
     if isinstance(expression, ir.Temp) and temps:
         return temps.get(expression.name)
     if isinstance(expression, ir.Op) and expression.name in ("add", "sub") and expression.bits == bits:
         base, amount = expression.args
         if isinstance(amount, ir.Const):
-            inner = offset_of(base, sp, temps)
+            inner = offset_of(base, sp, temps, frames)
             if inner is not None:
                 delta = amount.value if amount.value < 1 << (bits - 1) else amount.value - (1 << bits)
                 return inner + delta if expression.name == "add" else inner - delta
@@ -63,11 +70,11 @@ def redirect(end, old, new):
         end.cases = {case: new if target == old else target for case, target in end.cases.items()}
 
 
-def slot_reader(sp):
+def slot_reader(sp, frames=None):
     """A rebuild() change that turns reads of stack memory into slots."""
     def change(node):
         if isinstance(node, ir.Load):
-            offset = offset_of(node.address, sp)
+            offset = offset_of(node.address, sp, None, frames)
             if offset is not None:
                 return ir.Stack(offset, node.bits)
         return None
@@ -116,6 +123,7 @@ def slots(function):
     stacks = 0
     restarts = {label for label, block in function.blocks.items() if sets_sp_first(block)} if RESTARTS else set()
     start = {function.entry: 0}
+    start_frames = {function.entry: {}}
     pending = [function.entry]
     done = set()
     while pending:
@@ -125,17 +133,27 @@ def slots(function):
         done.add(label)
         block = function.blocks[label]
         sp = start[label]
+        frames = dict(start_frames[label])
         statements = []
         temps = {}
         for statement in block.statements:
             if isinstance(statement, ir.SetTemp):
-                offset = offset_of(statement.value, sp, temps)
+                offset = offset_of(statement.value, sp, temps, frames)
                 if offset is not None:
                     # a stack address held for a moment: followed as an offset, the temporary goes away
                     temps[statement.temp.name] = offset
                     continue
+            if isinstance(statement, ir.SetReg) and statement.index in FRAME_REGISTERS:
+                offset = offset_of(statement.value, sp, temps, frames)
+                if offset is not None:
+                    frames[statement.index] = offset    # (a frame: its places are slots, the register drops out)
+                    continue
+                ir.map_statement(statement, slot_reader(sp, frames))
+                statements.append(statement)
+                frames.pop(statement.index, None)
+                continue
             if isinstance(statement, ir.SetReg) and statement.index == cpu.current.sp:
-                new = offset_of(statement.value, sp, temps)
+                new = offset_of(statement.value, sp, temps, frames)
                 if new is None:
                     if not isinstance(statement.value, ir.Const):
                         raise StackError(f"{function.name}: SP set to {statement.value}")
@@ -152,23 +170,25 @@ def slots(function):
                 sp += 8 + frame.value
                 continue
             if isinstance(statement, ir.Store):
-                offset = offset_of(statement.address, sp)
+                offset = offset_of(statement.address, sp, None, frames)
                 if offset is not None:
-                    value = ir.rebuild(statement.value, slot_reader(sp))
+                    value = ir.rebuild(statement.value, slot_reader(sp, frames))
                     slot = ir.SetStack(offset, value, statement.bits)
                     if hasattr(statement, "origin"):
                         slot.origin = statement.origin    # the instruction that stores it ("local" lines)
                     statements.append(slot)
                     continue
-            ir.map_statement(statement, slot_reader(sp))
+            ir.map_statement(statement, slot_reader(sp, frames))
             statements.append(statement)
         block.statements = statements
-        ir.map_statement(block.end, slot_reader(sp))
+        ir.map_statement(block.end, slot_reader(sp, frames))
         # a stack address that still serves as a value (the flags of "add.w #4, SP") has none in C: it
         # becomes a marker the C writer refuses, so it has to turn out unused
         def opaque(node):
             if isinstance(node, ir.Temp) and node.name in temps:
                 return ir.op("stack_address", (ir.const(temps[node.name] & 0xFFFFFFFF),), cpu.current.address_bits)
+            if isinstance(node, ir.Reg) and node.index in frames:
+                return ir.op("stack_address", (ir.const(frames[node.index] & 0xFFFFFFFF),), cpu.current.address_bits)
             return None
         for statement in statements + [block.end]:
             ir.map_statement(statement, opaque)
@@ -182,6 +202,9 @@ def slots(function):
         for successor in block.successors():
             if successor in start and start[successor] != sp and successor in restarts:
                 continue
+            if successor in start_frames and start_frames[successor] != frames:
+                raise StackError(f"{function.name}: frames {start_frames[successor]} and {frames} meet at {successor}")
+            start_frames[successor] = dict(frames)
             if successor in start and start[successor] != sp:
                 target = function.blocks[successor]
                 if target.statements or not isinstance(target.end, ir.Return):

@@ -66,6 +66,17 @@ LABELS_NOT_ENTRIES = getattr(game_profile, "LABELS_NOT_ENTRIES", False)
 # read from the game's data) becomes call_code(address), the runtime's call by address, as the V60's slots do
 # (the profile's DYNAMIC_CALLS; off, such a call stops the decompiler)
 DYNAMIC_CALLS = getattr(game_profile, "DYNAMIC_CALLS", False)
+# a hand-written routine that builds its caller's frame (pops its return address, LINK and saves on the caller's
+# stack, pushes the address back, goes on as a routine of its own): {routine: (first, end, rest)} lifts a call to it
+# as the instructions from first to end in the caller, then a call to rest, so that the caller's own UNLK (in the
+# shared epilogue it jumps to) meets its LINK (the profile's FRAME_BUILDERS; Sonic Spinball's GEMS senders, 0F6088)
+FRAME_BUILDERS = getattr(game_profile, "FRAME_BUILDERS", {})
+# LINK An's frames followed by the stack's slots (decompiler/stack.py's FRAME_REGISTERS) instead of stopping
+LINK_FRAMES = getattr(game_profile, "LINK_FRAMES", False)
+# code that several functions branch to and that ends their frame (UNLK of the caller's LINK): each function that
+# reaches it gets it as its own blocks, and it is no function of its own (the profile's SHARED_TAILS; Sonic
+# Spinball's GEMS senders' 0F6164 and 0F61C4)
+SHARED_TAILS = frozenset(getattr(game_profile, "SHARED_TAILS", ()))
 # the devices that do something when read (TMNT's K051960 in its ROM readback mode): a read there stays, its value
 # used or not
 EFFECT_READ_AREAS = list(getattr(game_profile, "EFFECT_READ_AREAS", ()))
@@ -308,6 +319,16 @@ class Builder:
 
     def build(self, entry):
         body = self.program.bodies[entry]
+        if SHARED_TAILS:
+            body = dict(body)
+            while True:
+                tails = {key(target) for instruction in body.values()
+                         for target in [instruction.target, instruction.address + instruction.length]
+                         if target is not None and key(target) in SHARED_TAILS and key(target) not in body}
+                if not tails:
+                    break
+                for tail in tails:
+                    body.update(self.program.bodies[tail])
         function = Function(entry, self.program.names[entry])
         self.extra_blocks = []
         leaders = self.leaders(entry, body)
@@ -378,7 +399,7 @@ class Builder:
         own return address popped into the register a jump with no known target goes through (a routine that
         hands its results back on the stack: 0021E6), or a frame made with LINK"""
         operands = instruction.operands
-        if instruction.mnemonic == "link":
+        if instruction.mnemonic == "link" and not LINK_FRAMES:
             return True    # (a frame through a register the stack's slots do not follow: 00218A's)
         if len(operands) != 2 or operands[1].mode != "areg":
             return False
@@ -394,7 +415,7 @@ class Builder:
     def transfer(self, entry, target):
         """How execution gets to 'target': a jump in this function, or into another one"""
         target = key(target)
-        if target != entry and target in self.entries:
+        if target != entry and target in self.entries and target not in SHARED_TAILS:
             return ir.TailCall(target)
         return ir.Goto(target)
 
@@ -403,7 +424,7 @@ class Builder:
         def resolve(target, origin):
             if target in function.blocks:
                 return target
-            if target in self.entries:
+            if target in self.entries and target not in SHARED_TAILS:
                 label = ("tail", target)
                 if label not in function.blocks:
                     function.blocks[label] = Block(label, end=ir.TailCall(target))
@@ -458,6 +479,16 @@ class Builder:
             block.end = ir.Branch(lift.condition_of(instruction.condition), key(instruction.target), following)
             return None
         if mnemonic in ("bsr", "jsr"):
+            if instruction.target is not None and instruction.target in FRAME_BUILDERS:
+                first, end, rest = FRAME_BUILDERS[instruction.target]
+                routine = self.program.bodies[instruction.target]
+                for place in sorted(routine):
+                    if first <= place < end:
+                        ended = self.lift(function, block, routine[place])
+                        if ended is not None or block.end is not None:
+                            raise lift.Unsupported(f"{address:06X}: the frame builder's {place:06X} ends a block")
+                statements.append(ir.Call(target=key(rest), return_address=following))
+                return None
             if instruction.target is not None:
                 statements.append(ir.Call(target=key(instruction.target), return_address=following))
                 return None

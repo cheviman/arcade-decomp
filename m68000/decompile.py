@@ -95,6 +95,8 @@ def configure():
     dataflow.WORKLIST = True
     # (the profile's PASSES_BY_PART, off by default: what a function reads to hand back a register, part by part)
     dataflow.PASSES_BY_PART = getattr(game_profile, "PASSES_BY_PART", False)
+    # LINK A6's frames (the compiler's) followed as the stack's slots (the profile's LINK_FRAMES; off, a LINK stops the function)
+    stack.FRAME_REGISTERS = frozenset({14}) if getattr(game_profile, "LINK_FRAMES", False) else frozenset()
     # (and UNCHANGED_PARTS: "bset #7, D7" writes D7's low byte only)
     dataflow.UNCHANGED_PARTS = getattr(game_profile, "UNCHANGED_PARTS", False)
     # (and NARROW_OUTPUTS: what a function hands back is what its callers read once everything is known)
@@ -129,6 +131,8 @@ def build_functions(program):
     built = {}
     failures = []
     for entry in sorted(program.entries):
+        if entry in functions.SHARED_TAILS:
+            continue    # (each function that reaches it has it as its own blocks)
         try:
             built[entry] = builder.build(entry)
         except lift.Unsupported as problem:
