@@ -3807,7 +3807,8 @@ class FunctionWriter:
             return [self.call_text(statement.target & 0xFFFFFF, statement.return_address)]
         if statement.slot is not None:
             if memory.CODE_FIELDS:
-                # the slot holds a function's number: game_functions[] runs it
+                # the slot holds a function's number: the runtime's call_function runs it from game_functions[],
+                # and refuses a number that is no function's
                 value = statement.address
                 while isinstance(value, ir.Op) and value.name in ("zext", "fits", "trunc"):
                     value = value.args[0]
@@ -3816,7 +3817,7 @@ class FunctionWriter:
                 else:
                     found = self.code_field(id(statement), statement.address)
                 if found:
-                    return [f"game_functions[{self.expr(statement.address)}]();"]
+                    return [f"call_function({self.expr(statement.address)});"]
                 raise SystemExit(f"{self.function.name}: call_code of a value that is not a code field "
                                  f"(memory.CODE_FIELDS)")
             return [f"call_code({self.expr(statement.address)});"]

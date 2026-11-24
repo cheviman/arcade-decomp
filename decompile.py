@@ -581,7 +581,7 @@ IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 TAKEN = {"psw", "psw_read", "psw_write", "psw_update", "load_privileged", "frame_wait", "take_interrupts",
          "frame_end", "swap_tasks", "game_context", "game_context_registers", "game_context_count", "halt", "call_code", "unknown_code", "invalid_jump", "move_string", "move_bits_down", "move_bits_up",
          "search_bits_up", "search_bytes", "divx_pair", "divux_pair", "game_code", "game_code_count", "game_entry", "main",
-         "game_functions", "function_number", "function_address", "address_function", "projection"}
+         "game_functions", "game_function_count", "call_function", "function_number", "function_address", "address_function", "projection"}
 
 
 def needs_return_address(built):
@@ -1299,7 +1299,6 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         for address in table:
             code_lines.append(f"\tFUNCTION_{names[address]},")
         code_lines += ["\tFUNCTION_COUNT    /* (how many numbers there are) */", "};",
-                       "extern void (*const game_functions[])(void);    /* the C function for each number: a slot's handler */",
                        "uint32_t function_number(uint32_t address);     /* the number of the function at a V70 address read",
                        "                                                   out of the program ROM's tables (the projection's) */"]
         for address in table:
@@ -1376,8 +1375,10 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     registry = ("\n".join(memory.table_registry(loaded, 6)) + "\n\n") if loaded else ""
     if memory.CODE_FIELDS:
         # (game_code[] and the projection live in projection.c: the only file with code addresses)
-        code_tables = ("/* the C function for each number: a slot's handler */\n"
-                       "void (*const game_functions[])(void) =\n{\n\tNULL,\n" + "\n".join(func_rows) + "\n};\n\n")
+        code_tables = ("/* the C function for each number: a slot's handler, which the runtime's call_function runs (0,\n"
+                       "   NO_FUNCTION, is none: call_function refuses it, as a number past the table) */\n"
+                       "void (*const game_functions[])(void) =\n{\n\tNULL,\n" + "\n".join(func_rows) + "\n};\n\n"
+                       "const size_t game_function_count = FUNCTION_COUNT;\n\n")
         host_lines = ""
     else:
         code_tables = ("/* the code calls through memory slots and interrupts can reach, by address */\n"
@@ -1407,7 +1408,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                 f"const size_t game_code_count = {len(rows)};", "",
                 "/* the number of the function at a V70 address (its row of game_code, which is in address order, + 1):",
                 "   what the C keeps for an address read out of the program ROM's tables; NO_FUNCTION for an address",
-                "   no code was found at, which game_functions[] does not run */",
+                "   no code was found at, which call_function refuses */",
                 "uint32_t function_number(uint32_t address)",
                 "{",
                 "\tconst uint32_t rows = FUNCTION_COUNT - 1;",
