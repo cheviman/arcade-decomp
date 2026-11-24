@@ -580,7 +580,8 @@ IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 # names the runtime the decompiled code includes already uses (game/support.h, s32/bus.h, v60/arith.h)
 TAKEN = {"psw", "psw_read", "psw_write", "psw_update", "load_privileged", "frame_wait", "take_interrupts",
          "frame_end", "swap_tasks", "game_context", "game_context_registers", "game_context_count", "halt", "call_code", "unknown_code", "invalid_jump", "move_string", "move_bits_down", "move_bits_up",
-         "search_bits_up", "search_bytes", "divx_pair", "divux_pair", "game_code", "game_code_count", "game_entry", "main"}
+         "search_bits_up", "search_bytes", "divx_pair", "divux_pair", "game_code", "game_code_count", "game_entry", "main",
+         "game_functions", "function_number", "function_address", "address_function", "projection"}
 
 
 def needs_return_address(built):
@@ -1022,8 +1023,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     emitter.param_pointers = {entry: set(kinds) for entry, kinds in hints.items()}
     emitter.referenced = referenced_addresses(program)
     table = code_table(program, flow)
-    emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in table
-                              if address >= 0x1000 and address in names}
+    if memory.CODE_FIELDS:
+        # the state holds a function's number (its place in 'table' + 1: an index into game_functions[]), not its
+        # address, which only the projection (world_project, src/projection.c) puts back
+        if memory.HOST is None:
+            raise SystemExit("CODE_FIELDS: the projection that puts the addresses back is HOST's (memory.HOST)")
+        emitter.code_addresses = {address: "FUNCTION_" + names[address] for address in table
+                                  if address >= 0x1000 and address in names}
+    else:
+        emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in table
+                                  if address >= 0x1000 and address in names}
     emitter.flow = flow
     emitter.result_bits = dict(cleanup.RESULT_BITS)
     emitter.split_webs = split_webs
@@ -1283,16 +1292,32 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     # (a function something else replaces is declared twice: as the game calls it and as its original)
     prototypes = grouped_prototypes(files, lambda entry: emitter.prototype(entry) + (
         ";\n" + emitter.definition(entry) if names[entry] in emitter.replaced else ""))
-    addresses = [f"#define {name} 0x{address:06X}u" for address, name in sorted(emitter.code_addresses.items())]
+    if memory.CODE_FIELDS:
+        # (the state holds a function's number: an index into game_functions[], which holds the C function)
+        code_lines = ["/* the number of each function the game's state holds in a slot: an index into game_functions[] */",
+                      "enum game_function", "{", "\tNO_FUNCTION,"]
+        for address in table:
+            code_lines.append(f"\tFUNCTION_{names[address]},")
+        code_lines += ["\tFUNCTION_COUNT    /* (how many numbers there are) */", "};",
+                       "extern void (*const game_functions[])(void);    /* the C function for each number: a slot's handler */",
+                       "uint32_t function_number(uint32_t address);     /* the number of the function at a V70 address read",
+                       "                                                   out of the program ROM's tables (the projection's) */"]
+        for address in table:
+            if emitter.wrapper(address) is not None:
+                code_lines.append(f"void call_{names[address]}(void);")
+        code_section = "\n".join(code_lines)
+    else:
+        addresses = [f"#define {name} 0x{address:06X}u" for address, name in sorted(emitter.code_addresses.items())]
+        code_section = ("/* where the code the program keeps in memory slots (objects' handlers, hooks) is, as the game's own\n"
+                        "   addresses: what it stores and compares, and what call_code() runs */\n"
+                        + "\n".join(addresses))
     (out_dir / "game.h").write_text(
         file_header("game.h", "prototypes of the game's functions and the addresses of the code it keeps in "
                     "memory slots")
         + f"#ifndef {game_profile.GUARD}_GAME_H\n#define {game_profile.GUARD}_GAME_H\n\n"
         + "#include \"game/support.h\"\n#include \"ram.h\"\n\n"
         f"/* registers the whole program shares */\nextern uint32_t {context}\n\n"
-        "/* where the code the program keeps in memory slots (objects' handlers, hooks) is, as the game's own\n"
-        "   addresses: what it stores and compares, and what call_code() runs */\n"
-        + "\n".join(addresses) + "\n\n"
+        + code_section + "\n\n"
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
     labels = [f"#define {name}_ADDRESS 0x{address:06X}u" for address, name in sorted(emitter.data_labels.items())]
     unused = sorted([f"{function} {value:X} {name}" for (function, value), name in emitter.constants.items()
@@ -1331,18 +1356,34 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
 
     wrappers = []
     rows = []
+    func_rows = []
     for address in table:
         wrapper = emitter.wrapper(address)
         if wrapper is None:
             rows.append(f"\t{{ 0x{address:06X}u, {names[address]} }},")
+            func_rows.append(f"\t{names[address]},")
         else:
             wrappers.append(wrapper)
-            rows.append(f"\t{{ 0x{address:06X}u, call_{address:06X} }},")
+            if memory.CODE_FIELDS:
+                rows.append(f"\t{{ 0x{address:06X}u, call_{names[address]} }},")
+                func_rows.append(f"\tcall_{names[address]},")
+            else:
+                rows.append(f"\t{{ 0x{address:06X}u, call_{address:06X} }},")
     if emitter.wrapper(RESET_ADDRESS) is not None:
         raise SystemExit("the reset code takes parameters")
     entry_text = f"/* the code at the reset vector */\nvoid game_entry(void)\n{{\n\t{names[RESET_ADDRESS]}();\n}}\n"
     loaded = named.loaded_tables()
     registry = ("\n".join(memory.table_registry(loaded, 6)) + "\n\n") if loaded else ""
+    if memory.CODE_FIELDS:
+        # (game_code[] and the projection live in projection.c: the only file with code addresses)
+        code_tables = ("/* the C function for each number: a slot's handler */\n"
+                       "void (*const game_functions[])(void) =\n{\n\tNULL,\n" + "\n".join(func_rows) + "\n};\n\n")
+        host_lines = ""
+    else:
+        code_tables = ("/* the code calls through memory slots and interrupts can reach, by address */\n"
+                       "const game_code_entry game_code[] =\n{\n" + "\n".join(rows) + "\n};\n\n"
+                       f"const size_t game_code_count = {len(rows)};\n\n")
+        host_lines = ("\n".join(named.host_projection()) + "\n\n") if memory.HOST else ""
     (out_dir / "table.c").write_text(
         file_header("table.c", "the registers the whole program shares, the code calls through memory "
                     "slots reach (by address), and the reset entry")
@@ -1353,10 +1394,116 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         f"const game_register game_context[] = {{ {context_pointers} }};\n"
         f"const uint8_t game_context_registers[] = {{ {context_numbers} }};\n"
         f"const size_t game_context_count = {len(signatures.CONTEXT)};\n\n" + "\n".join(wrappers) + "\n"
-        "/* the code calls through memory slots and interrupts can reach, by address */\n"
-        "const game_code_entry game_code[] =\n{\n" + "\n".join(rows) + "\n};\n\n"
-        f"const size_t game_code_count = {len(rows)};\n\n" + registry
-        + ("\n".join(named.host_projection()) + "\n\n" if memory.HOST else "") + entry_text, encoding="ascii")
+        + code_tables + registry + host_lines + entry_text, encoding="ascii")
+    if memory.CODE_FIELDS:
+        # (the only file with code addresses: game_code[] for the runtime, and the projection that puts the
+        # state's function numbers back into the work RAM for the state's hash)
+        proj = [file_header("projection.c", "where the game's state is put back into the original's memory for "
+                            "the state's hash: the code addresses the C keeps as function numbers, and the "
+                            "variables kept in the host's memory"),
+                '#include "game.h"', "",
+                "/* the code calls through memory slots and interrupts can reach, by address */",
+                "const game_code_entry game_code[] =\n{\n" + "\n".join(rows) + "\n};", "",
+                f"const size_t game_code_count = {len(rows)};", "",
+                "/* the number of the function at a V70 address (its row of game_code, which is in address order, + 1):",
+                "   what the C keeps for an address read out of the program ROM's tables; NO_FUNCTION for an address",
+                "   no code was found at, which game_functions[] does not run */",
+                "uint32_t function_number(uint32_t address)",
+                "{",
+                "\tconst uint32_t rows = FUNCTION_COUNT - 1;",
+                "\tuint32_t low = 0, high = rows;",
+                "\twhile (low < high)",
+                "\t{",
+                "\t\tconst uint32_t middle = (low + high) / 2;",
+                "\t\tif (game_code[middle].address < address)",
+                "\t\t\tlow = middle + 1;",
+                "\t\telse",
+                "\t\t\thigh = middle;",
+                "\t}",
+                "\tif (low < rows && game_code[low].address == address)",
+                "\t\treturn low + 1;",
+                "\treturn NO_FUNCTION;",
+                "}", "",
+                "/* a function's number as the original's address, for the state's hash; anything else (NO_FUNCTION",
+                "   and what records not in use or other union members hold there) as it is */",
+                "static uint32_t function_address(uint32_t number)",
+                "{",
+                "\tconst uint32_t rows = FUNCTION_COUNT - 1;",
+                "\tif (number != NO_FUNCTION && number <= rows)",
+                "\t\treturn game_code[number - 1].address;",
+                "\treturn number;",
+                "}", "",
+                "/* and back: the address of a function as its number, anything else as it is */",
+                "static uint32_t address_function(uint32_t address)",
+                "{",
+                "\tconst uint32_t number = function_number(address);",
+                "\treturn number != NO_FUNCTION ? number : address;",
+                "}", ""]
+        if memory.HOST:
+            nested = emitter.layouts.nested
+
+            def loop_index(depth):
+                return "index" if depth == 0 else f"index_{depth + 1}"
+
+            def places(struct, target, text, count, loops):
+                """(C expression, enclosing loop bounds) of each place 'struct' holds a 'target' in: an array at
+                any level is a loop of its own."""
+                if count and count > 1:
+                    text, loops = f"{text}[{loop_index(len(loops))}]", loops + [count]
+                if struct == target:
+                    return [(text, loops)]
+                found = []
+                for _offset, (name, inner, inner_count) in sorted(nested.get(struct, {}).items()):
+                    found += places(inner, target, f"{text}.{name}", inner_count, loops)
+                return found
+
+            def conversions(function):
+                """C lines converting each code field of the state's records through 'function'."""
+                lines = []
+                for entry in sorted(memory.CODE_FIELDS):
+                    if "." not in entry:
+                        if entry not in memory.HOST_VARIABLES:
+                            raise SystemExit(f"CODE_FIELDS: no HOST variable {entry}")
+                        continue    # (world_project and world_unproject convert it)
+                    struct, member = entry.split(".", 1)
+                    if member not in emitter.layouts.names.get(struct, {}).values():
+                        raise SystemExit(f"CODE_FIELDS: struct {struct} has no member {member}")
+                    roots = [(block_struct, f"{memory.STATE}->{name}", count)
+                             for _address, name, block_struct, count in memory.STATE_BLOCKS
+                             if block_struct is not None]
+                    roots += [(inner, f"{memory.STATE}->{name}", count)
+                              for _offset, (name, inner, count) in sorted(nested.get(memory.STATE, {}).items())]
+                    seen = set()
+                    for block_struct, text, count in roots:
+                        for place, loops in places(block_struct, struct, text, count, []):
+                            if place in seen:
+                                continue
+                            seen.add(place)
+                            indent = "\t"
+                            for depth, bound in enumerate(loops):
+                                index = loop_index(depth)
+                                lines.append(f"{indent}for (size_t {index} = 0; {index} < 0x{bound:X}; {index}++)")
+                                indent += "\t"
+                            lines.append(f"{indent}{place}.{member} = {function}({place}.{member});")
+                return lines
+
+            proj += named.host_projection()
+            proj.append("")
+            for index, line in enumerate(proj):
+                if line == f"void {memory.HOST}_project(void)":
+                    end = index
+                    while proj[end] != "}":
+                        end += 1
+                    proj[end:end] = conversions("function_address")
+                    break
+            for index, line in enumerate(proj):
+                if line == f"void {memory.HOST}_unproject(void)":
+                    start = index
+                    while proj[start] != "{":
+                        start += 1
+                    proj[start + 1:start + 1] = conversions("address_function")
+                    break
+        (out_dir / "projection.c").write_text("\n".join(proj) + "\n", encoding="ascii")
     branches = sum(isinstance(block.end, ir.Branch) for function in built.values() for block in function.blocks.values())
     gotos = sum(text.count("goto ") for text in texts.values())
     with_gotos = sum(1 for text in texts.values() if "goto " in text)

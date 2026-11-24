@@ -417,6 +417,11 @@ class Printer(cprint.Printer):
                 return cprint.Value(f"({test}) {'==' if node.name == 'eq' else '!='} 0u", cprint.EQUALITY, True, "int")
         if isinstance(node, ir.Const) and node.bits == cpu.current.address_bits and id(node) not in self.writer.numbers():
             if node.value in self.writer.emitter.code_addresses and id(node) not in self.writer.sum_operands():
+                if memory.CODE_FIELDS:
+                    # (only a store into a code field holds a function's number, which the store prints itself:
+                    # memory.CODE_FIELDS)
+                    raise SystemExit(f"{self.writer.function.name}: the code address {node.value:06X} used other "
+                                     f"than stored into a code field (memory.CODE_FIELDS)")
                 # the address of code the program stores in a slot (an object's handler): its name
                 return cprint.Value(self.writer.emitter.code_addresses[node.value], cprint.PRIMARY, True, "u32")
             named = self.writer.emitter.address_text(node.value)
@@ -2995,6 +3000,33 @@ class FunctionWriter:
             lines.append(f"{self.use(('f', flag))} = {source} & 1u;")
         return lines
 
+    def code_field(self, key, address):
+        """True when what is at 'address' (key: the id of the IR node that reaches it) is a code field of
+        memory.CODE_FIELDS: a member of a record (struct object's handler), or a HOST variable."""
+        if not memory.CODE_FIELDS:
+            return False
+        candidates = [address]
+        for candidate in (key, id(address)):
+            field = self.fields.get(candidate)
+            if field is None:
+                continue
+            if field[0] == "global" and len(field) > 1 and getattr(field[1], "bits", None) is not None:
+                candidates.append(field[1])
+            elif isinstance(field[0], str) and field[0] in self.emitter.layouts.names:
+                found = self.emitter.layouts.lookup(field[0], field[1])
+                if found is not None:
+                    member = self.emitter.layouts.names[field[0]].get(found[0])
+                    if member is not None and f"{field[0]}.{member}" in memory.CODE_FIELDS:
+                        return True
+        for candidate in candidates:
+            value = memory.constant_address(candidate)
+            if value is None:
+                continue
+            item = self.emitter.memory.variables.get(value)
+            if item is not None and item.host and item.name in memory.CODE_FIELDS:
+                return True
+        return False
+
     def statement(self, statement):
         self.current = statement
         if isinstance(statement, ir.SetTemp):
@@ -3040,6 +3072,17 @@ class FunctionWriter:
             target = self.memory(statement.address, statement.bits, id(statement))
             address = memory.constant_address(statement.address)
             if target is not None and target[2] and (address is None or not memory.bus_only(address, statement.bits)):
+                if self.code_field(id(statement), statement.address):
+                    # a code field holds a function's number: a constant is its name, anything else its number
+                    constant = statement.value
+                    while isinstance(constant, ir.Op) and constant.name in ("zext", "fits", "trunc"):
+                        constant = constant.args[0]
+                    if isinstance(constant, ir.Const) and constant.value in self.emitter.code_addresses:
+                        return [f"{target[0]} = {self.emitter.code_addresses[constant.value]};"]
+                    text = self.stored(statement.value, statement.bits)
+                    if isinstance(constant, ir.Load) and self.code_field(id(constant), constant.address):
+                        return [f"{target[0]} = {text};"]    # (a code field read: the number it holds)
+                    return [f"{target[0]} = function_number({text});"]
                 if target[0].startswith(("AS", "AT")) or self.family_splits(statement):
                     split = self.split_store(statement)
                     if split is not None:
@@ -3252,7 +3295,13 @@ class FunctionWriter:
         if value < 0x10000 or not value & 0xFFFF or not memory.program_rom(value):
             return None
         named = self.emitter.address_text(value)
-        return named[0] if named is not None else self.emitter.code_addresses.get(value)
+        if named is not None:
+            return named[0]
+        code_name = self.emitter.code_addresses.get(value)
+        if code_name is not None and memory.CODE_FIELDS:
+            raise SystemExit(f"{self.function.name}: the code address {value:06X} used other than stored into a "
+                             f"code field (memory.CODE_FIELDS)")
+        return code_name
 
     def compound(self, lvalue, operation, right):
         """'lvalue op= right;', or ++ and --; adding 0xFFFFFFFA takes 6 away, as the expressions say it."""
@@ -3757,6 +3806,19 @@ class FunctionWriter:
         if statement.target is not None:
             return [self.call_text(statement.target & 0xFFFFFF, statement.return_address)]
         if statement.slot is not None:
+            if memory.CODE_FIELDS:
+                # the slot holds a function's number: game_functions[] runs it
+                value = statement.address
+                while isinstance(value, ir.Op) and value.name in ("zext", "fits", "trunc"):
+                    value = value.args[0]
+                if isinstance(value, ir.Load):
+                    found = self.code_field(id(value), value.address) or self.code_field(id(statement), value.address)
+                else:
+                    found = self.code_field(id(statement), statement.address)
+                if found:
+                    return [f"game_functions[{self.expr(statement.address)}]();"]
+                raise SystemExit(f"{self.function.name}: call_code of a value that is not a code field "
+                                 f"(memory.CODE_FIELDS)")
             return [f"call_code({self.expr(statement.address)});"]
         if not statement.choices:
             raise EmitError(f"{self.function.name}: a computed call with no known targets")
@@ -4085,7 +4147,8 @@ class Emitter:
         self.param_pointers = {}    # entry -> the registers symbols.txt says it takes pointers to a structure in
         self.result_bits = {}       # entry -> bits of the register it returns, where narrower (cleanup.RESULT_BITS)
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
-        self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS
+        self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS (with
+                                    # memory.CODE_FIELDS: FUNCTION_name, its number in the state)
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
                                     # something else puts its own in its place (decompile.py, replaced_functions)
         self.trampolines = {}       # entry -> (function, way in) of a function that only jumps to another
@@ -4511,7 +4574,11 @@ class Emitter:
             return None
         lines = comment_lines(f"How call_code() runs {self.names[entry]} from a slot that holds its address: with 0 "
                               "for what it takes, and what it hands back dropped.")
-        lines += [f"static void call_{entry:06X}(void)", "{"]
+        if memory.CODE_FIELDS:
+            # (the number the state holds names it: game.h declares it, table.c's game_functions[] holds it)
+            lines += [f"void call_{self.names[entry]}(void)", "{"]
+        else:
+            lines += [f"static void call_{entry:06X}(void)", "{"]
         # what it hands back goes into variables named as the function names its result pointers
         if by_pointer:
             lines.append("\tuint32_t " + ", ".join(f"{self.param_name(entry, value)} = 0" for value in by_pointer) + ";")

@@ -96,6 +96,11 @@ HOST = None
 HOST_VARIABLES = frozenset()
 # the generated functions whose body HOST_project and HOST_unproject bracket (they reach memory by its address)
 HOST_SYNCED = frozenset()
+# the state's fields that hold the address of code: "struct.member" for a member of a record (struct object's
+# handler), or the name of a HOST variable; the C keeps a function's number there (enum game_function, an index
+# into game_functions[]) and the generated projection (src/projection.c) puts the address in its place for the
+# state's hash. Empty: off
+CODE_FIELDS = frozenset()
 HARDWARE = [(0x300000, 0x320000, "VIDEO"), (0x400000, 0x420000, "SPRITE_RAM"), (0x500000, 0x500010, "SPRITE_CONTROL"),
             (0x600000, 0x610000, "PALETTE"), (0x610000, 0x620000, "MIXER"), (0x700000, 0x702000, "SOUND"),
             (0xC00000, 0xC00080, "IO"), (0xD00000, 0xD00010, "IRQ"), (0xD80000, 0xD80010, "RANDOM")]
@@ -811,7 +816,13 @@ class Memory:
         for function, to, source in ((f"{HOST}_project", STATE, HOST), (f"{HOST}_unproject", HOST, STATE)):
             lines += [comments[function], f"void {function}(void)", "{"]
             for item in self.host_items():
-                if item.indexed:
+                if item.name in CODE_FIELDS:
+                    # a code field: the C keeps a function's number, the work RAM the address
+                    if to == STATE:
+                        lines.append(f"\t{to}->{item.name} = function_address({source}->{item.name});")
+                    else:
+                        lines.append(f"\t{to}->{item.name} = address_function({source}->{item.name});")
+                elif item.indexed:
                     lines += [f"\tfor (size_t index = 0; index < 0x{item.count:X}; index++)",
                               f"\t\t{to}->{item.name}[index] = {source}->{item.name}[index];"]
                 else:
