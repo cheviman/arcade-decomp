@@ -393,13 +393,64 @@ class Printer(cprint.Printer):
     def constant_name(self, node):
         return self.writer.rom_address_name(node)
 
+    def number_name(self, node):
+        named = self.writer.emitter.constants.get((self.writer.function.name, node.value))
+        if named is not None and "(" in named and id(node) in self.bit_operands():
+            return None     # a macro of the runtime's is a place (a screen's edge), never a mask or a shift
+        if named is not None:
+            self.writer.emitter.constants_used.add((self.writer.function.name, node.value))
+        return named
+
+    def bit_operands(self):
+        """ids of the constants the function masks, combines or shifts with (and, or, xor, shifts)"""
+        found = getattr(self.writer, "_bit_operands", None)
+        if found is None:
+            found = {id(arg) for block in self.writer.function.blocks.values()
+                     for statement in block.statements + [block.end]
+                     for expression in ir.statement_expressions(statement) for node in ir.walk(expression)
+                     if isinstance(node, ir.Op) and node.name in ("and", "or", "xor", "shl", "shr", "sar")
+                     for arg in node.args if isinstance(arg, ir.Const)}
+            self.writer._bit_operands = found
+        return found
+
+    def window(self, node):
+        """An unsigned test of a 16-bit value against a range a window line names (x - a < b, x < b, x >= b
+        and the like: a <= x < a + b or outside it), as the runtime's macro: MACRO(x, ...) or !MACRO(x, ...);
+        None when it is not one."""
+        windows = self.writer.emitter.windows
+        if not windows or node.name not in ("ult", "ule") or node.args[0].bits != 16:
+            return None
+        left, right = node.args
+        inside = isinstance(right, ir.Const) and not isinstance(left, ir.Const)
+        if not inside and not (isinstance(left, ir.Const) and not isinstance(right, ir.Const)):
+            return None
+        value, limit = (left, right) if inside else (right, left)
+        start = 0
+        if isinstance(value, ir.Op) and value.name == "sub" and isinstance(value.args[1], ir.Const) \
+                and not isinstance(value.args[0], ir.Const):
+            value, start = value.args[0], value.args[1].value & 0xFFFF
+        # x < b: b values from a; x <= b: b + 1 of them; b < x: outside b + 1 of them; b <= x: outside b
+        count = (limit.value & 0xFFFF) + ((node.name == "ule") == inside)
+        found = windows.get((self.writer.function.name, start, start + count))
+        if found is None:
+            return None
+        self.writer.emitter.windows_used.add((self.writer.function.name, start, start + count))
+        macro, arguments = found
+        text = f"{macro}({', '.join([self.exact(value).text] + list(arguments))})"
+        return cprint.Value(text if inside else f"!{text}", cprint.PRIMARY if inside else cprint.UNARY, True, "int")
+
     def emit(self, node):
         if isinstance(node, ir.Const):
-            named = self.writer.emitter.constants.get((self.writer.function.name, node.value))
+            named = self.number_name(node)
             if named is not None:
-                # a number the function uses, by its name (symbols.txt constant lines)
-                self.writer.emitter.constants_used.add((self.writer.function.name, node.value))
-                return cprint.Value(named, cprint.PRIMARY, True, "u64" if node.bits == 64 else "u32")
+                # a number the function uses, by its name (symbols.txt constant lines); a macro of the runtime's,
+                # NAME(ARGS), is an int
+                return cprint.Value(named, cprint.PRIMARY, True,
+                                    "int" if "(" in named else "u64" if node.bits == 64 else "u32")
+        if isinstance(node, ir.Op):
+            framed = self.window(node)
+            if framed is not None:
+                return framed
         if isinstance(node, ir.Op) and node.name == "stack_address":
             raise EmitError(f"{self.writer.function.name}: a stack address is used as a value")
         if isinstance(node, ir.EntryPoint):
@@ -3249,6 +3300,8 @@ class Emitter:
         self.referenced = set()     # addresses below 0x10000 the program's instructions name (decompile.py)
         self.constants = {}         # (function name, value) -> its name (symbols.txt constant lines)
         self.constants_used = set()  # the (function name, value) of those the C printed
+        self.windows = {}           # (function name, low, high) -> (macro, arguments) (symbols.txt window lines)
+        self.windows_used = set()   # the (function name, low, high) of those the C printed
         self.writes = {}            # entry -> what a function may write (dataflow summaries)
         self.always = always    # entry -> what a function writes on every path (dataflow summaries)
         self.functions = functions
