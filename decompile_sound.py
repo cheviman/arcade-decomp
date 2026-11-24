@@ -91,6 +91,10 @@ def configure():
     signatures.CONTEXT = ()
     signatures.SCRATCH_CONTEXT = {}
     signatures.CONSTANT = {}
+    # (the game's variables in the host's memory are the main program's: the sound program has none)
+    memory.HOST = None
+    memory.HOST_VARIABLES = frozenset()
+    memory.HOST_SYNCED = frozenset()
 
 
 def build_functions(program):
