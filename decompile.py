@@ -1033,6 +1033,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     emitter.code_labels = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "code"}
     emitter.comments = dict(known.comments)
     emitter.constants = dict(known.constants)
+    emitter.windows = dict(known.windows)
     emitter.replaced = replaced_functions([(ROOT / "runtime" / "replaced.txt", "BOARD_ORIGINAL")])
     entries_by_name = {name: entry for entry, name in names.items()}
     unknown = sorted(function for function, _ in known.params if function not in entries_by_name)
@@ -1294,12 +1295,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         + "\n".join(addresses) + "\n\n"
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
     labels = [f"#define {name}_ADDRESS 0x{address:06X}u" for address, name in sorted(emitter.data_labels.items())]
-    unused = sorted(f"{function} {value:X} {name}" for (function, value), name in emitter.constants.items()
-                    if (function, value) not in emitter.constants_used)
+    unused = sorted([f"{function} {value:X} {name}" for (function, value), name in emitter.constants.items()
+                     if (function, value) not in emitter.constants_used]
+                    + [f"window {function} {low:X} {high:X}" for function, low, high in emitter.windows
+                       if (function, low, high) not in emitter.windows_used])
     if unused:
         raise SystemExit("symbols.txt names numbers the C does not use: " + ", ".join(unused))
+    # (a macro of the runtime's, NAME(ARGS), is the runtime's to define)
     numbers = [f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
-                                                                          in emitter.constants.items()})]
+                                                                          in emitter.constants.items()})
+               if "(" not in name]
     named.drop_unread(texts.values())
     emitter.layouts.drop_unread(texts.values())
     (out_dir / "ram.h").write_text(
