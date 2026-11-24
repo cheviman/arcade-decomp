@@ -823,6 +823,26 @@ def rom_value(program, address, bits):
     return {8: program.mem.r8, 16: program.mem.r16, 32: program.mem.r32}[bits](address)
 
 
+def rom_code_tables(program, named, code_addresses):
+    """{address: (name, [the FUNCTION_ name of each word])} for the program ROM's tables of code
+    (memory.CODE_TABLES): each named table of 'named' (memory.Memory: its .tables) of 32-bit elements with a
+    count whose every word, read with rom_value, is a key of 'code_addresses' (the emitter's, which maps a
+    function's address to its FUNCTION_ name)."""
+    tables = {}
+    for address, item in named.tables.items():
+        if not item.count or item.bits != 32:
+            continue    # (no count: not a table the assets name as one of a fixed size; another width: no code)
+        words = []
+        for index in range(item.count):
+            value = rom_value(program, address + 4 * index, 32)
+            if value not in code_addresses:
+                break
+            words.append(code_addresses[value])
+        else:
+            tables[address] = (item.name, words)
+    return tables
+
+
 def fewer_controls(texts, writers, write_way, notes_of, read=None):
     """A function the structure leaves control variables in, written again with more code copied: a loop
     entered at two places from a larger piece of it (split_loop_entries with SPLIT_COPY), small blocks
@@ -1033,6 +1053,12 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     else:
         emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in table
                                   if address >= 0x1000 and address in names}
+    if memory.CODE_TABLES:
+        # (a table of code holds functions' numbers: nothing of it is ROM data the assets supply)
+        if not memory.CODE_FIELDS:
+            raise SystemExit("CODE_TABLES: a table of code holds functions' numbers (memory.CODE_FIELDS)")
+        named.code_tables = rom_code_tables(program, named, emitter.code_addresses)
+        emitter.code_table_names = frozenset(name for name, _ in named.code_tables.values())
     emitter.flow = flow
     emitter.result_bits = dict(cleanup.RESULT_BITS)
     emitter.split_webs = split_webs
@@ -1301,6 +1327,11 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         code_lines += ["\tFUNCTION_COUNT    /* (how many numbers there are) */", "};",
                        "uint32_t function_number(uint32_t address);     /* the number of the function at a V70 address read",
                        "                                                   out of the program ROM's tables (the projection's) */"]
+        if named.code_tables:
+            code_lines.append("")
+            code_lines.append("/* the program's tables of code: the numbers (enum game_function) of the functions they hold */")
+            for address, (name, words) in sorted(named.code_tables.items()):
+                code_lines.append(f"extern const uint32_t {name}[{len(words)}];")
         for address in table:
             if emitter.wrapper(address) is not None:
                 code_lines.append(f"void call_{names[address]}(void);")
@@ -1329,6 +1360,18 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     numbers = [f"#define {name} 0x{value:X}u" for value, name in sorted({(value, name) for (_, value), name
                                                                           in emitter.constants.items()})
                if "(" not in name]
+    if named.code_tables:
+        # (a table of code read any other way is not its elements' numbers: its name must not be in the C)
+        fields = {entry.rpartition(".")[2] for entry in memory.CODE_FIELDS}
+        for name, _ in named.code_tables.values():
+            for text in texts.values():
+                for line in re.sub(r"/\*.*?\*/", "", text, flags=re.S).splitlines():
+                    if not re.search(rf"\b{re.escape(name)}\b", line):
+                        continue
+                    found = re.fullmatch(r"^\s*(.+?) = " + re.escape(name) + r"\[[^;]*\];$", line)
+                    if found is None or found.group(1).strip().rpartition("->")[2].rpartition(".")[2] not in fields:
+                        raise SystemExit(f"CODE_TABLES: {name} holds functions' numbers, read other than into a "
+                                         f"code field: {line.strip()}")
     named.drop_unread(texts.values())
     emitter.layouts.drop_unread(texts.values())
     (out_dir / "ram.h").write_text(
@@ -1379,6 +1422,13 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                        "   NO_FUNCTION, is none: call_function refuses it, as a number past the table) */\n"
                        "void (*const game_functions[])(void) =\n{\n\tNULL,\n" + "\n".join(func_rows) + "\n};\n\n"
                        "const size_t game_function_count = FUNCTION_COUNT;\n\n")
+        if named.code_tables:
+            code_tables += ("/* the program's tables of code, as the numbers of the functions they hold (enum game_function) */\n")
+            for address, (name, words) in sorted(named.code_tables.items()):
+                code_tables += f"const uint32_t {name}[{len(words)}] =\n{{\n"
+                for word in words:
+                    code_tables += f"\t{word},\n"
+                code_tables += "};\n\n"
         host_lines = ""
     else:
         code_tables = ("/* the code calls through memory slots and interrupts can reach, by address */\n"

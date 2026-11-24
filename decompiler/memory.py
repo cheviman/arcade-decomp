@@ -101,6 +101,10 @@ HOST_SYNCED = frozenset()
 # into game_functions[]) and the generated projection (src/projection.c) puts the address in its place for the
 # state's hash. Empty: off
 CODE_FIELDS = frozenset()
+# the program ROM's tables that hold only code: a named table of 32-bit elements with a count, every word the
+# entry of a function the state's code fields may hold. The C keeps them as arrays of the functions'
+# numbers (enum game_function) in table.c, not as tables the assets supply. Needs CODE_FIELDS. False: off
+CODE_TABLES = False
 HARDWARE = [(0x300000, 0x320000, "VIDEO"), (0x400000, 0x420000, "SPRITE_RAM"), (0x500000, 0x500010, "SPRITE_CONTROL"),
             (0x600000, 0x610000, "PALETTE"), (0x610000, 0x620000, "MIXER"), (0x700000, 0x702000, "SOUND"),
             (0xC00000, 0xC00080, "IO"), (0xD00000, 0xD00010, "IRQ"), (0xD80000, 0xD80010, "RANDOM")]
@@ -383,6 +387,8 @@ class Memory:
                 item.state = True
         if HOST is not None:
             self.mark_host()
+        # address -> (name, words): the program ROM's tables of code (memory.CODE_TABLES), which are no asset
+        self.code_tables = {}
 
     def state_items(self):
         """The work RAM's variables under every name: the program's, the narrower ones over their first
@@ -667,6 +673,8 @@ class Memory:
                             lines += self.declare(overlay, RAM_MACRO, RAM_FUNCTION)
         lines += [""] + NOTES["tables"]
         for address, item in sorted(self.tables.items()):
+            if address in self.code_tables:
+                continue    # (a table of code is C data of function numbers: table.c)
             lines += self.declare(item, ROM_MACRO, ROM_FUNCTION)
         lines += [""] + NOTES["hardware"]
         for address, item in sorted(self.hardware.items()):
@@ -835,7 +843,7 @@ class Memory:
         records."""
         if not LOADED_TABLES:
             return []
-        found = [(address, item.name) for address, item in self.tables.items()]
+        found = [(address, item.name) for address, item in self.tables.items() if address not in self.code_tables]
         found += [(address, name) for address, (name, _) in pointers.RECORD_TABLES.items()]
         return sorted(found)
 

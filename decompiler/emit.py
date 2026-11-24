@@ -3080,6 +3080,10 @@ class FunctionWriter:
                     if isinstance(constant, ir.Const) and constant.value in self.emitter.code_addresses:
                         return [f"{target[0]} = {self.emitter.code_addresses[constant.value]};"]
                     text = self.stored(statement.value, statement.bits)
+                    if isinstance(constant, ir.Load) and self.emitter.code_table_names:
+                        bracket = text.find("[")
+                        if bracket > 0 and text.endswith("]") and text[:bracket] in self.emitter.code_table_names:
+                            return [f"{target[0]} = {text};"]    # (a table of code: it holds the functions' numbers)
                     if isinstance(constant, ir.Load) and self.code_field(id(constant), constant.address):
                         return [f"{target[0]} = {text};"]    # (a code field read: the number it holds)
                     return [f"{target[0]} = function_number({text});"]
@@ -4150,6 +4154,8 @@ class Emitter:
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
         self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS (with
                                     # memory.CODE_FIELDS: FUNCTION_name, its number in the state)
+        self.code_table_names = frozenset()    # the program ROM's tables of code (memory.CODE_TABLES): the C
+                                    # keeps them as arrays of the functions' numbers
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
                                     # something else puts its own in its place (decompile.py, replaced_functions)
         self.trampolines = {}       # entry -> (function, way in) of a function that only jumps to another
