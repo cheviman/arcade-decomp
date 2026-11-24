@@ -6,7 +6,7 @@ Description: the 68000 program split into functions, and each one as a control-f
              decompiler
 Version:     0.1.0
 Created:     29-10-2026
-Modified:    29-10-2026
+Modified:    24-11-2026
 Author:      Sebastian Toyos
 
 Program takes what the static analysis finds (m68000/analysis.py, symbols.txt, no traces) and splits it into
@@ -219,6 +219,16 @@ class Program(recompile.Program):
                         if instruction.flow in (dis.FLOW_JUMP, dis.FLOW_BRANCH) and instruction.target is not None}
             for cases in getattr(self.analysis, "switch_tables", {}).values():
                 branched.update(cases)
+            # and one only the instruction before it runs into (0E6942, a "jsr" in the middle of the code that leads
+            # there), unless the program's tables or computed jumps reach it, or it is the rest of a frame builder
+            # (FRAME_BUILDERS: each call of the builder calls it)
+            reached = set(self.analysis.computed_targets) | set(self.handlers)
+            reached.update(rest for *_, rest in FRAME_BUILDERS.values())
+            for table in list(self.analysis.code_tables.values()) + list(self.analysis.field_tables.values()):
+                reached.update(table)
+            run_into = {key(address + instruction.length) for address, instruction in instructions.items()
+                        if instruction.flow in (dis.FLOW_NORMAL, dis.FLOW_BRANCH, dis.FLOW_CALL)}
+            branched |= run_into - reached
             entries = {address for address in entries if address in called or address not in branched}
             named = {address for address in named if address in called or address not in branched}
         entries.update(named)
@@ -239,7 +249,8 @@ class Program(recompile.Program):
         self.split_shared_code()
         self.names = self.choose_names()
         self.unreached = {address for address, symbol in symbols.items()
-                          if symbol.kind == "func" and symbol.name.startswith("unreached_") and address in self.entries}
+                          if symbol.kind in ("func", "code") and symbol.name.startswith("unreached_")
+                          and address in self.entries}
         self.second_entries = {}
         self.inner_entries = {}
 
@@ -424,6 +435,12 @@ class Builder:
                 leaders.add(following)
             if instruction.mnemonic in ("divu", "divs", "chk", "trap", "trapv") or address == FRAME_WAIT:
                 leaders.add(following)    # (the exception's call goes on there)
+        order = sorted(body)
+        for here, there in zip(order, order[1:]):
+            if here + body[here].length > there:
+                # an instruction that overlaps the next (a jump into another's operand: 0E693E's "ori.b #$12, D4" is
+                # the word of 0E693C's "pea $4.w" and 0E6940's "move.l (A2), -(A7)"): where it goes on starts a block
+                leaders.add(key(here + body[here].length))
         return leaders & set(body)
 
     def lost_stack(self, instruction, body):

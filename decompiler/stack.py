@@ -103,7 +103,13 @@ def analyse(function):
     if MEMORY_SP not in cpu.current.registers:
         return slots(function)
     if ADDRESSES_IN_MEMORY:
-        found = slots(function)
+        before = copy.deepcopy(function.blocks)
+        try:
+            found = slots(function)
+        except StackError:
+            # (SP the slots cannot follow: the whole stack in memory, from the start)
+            function.blocks = before
+            return whole(function)
         function.memory_frame = addresses_left(function)
         return found
     saved = copy.deepcopy(function.blocks)
@@ -418,6 +424,281 @@ def to_memory(function):
         first.statements.insert(0, down)
     function.memory_frame = False
     function.memory_stack = True
+
+
+def whole(function):
+    """A function whose SP slots() cannot follow (bytes pushed in a loop and popped in another, a buffer of a size it
+    computes, ways that meet with calls' arguments not yet popped) keeps its whole stack in memory from its start, as the
+    68000 does: SP is MEMORY_SP, and every push, pop and (n,SP) access reads or writes the console's memory there. What
+    its slots would have given the data flow is found where SP is known (followed from the start where every way that
+    reaches a place agrees, and counted back from each way out, where SP stands where it did at the start):
+      - the arguments it reads (function.stack_arguments, (offset, bytes) from SP at the start): decompiler/stackargs.py
+        lowers MEMORY_SP past them as the function starts and stores their registers there, sets its callees' from
+        what it pushed, and puts MEMORY_SP back before every way out;
+      - a register it saves as it starts and puts back from the same place on every way out (movem, LINK's A6) keeps
+        that place as a slot, which preserved.py drops as in any other function.
+    Requires STACK_ARGUMENTS (the arguments' registers). A StackError where the code sets SP to something else than SP
+    plus a value or a frame (FRAME_REGISTERS), or where SP is known and differs from what the ways out need."""
+    if not STACK_ARGUMENTS:
+        raise StackError(f"{function.name}: SP that slots cannot follow, and no stack arguments")
+    states = positions(function)
+    saved = saved_places(function, states)
+    arguments = set()
+    for label, block in function.blocks.items():
+        for statement, (sp, frames, temps) in zip(block.statements + [block.end], states.get(label, ())):
+            for address, size in accesses(statement):
+                offset = offset_of(address, sp, temps, frames)
+                if offset is None or offset + size <= 0:
+                    continue
+                if offset < cpu.current.return_address_bytes:
+                    raise StackError(f"{function.name}: reads its return address")
+                arguments.add((offset, size))
+
+    def register(node):
+        if isinstance(node, ir.Reg) and node.index == cpu.current.sp:
+            return ir.Reg(MEMORY_SP, node.bits)
+        return None
+    for label, block in function.blocks.items():
+        known = states.get(label) or [(None, {}, {})] * (len(block.statements) + 1)
+        statements = []
+        for statement, (sp, frames, temps) in zip(block.statements + [block.end], known):
+            def slot(node):
+                if isinstance(node, ir.Load):
+                    offset = offset_of(node.address, sp, temps, frames)
+                    if offset is not None and all(byte in saved for byte in range(offset, offset + node.bits // 8)):
+                        return ir.Stack(offset, node.bits)
+                return None
+            if isinstance(statement, ir.Store):
+                offset = offset_of(statement.address, sp, temps, frames)
+                if offset is not None and all(byte in saved for byte in range(offset, offset + statement.bits // 8)):
+                    stored = ir.SetStack(offset, ir.rebuild(ir.rebuild(statement.value, slot), register),
+                                         statement.bits)
+                    if hasattr(statement, "origin"):
+                        stored.origin = statement.origin
+                    statements.append(stored)
+                    continue
+            if isinstance(statement, ir.Call):
+                statement.memory_sp = sp    # (where SP stands at the call, if known: an argument a slot holds)
+            ir.map_statement(statement, slot)
+            if isinstance(statement, ir.SetReg) and statement.index == cpu.current.sp:
+                moved = ir.SetReg(MEMORY_SP, statement.value)
+                if hasattr(statement, "origin"):
+                    moved.origin = statement.origin
+                statement = moved
+            ir.map_statement(statement, register)
+            if statement is not block.end:
+                statements.append(statement)
+        block.statements = statements
+        if isinstance(block.end, ir.TailCall):
+            block.end.sp = 0    # (where SP stands as it jumps: the callee's arguments are the function's own places)
+    function.exits_caller = False
+    function.memory_frame = False
+    function.memory_stack = True
+    function.memory_whole = True
+    function.stack_arguments = sorted(arguments)
+    function.saved_places = saved
+    return {label: found[0][0] for label, found in states.items()}
+
+
+def accesses(statement):
+    """(address, bytes) of every memory access in 'statement'"""
+    found = [(statement.address, statement.bits // 8)] if isinstance(statement, ir.Store) else []
+    for expression in ir.statement_expressions(statement):
+        found += [(node.address, node.bits // 8) for node in ir.walk(expression) if isinstance(node, ir.Load)]
+    return found
+
+
+def stack_derived(expression, derived, frames):
+    """Whether 'expression' is SP, a frame register or a temporary that holds one, plus or minus something"""
+    return any(isinstance(node, ir.Reg) and (node.index == cpu.current.sp or node.index in frames)
+               or isinstance(node, ir.Temp) and node.name in derived for node in ir.walk(expression))
+
+
+def walk(function, block, sp, frames):
+    """[(SP's offset or None, the frame registers' offsets, the temporaries' that hold a stack address)] before each
+    statement of 'block' and at its end, from SP and the frames at its start: SP set from SP plus a value the code
+    computes is None from there, set from anything but SP or a frame a StackError"""
+    frames = dict(frames)
+    temps = {}
+    derived = set()
+    found = []
+    for statement in block.statements:
+        found.append((sp, dict(frames), dict(temps)))
+        if isinstance(statement, ir.SetTemp):
+            name = statement.temp.name
+            offset = offset_of(statement.value, sp, temps, frames)
+            if offset is None:
+                temps.pop(name, None)
+            else:
+                temps[name] = offset
+            if stack_derived(statement.value, derived, frames):
+                derived.add(name)
+            else:
+                derived.discard(name)
+        elif isinstance(statement, ir.SetReg) and statement.index in FRAME_REGISTERS:
+            offset = offset_of(statement.value, sp, temps, frames)
+            if offset is None:
+                frames.pop(statement.index, None)
+            else:
+                frames[statement.index] = offset
+        elif isinstance(statement, ir.SetReg) and statement.index == cpu.current.sp:
+            if not stack_derived(statement.value, derived, frames):
+                raise StackError(f"{function.name}: SP set to {statement.value}")
+            sp = offset_of(statement.value, sp, temps, frames)
+    found.append((sp, frames, temps))
+    return found
+
+
+def counted_back(block):
+    """SP's offset before each statement of a block that leaves the function (a return, a jump to another function) and at
+    its end, counted back from the end, where SP stands where it did at the start, to the last statement that sets SP
+    from something else than SP plus a constant; None before that"""
+    sp, temps, run = 0, {}, 0
+    found = []
+    for statement in block.statements:
+        found.append((run, sp))
+        if isinstance(statement, ir.SetTemp):
+            offset = offset_of(statement.value, sp, temps)
+            if offset is None:
+                temps.pop(statement.temp.name, None)
+            else:
+                temps[statement.temp.name] = offset
+        elif isinstance(statement, ir.SetReg) and statement.index == cpu.current.sp:
+            new = offset_of(statement.value, sp, temps)
+            if new is None:
+                run, sp, temps = run + 1, 0, {}    # (a new run, relative to what SP was set to)
+            else:
+                sp = new
+    found.append((run, sp))
+    return [offset - sp if where == run else None for where, offset in found]
+
+
+def positions(function):
+    """{label: [(SP's offset or None, the frame registers' offsets, the temporaries' offsets)] before each statement and at
+    the end}: where every way that reaches a block agrees, followed from the start; else, in a block that leaves the
+    function, counted back from its end"""
+    start = {function.entry: (0, {})}
+    pending = [function.entry]
+    while pending:
+        label = pending.pop()
+        sp, frames, _ = walk(function, function.blocks[label], *start[label])[-1]
+        for successor in function.blocks[label].successors():
+            if successor not in function.blocks:
+                continue
+            old = start.get(successor)
+            new = (sp, dict(frames)) if old is None else (
+                old[0] if old[0] == sp else None, {index: offset for index, offset in old[1].items()
+                                                   if frames.get(index) == offset})
+            if new != old:
+                start[successor] = new
+                pending.append(successor)
+    found = {}
+    for label, (sp, frames) in start.items():
+        block = function.blocks[label]
+        forward = walk(function, block, sp, frames)
+        leaves = isinstance(block.end, (ir.Return, ir.TailCall))
+        if leaves and forward[-1][0] is not None and forward[-1][0] != 0:
+            raise StackError(f"{function.name}: returns with SP {forward[-1][0]:+d} from where it started")
+        back = counted_back(block) if leaves else [None] * len(forward)
+        temps = {}
+        states = []
+        for index, (ahead, frames, _) in enumerate(forward):
+            sp = ahead if ahead is not None else back[index]
+            if ahead is not None and back[index] is not None and ahead != back[index]:
+                raise StackError(f"{function.name}: SP {ahead} and {back[index]} at {label}")
+            states.append((sp, frames, dict(temps)))
+            if index < len(block.statements) and isinstance(block.statements[index], ir.SetTemp):
+                statement = block.statements[index]
+                offset = offset_of(statement.value, sp, temps, frames)
+                if offset is None:
+                    temps.pop(statement.temp.name, None)
+                else:
+                    temps[statement.temp.name] = offset
+        found[label] = states
+    return found
+
+
+def saved_places(function, states):
+    """The bytes of the stack (offsets from SP at the start) where the function saves a register as it starts, from
+    which every way out puts it back, and which nothing else reads or writes where SP is known"""
+    predecessors = {}
+    for label, block in function.blocks.items():
+        for successor in block.successors():
+            predecessors.setdefault(successor, []).append(label)
+    prologue = [function.entry]
+    while isinstance(function.blocks[prologue[-1]].end, ir.Goto):
+        following = function.blocks[prologue[-1]].end.target
+        if following in prologue or following not in states or predecessors.get(following) != [prologue[-1]]:
+            break
+        prologue.append(following)
+
+    def place(address, size, sp, frames, temps):
+        offset = offset_of(address, sp, temps, frames)
+        return None if offset is None or offset >= 0 else frozenset(range(offset, offset + size))
+
+    saves = {}           # {register: bytes}
+    written = set()
+    values = {}          # what the prologue's temporaries hold
+    done = False
+    for label in prologue:
+        if done or label not in states:
+            break
+        for statement, (sp, frames, temps) in zip(function.blocks[label].statements, states[label]):
+            if isinstance(statement, ir.Call):
+                done = True
+                break
+            if isinstance(statement, ir.SetTemp):
+                values[statement.temp.name] = ir.rebuild(statement.value, lambda node: values.get(node.name)
+                                                         if isinstance(node, ir.Temp) else None)
+            elif isinstance(statement, ir.Store):
+                value = ir.rebuild(statement.value, lambda node: values.get(node.name)
+                                   if isinstance(node, ir.Temp) else None)
+                registers = {node.index for node in ir.walk(value) if isinstance(node, ir.Reg)}
+                bytes_ = place(statement.address, statement.bits // 8, sp, frames, temps)
+                if bytes_ and len(registers) == 1 and not any(isinstance(node, (ir.Load, ir.Temp))
+                                                              for node in ir.walk(value)):
+                    register = registers.pop()
+                    if register not in written and register != cpu.current.sp:
+                        saves[register] = saves.get(register, frozenset()) | bytes_
+            elif isinstance(statement, ir.SetReg):
+                written.add(statement.index)
+    exits = [label for label, block in function.blocks.items()
+             if isinstance(block.end, (ir.Return, ir.TailCall)) and label in states]
+    restored = []
+    for label in exits:
+        found = {}
+        loads = {}       # {temporary: bytes of the stack it read}
+        for statement, (sp, frames, temps) in zip(function.blocks[label].statements, states[label]):
+            read = set()
+            for expression in ir.statement_expressions(statement):
+                for node in ir.walk(expression):
+                    if isinstance(node, ir.Load):
+                        bytes_ = place(node.address, node.bits // 8, sp, frames, temps)
+                        read.add(bytes_)
+                    elif isinstance(node, ir.Temp) and node.name in loads:
+                        read.add(loads[node.name])
+            if isinstance(statement, ir.SetTemp):
+                if len(read) == 1:
+                    loads[statement.temp.name] = next(iter(read))
+            elif isinstance(statement, ir.SetReg):
+                if len(read) == 1 and None not in read:
+                    found[statement.index] = next(iter(read))
+                else:
+                    found.pop(statement.index, None)
+        restored.append(found)
+    places = {register: bytes_ for register, bytes_ in saves.items()
+              if exits and all(found.get(register) == bytes_ for found in restored)}
+    # (and nothing else where SP is known reads or writes them)
+    claimed = set().union(*places.values()) if places else set()
+    for label, block in function.blocks.items():
+        for statement, (sp, frames, temps) in zip(block.statements + [block.end], states.get(label, ())):
+            for address, size in accesses(statement):
+                bytes_ = place(address, size, sp, frames, temps)
+                if bytes_ and bytes_ & claimed and not any(bytes_ <= kept for kept in places.values()):
+                    for register in [register for register, kept in places.items() if kept & bytes_]:
+                        del places[register]
+                    claimed = set().union(*places.values()) if places else set()
+    return set().union(*places.values()) if places else set()
 
 
 def addresses_left(function):

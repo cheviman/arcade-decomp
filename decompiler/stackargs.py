@@ -103,6 +103,8 @@ def accesses_of(function):
             if isinstance(statement, ir.SetStack) and statement.offset >= start:
                 found.add((statement.offset, statement.bits // 8))
             ir.map_statement(statement, look)
+    # (a function whose whole stack is in memory reads them there: stack.whole() found where)
+    found.update(getattr(function, "stack_arguments", ()))
     return found
 
 
@@ -132,6 +134,10 @@ def extract(source, offset, size, first, last):
     value = source
     if shift:
         value = ir.op("shr", (value, ir.Const(shift, 8)), value.bits)
+    if last - first == 3:
+        # (three bytes, the rest of a long a byte is stored into: 0F4764 "move.b (A0)+, ($3,A7)"; no C type that wide,
+        # so the long's bits, masked)
+        return ir.op("and", (value, ir.const(0xFFFFFF)), value.bits)
     return ir.trunc(value, (last - first) * 8)
 
 
@@ -377,7 +383,67 @@ class Model:
                     found |= {first for first, _ in regions}
         return found
 
+    def in_memory(self, function):
+        """A function whose whole stack is in memory (stack.whole()): it lowers MEMORY_SP past its arguments as it starts
+        and stores their registers there, where its code reads them; before each call it sets the registers of what the
+        callees read from what it pushed (a callee's +4 is SP at the call: no return address is pushed), before a jump to
+        another function from its own places (SP stands where it started), and it puts MEMORY_SP back before every way
+        out. An argument pushed where a register's save is a slot (stack.saved_places) comes from that slot."""
+        sp = ir.Reg(stack.MEMORY_SP, 32)
+        regions = self.layouts.get(function.entry, [])
+        size = (max([offset + bytes_ for offset, bytes_ in regions], default=0) + 3) & ~3
+        saved = getattr(function, "saved_places", set())
+
+        def place(offset):
+            return ir.op("add", (sp, ir.const(offset & 0xFFFFFFFF)), 32)
+
+        def given(call, block, upto):
+            known = 0 if isinstance(call, ir.TailCall) else getattr(call, "memory_sp", None)
+            wanted = {}
+            for target in self.targets(call):
+                for offset, bytes_ in self.layouts[self.key(target)]:
+                    wanted[offset] = max(bytes_, wanted.get(offset, 0))
+            setup = []
+            for offset, bytes_ in sorted(wanted.items()):
+                start = offset if isinstance(call, ir.TailCall) else offset - self.start
+                value = None
+                if known is not None and all(byte in saved for byte in range(known + start, known + start + bytes_)):
+                    value = self.pushed(function, known + start, known + start + bytes_, block, upto)
+                if value is None:
+                    value = ir.Load(place(start), bytes_ * 8)
+                statement = ir.SetReg(register_for(offset), ir.zext(value, 32))
+                statement.origin = getattr(call, "origin", None)
+                setup.append(statement)
+            if setup:
+                self.calls += 1
+            return setup
+
+        for block in function.blocks.values():
+            statements = []
+            for index, statement in enumerate(block.statements):
+                if isinstance(statement, ir.Call):
+                    statements += given(statement, block, index)
+                statements.append(statement)
+            if isinstance(block.end, ir.TailCall):
+                statements += given(block.end, block, len(block.statements))
+            if isinstance(block.end, (ir.Return, ir.TailCall)) and size:
+                back = ir.SetReg(stack.MEMORY_SP, ir.op("add", (sp, ir.const(size)), 32))
+                back.origin = getattr(block.end, "origin", None)
+                statements.append(back)
+            block.statements = statements
+        if size:
+            first = function.blocks[function.entry]
+            down = ir.SetReg(stack.MEMORY_SP, ir.op("sub", (sp, ir.const(size)), 32))
+            down.origin = getattr(first.statements[0] if first.statements else first.end, "origin", None)
+            copy_in = [ir.Store(place(offset), ir.trunc(ir.Reg(register_for(offset), 32), bytes_ * 8), bytes_ * 8)
+                       for offset, bytes_ in regions]
+            for statement in copy_in:
+                statement.origin = down.origin
+            self.prepend(function, first, [down] + copy_in)
+
     def rewrite(self, function):
+        if getattr(function, "memory_whole", False):
+            return self.in_memory(function)
         # the calls first: their setups read the function's own arguments for a tail call
         for block in function.blocks.values():
             self.setups(function, block)
@@ -467,7 +533,7 @@ def apply(functions):
         try:
             # (first: a call's setup reads what was pushed, at one extent per slot; a frame that goes to memory keeps
             # each access at its own width, as the bytes there are one: stack.to_memory)
-            if not getattr(function, "memory_frame", False):
+            if not getattr(function, "memory_frame", False) and not getattr(function, "memory_whole", False):
                 widen(function)
             model.rewrite(function)
         except ArgumentError as problem:

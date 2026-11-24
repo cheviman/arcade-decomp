@@ -32,6 +32,7 @@ The functions the board puts its own in place of (runtime/replaced.txt, a name a
 sums chips the game does not have) are written as BOARD_ORIGINAL(name), and declared both ways in game.h; a port's
 console build's (console/replaced.txt, where a port has one) as CONSOLE_ORIGINAL(name), the same way.
 """
+import copy
 import dataclasses
 import re
 import sys
@@ -189,6 +190,8 @@ def declared_results(program, open_entries):
 
 def analyse(program, built):
     """Stack slots, preserved registers and the data flow summaries, in place"""
+    for entry in left_out(program, built):
+        del built[entry]
     for function in built.values():
         stack.analyse(function)
     if stack.STACK_ARGUMENTS:
@@ -293,8 +296,37 @@ def carry(program, built, flow, found):
                                             for number, key in sorted(used.items())}
 
 
+def left_out(program, built):
+    """The code nothing runs (symbols.txt's unreached_) whose stack no function of its own can have, which no function
+    calls or jumps to: Sonic Spinball's 0D54C8, the end of 0D527A past the jump that closes its loop, puts back the
+    registers 0D527A saved and returns with SP 20 bytes above where it started. Left out of the C (only these: the
+    other unreached code is written as before)."""
+    found = []
+    for entry in sorted(getattr(program, "unreached", ())):
+        if entry not in built:
+            continue
+        try:
+            stack.analyse(copy.deepcopy(built[entry]))
+            continue
+        except stack.StackError:
+            pass
+        for function in built.values():
+            for block in function.blocks.values():
+                for statement in block.statements + [block.end]:
+                    targets = ([statement.target] if statement.target is not None else list(statement.choices)) \
+                        if isinstance(statement, ir.Call) else [statement.target] if isinstance(statement, ir.TailCall) else []
+                    if any(target is not None and target & 0xFFFFFF == entry for target in targets):
+                        raise SystemExit(f"{entry:06X}: unreached code whose stack cannot be followed, and "
+                                         f"{function.entry:06X} goes there")
+        found.append(entry)
+    return found
+
+
 def check(program):
     built, failures = build_functions(program)
+    for entry in left_out(program, built):
+        print(f"left out:   {entry:06X} (unreached code whose stack is no function's)")
+        del built[entry]
     for entry, function in built.items():
         try:
             stack.analyse(function)
