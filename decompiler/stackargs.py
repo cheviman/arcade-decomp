@@ -3,7 +3,7 @@ Name:        stackargs.py
 Description: the arguments a caller pushes on the stack and its callee reads there, as the registers they are to the data flow
 Version:     0.1.0
 Created:     23-11-2026
-Modified:    23-11-2026
+Modified:    24-11-2026
 Author:      Sebastian Toyos
 
 The 68000's C compilers pass arguments on the stack: the caller pushes them (move.l D0,-(A7), pea n.w), calls, and
@@ -21,7 +21,10 @@ is a part of it). Then:
     register in turn) or writes the slot starts by copying each register into the slot, and reads that;
   - before each call the caller sets the registers of what its callees read, from the slots it pushed (what a callee at
     +4 reads is what the caller stored at its SP; a tail call is the caller's own +n);
-  - the two 16-bit stores the 68000's lift makes of a pushed long are one 32-bit slot, so that a slot has one width.
+  - the two 16-bit stores the 68000's lift makes of a pushed long are one 32-bit slot, so that a slot has one width;
+  - a slot of the function's own stack it uses at two extents that overlap (a long stored and its high word read back,
+    a word whose high byte "bset" changes, the arguments' area pushed again at another width) is one slot of the whole
+    extent, of which a narrower access reads or stores its part (widen()).
 
 Signatures and calls then see ordinary register parameters. Off by default (stack.STACK_ARGUMENTS, the profile's
 STACK_ARGUMENTS): the games that pass nothing on the stack keep their C the same.
@@ -156,6 +159,68 @@ def compose(pieces, first, last):
             part = ir.op("shl", (part, ir.Const(shift, 8)), bits)
         result = part if result is None else ir.op("or", (result, part), bits)
     return result
+
+
+def widen(function):
+    """The slots of the function's own stack it reads or stores at extents that overlap, as one slot each of the
+    whole extent: a narrower read is its part of that slot (extract()), a narrower store puts its part into it and
+    keeps the rest (compose()), as the bytes in memory do. A joined extent wider than a long is an ArgumentError."""
+    accesses = set()
+
+    def look(node):
+        if isinstance(node, ir.Stack) and node.offset < 0:
+            accesses.add((node.offset, node.offset + node.bits // 8))
+        return None
+    for block in function.blocks.values():
+        for statement in block.statements + [block.end]:
+            if isinstance(statement, ir.SetStack) and statement.offset < 0:
+                accesses.add((statement.offset, statement.offset + statement.bits // 8))
+            ir.map_statement(statement, look)
+    groups = []
+    for first, last in sorted(accesses):
+        if groups and first < groups[-1][1]:
+            groups[-1][1] = max(groups[-1][1], last)
+            groups[-1][2].append((first, last))
+        else:
+            groups.append([first, last, [(first, last)]])
+    whole = {}
+    for first, last, members in groups:
+        if len(members) == 1:
+            continue
+        if last - first not in (2, 4):
+            raise ArgumentError(f"{function.name}: stack slots {sorted(members)} overlap over {last - first} bytes")
+        for member in members:
+            if member != (first, last):
+                whole[member] = (first, last)
+    if not whole:
+        return
+
+    def change(node):
+        if isinstance(node, ir.Stack) and (node.offset, node.offset + node.bits // 8) in whole:
+            first, last = whole[(node.offset, node.offset + node.bits // 8)]
+            return extract(ir.Stack(first, (last - first) * 8), first, last - first,
+                           node.offset, node.offset + node.bits // 8)
+        return None
+    for block in function.blocks.values():
+        for index, statement in enumerate(block.statements):
+            part = None
+            if isinstance(statement, ir.SetStack):
+                part = (statement.offset, statement.offset + statement.bits // 8)
+            if part not in whole:
+                ir.map_statement(statement, change)
+                continue
+            first, last = whole[part]
+            old = ir.Stack(first, (last - first) * 8)
+            pieces = [(part[0], part[1] - part[0], ir.rebuild(statement.value, change))]
+            if first < part[0]:
+                pieces.append((first, part[0] - first, extract(old, first, last - first, first, part[0])))
+            if part[1] < last:
+                pieces.append((part[1], last - part[1], extract(old, first, last - first, part[1], last)))
+            joined_store = ir.SetStack(first, compose(pieces, first, last), (last - first) * 8)
+            if hasattr(statement, "origin"):
+                joined_store.origin = statement.origin
+            block.statements[index] = joined_store
+        ir.map_statement(block.end, change)
 
 
 class Model:
@@ -303,6 +368,13 @@ class Model:
                                 found |= covering(node.offset, node.bits // 8)
                 if isinstance(statement, ir.Call):
                     called = True
+                # (a function whose frame goes to memory and that takes an argument's address reads them through it:
+                # all of them are in its frame, stack.to_memory)
+                if getattr(function, "memory_frame", False) and any(
+                        isinstance(node, ir.Op) and node.name == "stack_address"
+                        and node.args[0].value < 0x80000000 and node.args[0].value >= self.start
+                        for expression in ir.statement_expressions(statement) for node in ir.walk(expression)):
+                    found |= {first for first, _ in regions}
         return found
 
     def rewrite(self, function):
@@ -393,6 +465,10 @@ def apply(functions):
     layouts = model.solve()
     for entry, function in functions.items():
         try:
+            # (first: a call's setup reads what was pushed, at one extent per slot; a frame that goes to memory keeps
+            # each access at its own width, as the bytes there are one: stack.to_memory)
+            if not getattr(function, "memory_frame", False):
+                widen(function)
             model.rewrite(function)
         except ArgumentError as problem:
             model.problems[entry] = str(problem)

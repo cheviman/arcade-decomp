@@ -3,7 +3,7 @@ Name:        stack.py
 Description: follows the V60 stack pointer through each function and turns stack memory into slots
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    20-10-2026
+Modified:    24-11-2026
 Author:      Sebastian Toyos
 
 The game passes nothing on the stack: it saves registers there (PUSH, PUSHM) and the V60 keeps return
@@ -25,7 +25,8 @@ NEW_STACK = -0x100000    # slot offsets after code sets SP itself: far from anyt
 # may meet there (The Simpsons' Z80, whose failed self test loops back to its LD SP); off by default, where such
 # ways are an error (decompile_sound.py sets it from the profile's SOUND_STACK_RESTARTS)
 RESTARTS = False
-MEMORY_SP = 32           # the register SP becomes in a function whose stack stays in memory (V60 only)
+MEMORY_SP = 32           # the register SP becomes in a function whose stack stays in memory (the V60; the 68000's
+                         # to_memory())
 # the registers a frame may go through (the 68000's LINK An: An = SP, the frame's places An+n, UNLK gives SP back):
 # one set to a stack address is followed as that offset, its loads and stores are slots; empty (the V60, the Z80,
 # Konami's) such a register is not followed (m68000/decompile.py sets it from the profile's LINK_FRAMES)
@@ -33,6 +34,11 @@ FRAME_REGISTERS = frozenset()
 # the stack's temporaries are followed where memory is read and written too, not only where a stack address is
 # computed (the 68000's pushes and "($n,A7)" reads go through one); off, as before (decompiler/stackargs.py)
 STACK_ARGUMENTS = False
+# a function whose stack addresses serve as values (a buffer's address handed to a callee or walked with an address
+# register: the marker the C writer refuses) keeps its slots for the data flow and is marked memory_frame, for
+# to_memory() to put its frame in memory once the slots have served (m68000/decompile.py sets it from the profile's
+# MEMORY_STACK; off, as before)
+ADDRESSES_IN_MEMORY = False
 LEFT_CALLER = 33         # a register the V60 does not have: set when the function just called returned for
                          # its caller too (link_caller_exits)
 
@@ -96,6 +102,10 @@ def analyse(function):
     all that does it)."""
     if MEMORY_SP not in cpu.current.registers:
         return slots(function)
+    if ADDRESSES_IN_MEMORY:
+        found = slots(function)
+        function.memory_frame = addresses_left(function)
+        return found
     saved = copy.deepcopy(function.blocks)
     try:
         found = slots(function)
@@ -123,6 +133,7 @@ def analyse(function):
 def slots(function):
     """The stack as slots: see analyse()."""
     function.exits_caller = False
+    function.deepest = 0    # (the lowest SP the function's own stack reaches: to_memory())
     stacks = 0
     restarts = {label for label, block in function.blocks.items() if sets_sp_first(block)} if RESTARTS else set()
     start = {function.entry: 0}
@@ -139,6 +150,9 @@ def slots(function):
         sp = start[label]
         frames = dict(start_frames[label])
         statements = []
+        # the frame registers where each statement reads them: a read before the register became a frame (LINK's
+        # push of the caller's A6) is the register's value, not the frame's address
+        frames_at = []
         temps = {}
         known = temps if STACK_ARGUMENTS else None    # (the temporaries the 68000's lift reaches memory through)
         for statement in block.statements:
@@ -155,6 +169,7 @@ def slots(function):
                     continue
                 ir.map_statement(statement, slot_reader(sp, frames, known))
                 statements.append(statement)
+                frames_at.append(dict(frames))
                 frames.pop(statement.index, None)
                 continue
             if isinstance(statement, ir.SetReg) and statement.index == cpu.current.sp:
@@ -164,6 +179,8 @@ def slots(function):
                         raise StackError(f"{function.name}: SP set to {statement.value}")
                     stacks += 1    # the code's own stack: a fresh range of slots
                     new = NEW_STACK * stacks
+                elif new > NEW_STACK // 2:
+                    function.deepest = min(function.deepest, new)
                 sp = new
                 continue
             if isinstance(statement, ir.Effect) and statement.name == "return_from_interrupt":
@@ -172,6 +189,7 @@ def slots(function):
                 if not isinstance(frame, ir.Const):
                     raise StackError(f"{function.name}: RETIS with a computed frame")
                 statements.append(ir.Effect("write_psw", (ir.Stack(sp + 4),)))
+                frames_at.append(dict(frames))
                 sp += 8 + frame.value
                 continue
             if isinstance(statement, ir.Store):
@@ -182,25 +200,29 @@ def slots(function):
                     if hasattr(statement, "origin"):
                         slot.origin = statement.origin    # the instruction that stores it ("local" lines)
                     statements.append(slot)
+                    frames_at.append(dict(frames))
                     continue
             if STACK_ARGUMENTS and isinstance(statement, ir.Call):
                 statement.sp = sp    # where the stack stood at the call: its arguments are the slots from here up
             ir.map_statement(statement, slot_reader(sp, frames, known))
             statements.append(statement)
+            frames_at.append(dict(frames))
         block.statements = statements
         if STACK_ARGUMENTS and isinstance(block.end, ir.TailCall):
             block.end.sp = sp
         ir.map_statement(block.end, slot_reader(sp, frames, known))
         # a stack address that still serves as a value (the flags of "add.w #4, SP") has none in C: it
         # becomes a marker the C writer refuses, so it has to turn out unused
-        def opaque(node):
-            if isinstance(node, ir.Temp) and node.name in temps:
-                return ir.op("stack_address", (ir.const(temps[node.name] & 0xFFFFFFFF),), cpu.current.address_bits)
-            if isinstance(node, ir.Reg) and node.index in frames:
-                return ir.op("stack_address", (ir.const(frames[node.index] & 0xFFFFFFFF),), cpu.current.address_bits)
-            return None
-        for statement in statements + [block.end]:
-            ir.map_statement(statement, opaque)
+        def opaque(frames):
+            def change(node):
+                if isinstance(node, ir.Temp) and node.name in temps:
+                    return ir.op("stack_address", (ir.const(temps[node.name] & 0xFFFFFFFF),), cpu.current.address_bits)
+                if isinstance(node, ir.Reg) and node.index in frames:
+                    return ir.op("stack_address", (ir.const(frames[node.index] & 0xFFFFFFFF),), cpu.current.address_bits)
+                return None
+            return change
+        for statement, where in zip(statements + [block.end], frames_at + [frames]):
+            ir.map_statement(statement, opaque(where))
         if isinstance(block.end, ir.Return) and sp == cpu.current.return_address_bytes:
             function.exits_caller = True
             block.end.leaves_caller = True
@@ -318,6 +340,91 @@ def link_caller_exits(functions):
             function.blocks[back.label] = back
             pending.append(rest.label)
     return exiting
+
+
+def to_memory(function):
+    """A function whose stack addresses serve as values (function.memory_frame, analyse()) keeps its frame in the
+    console's memory once its slots have served the data flow (its arguments, the registers it saves): it starts by
+    lowering MEMORY_SP past the deepest place its stack reaches, each slot is the memory at MEMORY_SP plus the slot's
+    distance from that place (the arguments' copies above the return address, as the 68000 has them), a stack address
+    is that sum, and MEMORY_SP goes back up before every return. A callee's own frame goes below it."""
+    sp = ir.Reg(MEMORY_SP, 32)
+    places = []
+
+    def look(node):
+        if isinstance(node, ir.Stack):
+            places.append((node.offset, node.bits // 8))
+        elif isinstance(node, ir.Op) and node.name == "stack_address":
+            offset = node.args[0].value
+            places.append((offset - (1 << 32) if offset & 0x80000000 else offset, 1))
+        return None
+    for block in function.blocks.values():
+        for statement in block.statements + [block.end]:
+            if isinstance(statement, ir.SetStack):
+                places.append((statement.offset, statement.bits // 8))
+            ir.map_statement(statement, look)
+    low = min([function.deepest] + [offset for offset, _ in places])
+    high = max([cpu.current.return_address_bytes] + [offset + size for offset, size in places])
+    size = (high - low + 3) & ~3
+
+    def place(offset):
+        return ir.op("add", (sp, ir.const((offset - low) & 0xFFFFFFFF)), 32)
+    count = 0
+    for block in function.blocks.values():
+        statements = []
+        for statement in block.statements + [block.end]:
+            loads = []
+
+            def change(node):
+                nonlocal count
+                if isinstance(node, ir.Stack):
+                    count += 1
+                    temp = ir.Temp(f"t{getattr(statement, 'origin', None) or 0:06X}_frame_{count}", node.bits)
+                    read = ir.SetTemp(temp, ir.Load(place(node.offset), node.bits))
+                    read.origin = getattr(statement, "origin", None)
+                    loads.append(read)
+                    return temp
+                if isinstance(node, ir.Op) and node.name == "stack_address":
+                    offset = node.args[0].value
+                    return place(offset - (1 << 32) if offset & 0x80000000 else offset)
+                return None
+            if isinstance(statement, ir.SetStack):
+                stored = ir.Store(place(statement.offset), ir.rebuild(statement.value, change), statement.bits)
+                if hasattr(statement, "origin"):
+                    stored.origin = statement.origin
+                statement = stored
+            else:
+                ir.map_statement(statement, change)
+            statements += loads
+            if statement is not block.end:
+                statements.append(statement)
+        if isinstance(block.end, (ir.Return, ir.TailCall)):
+            back = ir.SetReg(MEMORY_SP, ir.op("add", (sp, ir.const(size)), 32))
+            back.origin = getattr(block.end, "origin", None)
+            statements.append(back)
+        block.statements = statements
+    first = function.blocks[function.entry]
+    down = ir.SetReg(MEMORY_SP, ir.op("sub", (sp, ir.const(size)), 32))
+    down.origin = getattr(first.statements[0] if first.statements else first.end, "origin", None)
+    if any(function.entry in block.successors() for block in function.blocks.values()):
+        body = ("frame", function.entry)
+        function.blocks[body] = type(first)(body, first.statements, first.end, list(first.addresses))
+        for label, block in function.blocks.items():
+            if label != function.entry and label != body:
+                redirect(block.end, function.entry, body)
+        first.statements = [down]
+        first.end = ir.Goto(body)
+    else:
+        first.statements.insert(0, down)
+    function.memory_frame = False
+    function.memory_stack = True
+
+
+def addresses_left(function):
+    """Whether a stack address still serves as a value after slots() (its 'stack_address' marker)."""
+    return any(isinstance(node, ir.Op) and node.name == "stack_address"
+               for block in function.blocks.values() for statement in block.statements + [block.end]
+               for expression in ir.statement_expressions(statement) for node in ir.walk(expression))
 
 
 def leftovers(function):

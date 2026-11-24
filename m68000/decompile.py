@@ -5,7 +5,7 @@ Name:        decompile.py
 Description: decompiles a 68000 program into readable C, one C function per original function
 Version:     0.1.0
 Created:     29-10-2026
-Modified:    01-11-2026
+Modified:    24-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--checks] [--trace] [--out DIR] [--symbols FILE]
@@ -101,6 +101,17 @@ def configure():
     # the arguments the compiler's functions pass on the stack are registers of the data flow (the profile's STACK_ARGUMENTS,
     # off by default: decompiler/stackargs.py)
     stack.STACK_ARGUMENTS = getattr(game_profile, "STACK_ARGUMENTS", False)
+    # a function that hands on an address in its own stack (a buffer a callee fills, one it walks with an address
+    # register) keeps its stack in the console's memory, at the global stack_pointer (the profile's MEMORY_STACK, off
+    # by default: the C writer refuses such a function; decompiler/stack.py ADDRESSES_IN_MEMORY)
+    stack.ADDRESSES_IN_MEMORY = MEMORY_STACK
+    if MEMORY_STACK:
+        profile = cpu.current
+        cpu.use(dataclasses.replace(profile, registers=profile.registers + (stack.MEMORY_SP,),
+                                    register_bits={**profile.register_bits, stack.MEMORY_SP: 32},
+                                    register_names={**profile.register_names, stack.MEMORY_SP: "stack_pointer"},
+                                    variable_names={**profile.variable_names, stack.MEMORY_SP: "stack_pointer"}))
+        signatures.CONTEXT = (stack.MEMORY_SP,)
     # (and UNCHANGED_PARTS: "bset #7, D7" writes D7's low byte only)
     dataflow.UNCHANGED_PARTS = getattr(game_profile, "UNCHANGED_PARTS", False)
     # (and NARROW_OUTPUTS: what a function hands back is what its callers read once everything is known)
@@ -117,6 +128,7 @@ def configure():
 # the profile's CARRIED_REGISTERS, off by default: what the registers carry from one function to a later one that no
 # call links to it (decompiler/carried.py) is in global variables, part by part, the rest in locals and parameters
 CARRIED = getattr(game_profile, "CARRIED_REGISTERS", False)
+MEMORY_STACK = getattr(game_profile, "MEMORY_STACK", False)
 # the virtual registers that hold the carried parts: VIRTUAL_BASE + the register (past the V60's numbers the
 # decompiler knows: R20 and R23 are OutRunners' context registers, R26-R33 its string moves and stack)
 VIRTUAL_BASE = 40
@@ -135,8 +147,9 @@ def build_functions(program):
     built = {}
     failures = []
     for entry in sorted(program.entries):
-        if entry in functions.SHARED_TAILS:
-            continue    # (each function that reaches it has it as its own blocks)
+        if entry in functions.SHARED_TAILS or entry in functions.FRAME_BUILDERS:
+            continue    # (each function that reaches it has it as its own blocks; each call of a frame builder is its
+            # instructions in the caller)
         try:
             built[entry] = builder.build(entry)
         except lift.Unsupported as problem:
@@ -187,6 +200,14 @@ def analyse(program, built):
     flow.solve()
     while sum(len(preserved.analyse(function, flow.call_writes, context=signatures.CONTEXT))
               for function in built.values()):
+        flow.solve()
+    # a function that hands on an address in its stack keeps its frame in memory, once its slots have served its
+    # arguments and the registers it saves (the profile's MEMORY_STACK: decompiler/stack.py to_memory)
+    framed = [function for function in built.values() if getattr(function, "memory_frame", False)]
+    for function in framed:
+        stack.to_memory(function)
+    if framed:
+        flow.reset()
         flow.solve()
     changed = sum(conditions.recover(function, flow) for function in built.values())
     if changed:
@@ -256,7 +277,7 @@ def carry(program, built, flow, found):
     cpu.use(dataclasses.replace(profile, registers=profile.registers + tuple(sorted(used)),
                                 register_bits={**profile.register_bits, **{number: 32 for number in used}},
                                 variable_names={**profile.variable_names, **globals_named}))
-    signatures.CONTEXT = tuple(sorted(used))
+    signatures.CONTEXT = tuple(sorted(used)) + ((stack.MEMORY_SP,) if MEMORY_STACK else ())
     # (no part of them is live where a function ends but what its callers read: decompiler/cleanup.py context_live)
     signatures.SCRATCH_CONTEXT = {number: 0 for number in used}
     recovered = flow.conditions_recovered
@@ -641,12 +662,16 @@ def write_c(program, out_dir, variables_path=None, trace=False):
     addresses = [f"#define {name} 0x{address:06X}u"
                  for address, name in sorted({**emitter.case_addresses, **emitter.code_addresses}.items())]
     guard = game_profile.GUARD
-    globals_names = [emitter.context_name(number) for number in signatures.CONTEXT]
+    globals_names = [emitter.context_name(number) for number in signatures.CONTEXT if number != stack.MEMORY_SP]
     carried_text = ""
+    if MEMORY_STACK:
+        carried_text = ("/* the stack of the functions that hand on an address in it, in the console's memory "
+                        "(decompiler/stack.py\n   MEMORY_SP) */\nextern uint32_t "
+                        f"{emitter.context_name(stack.MEMORY_SP)};\n\n")
     if CARRIED:
         # what the code carries in its registers from one routine to a later one, each with what symbols.txt says of
         # it (a comment line by its name)
-        carried_text = ("/* what the code leaves in its registers for later code to read, kept as the game's state "
+        carried_text += ("/* what the code leaves in its registers for later code to read, kept as the game's state "
                         "(the parts of\n   them no routine sets before it reads: decompiler/carried.py) */\n")
         for name in globals_names:
             said = known.comments.get(name)
@@ -683,10 +708,14 @@ def write_c(program, out_dir, variables_path=None, trace=False):
             raise SystemExit(f"the handler at {handler:06X} takes parameters")
     loaded = named.loaded_tables()
     context_text = ""
+    if MEMORY_STACK:
+        # (where the 68000's SP starts: the reset vector's first long)
+        context_text = (f"/* the stack in memory starts where the 68000's does (game.h) */\nuint32_t "
+                        f"{emitter.context_name(stack.MEMORY_SP)} = 0x{program.mem.r32(0):X}u;\n\n")
     if CARRIED:
         # the globals of what the registers carry, and the list the runtime keeps a copy of while an interrupt's
         # handler runs (the handler saves the registers and puts them back before it returns: game/support.h)
-        context_text = (f"/* what the code carries in its registers (game.h) */\nuint32_t "
+        context_text += (f"/* what the code carries in its registers (game.h) */\nuint32_t "
                         + ", ".join(f"{name} = 0u" for name in globals_names) + ";\n\n" if globals_names else "")
         context_text += ("/* the same, for the runtime to put back what an interrupt's handler found there when it "
                          "returns, as the\n   handler does */\n"
