@@ -85,6 +85,9 @@ NAMED_BASES = {}
 STATE = None
 # (address, member, structure or None, count of structures or bytes) of the blocks of STATE's structure
 STATE_BLOCKS = ()
+TYPED_MOVES = False    # write a copy of a constant count as typed C when its ends are each one exact thing
+TYPED_POINTERS = False # carry proven state pointers through local values
+ZERO_BLOCK = None      # (start, end) of a block of zeros in the ROM: a copy from inside it is a memset
 # The game's variables the C keeps in a structure of their own in the host's memory, reached through a pointer of
 # this name (world->frame_count), instead of in STATE's: the ones HOST_VARIABLES names, which the code reaches only
 # by name. STATE's structure keeps their places, where the generated HOST_project puts them (the state's hash,
@@ -272,13 +275,14 @@ class Item:
 
 
 class Memory:
-    def __init__(self, names, accesses, data_names=None, own=None):
+    def __init__(self, names, accesses, data_names=None, own=None, layouts=None):
         """'names': disassemble.Names; 'accesses': (address expression, bits) of every read and write;
         'data_names': {address: name} of the data labels symbols.txt has (tables of code addresses), which
         name the tables that start there; 'own': {family: accesses} of the reads and writes a family of
         functions makes of work RAM it names its own way (scoped global): an indexed one makes the family's
         variable an array, and leaves alone the variable the rest of the program knows there."""
         self.variables = {}
+        self.layouts = layouts
         self.tables = {}
         self.hardware = {}
         # where a list walk starts: a structure there would have the list's head as one of its fields
@@ -343,6 +347,8 @@ class Memory:
                 continue
             if where is None or (where == "hardware" and parts is not None):
                 continue
+            if where == "variables" and self.layouts is not None and self._in_block_field(value, bits):
+                continue
             widths[where].setdefault(value, Counter())[bits] += 1
             if parts is not None:
                 indexed.add(value)
@@ -397,6 +403,68 @@ class Memory:
                         and item.address < other.address + size(other):
                     raise SystemExit(f"HOST_VARIABLES: {name} shares bytes with {other.name}")
             item.host = True
+
+    def _in_block_field(self, address, bits):
+        """Whether the 'bits' at a constant address inside a STATE_BLOCKS block (structure not None) are
+        named by the block's layout (_block_has_field): the block's member path names them, so Memory adds
+        no unnamed item for them."""
+        for block_addr, member, structure, count in STATE_BLOCKS:
+            if structure is None:
+                continue
+            block_size = pointers.STRUCTS.get(structure, 0)
+            if block_size == 0 or not (block_addr <= address < block_addr + block_size * count):
+                continue
+            if self._block_has_field(structure, (address - block_addr) % block_size, bits):
+                return True
+        return False
+
+    def _scalar_at(self, struct, pos):
+        """The size in bytes of the scalar field or array element that starts exactly at 'pos' in
+        'struct', or None if 'pos' is not the start of such an item (e.g. it is inside a nested
+        member)."""
+        nested = self.layouts.nested.get(struct, {})
+        for nest_offset, (name, nest_struct, count) in nested.items():
+            nest_size = pointers.STRUCTS.get(nest_struct, 0)
+            if nest_size == 0:
+                continue
+            if nest_offset <= pos < nest_offset + nest_size * count:
+                return None
+        found = self.layouts.lookup(struct, pos) or pointers.array_holding(struct, pos)
+        if found is None:
+            return None
+        field_offset, field_bits = found
+        elem_size = field_bits // 8
+        if pos == field_offset:
+            return elem_size
+        if (pos - field_offset) % elem_size != 0:
+            return None
+        count = self.layouts.array_count(struct, field_offset)
+        if count is None or (pos - field_offset) // elem_size >= count:
+            return None
+        return elem_size
+
+    def _block_has_field(self, struct, offset, bits):
+        """Whether the bits // 8 bytes at 'offset' of the layout 'struct' are named by the layout,
+        descending through nested structures, so that no unnamed item is made for them: a field or an
+        array element of exactly 'bits' there, or whole fields or elements laid end to end over them,
+        the first one starting at 'offset' (a halfword over two bytes of an array, read as each by its
+        path), none of them inside a nested member."""
+        nested = self.layouts.nested.get(struct, {})
+        for nest_offset, (name, nest_struct, count) in nested.items():
+            nest_size = pointers.STRUCTS.get(nest_struct, 0)
+            if nest_size == 0:
+                continue
+            if not (nest_offset <= offset < nest_offset + nest_size * count):
+                continue
+            return self._block_has_field(nest_struct, (offset - nest_offset) % nest_size, bits)
+        end = offset + bits // 8
+        place = offset
+        while place < end:
+            size = self._scalar_at(struct, place)
+            if size is None or place + size > end:
+                return False
+            place += size
+        return True
 
     def add_unnamed(self, items, widths, name_of):
         for address, counts in sorted(widths.items()):

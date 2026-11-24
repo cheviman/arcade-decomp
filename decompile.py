@@ -948,6 +948,9 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     pointers.FIELD_ARRAYS = {key: (int(known.fields[key][1][1:]), count) for key, count in known.field_arrays.items()}
     pointers.SCOPED_ARRAYS = {(struct, family, offset): (int(known.scoped[(struct, family)][offset][1][1:]), count)
                               for (struct, family, offset), count in known.scoped_arrays.items()}
+    pointers.MEMBERS = {}
+    for (struct, offset), (name, inner, count) in known.members.items():
+        pointers.MEMBERS.setdefault(struct, {})[offset] = (name, inner, count)
     # the names a "STRUCT@BASE" may give its base by: the program's data, tables and tables of records
     pointers.BASES = {symbol.name: address for address, symbol in program.symbols.items() if symbol.kind == "data"}
     pointers.BASES.update({name: address for address, (name, _) in list(known.tables.items())
@@ -1006,11 +1009,12 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                if hit[0] == "global"]
     data_names = {address: symbol.name for address, symbol in program.symbols.items() if symbol.kind == "data"}
     shared, own = family_accesses(built, names, known)
-    named = memory.Memory(known, shared + through, data_names, own)
+    layouts = pointers.Layouts(accesses, known)
+    named = memory.Memory(known, shared + through, data_names, own, layouts)
     always = {entry: set(summary.always) for entry, summary in flow.summaries.items()}
     emitter = emit.Emitter(built, found, names, signatures.CONTEXT, needs_return_address(built), named, always,
                            program.mem.r32, trace)
-    emitter.layouts = pointers.Layouts(accesses, known)
+    emitter.layouts = layouts
     emitter.reroll_statements = True    # an unrolled copy or clear as the loop it does (emit.rerolled_statements)
     emitter.register_names = dict(known.registers)
     emitter.writes = {entry: set(summary.writes) for entry, summary in flow.summaries.items()}
@@ -1095,6 +1099,109 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                 emitter.param_structs[entry] = params
             if result is not None:
                 emitter.result_structs[entry] = result
+
+        if memory.TYPED_POINTERS:
+            def state_pointer(kind):
+                return kind in pointers.STRUCTS and kind not in pointers.ROM_STRUCTS \
+                    and kind not in pointers.BOARD_STRUCTS
+
+            callers = {}
+            for caller in writers.values():
+                for block in caller.function.blocks.values():
+                    for statement in block.statements + ([block.end] if block.end is not None else []):
+                        if not isinstance(statement, (ir.Call, ir.TailCall)) or statement.target is None:
+                            continue
+                        target = emitter.resolve(statement.target & 0xFFFFFF,
+                                                 getattr(statement, "entry", None))[0]
+                        callers.setdefault(target, []).append((caller, statement))
+
+            while True:
+                added = False
+                for entry, writer in writers.items():
+                    if emitter.names.get(entry) in emitter.replaced or emitter.second_entries.get(entry) \
+                            or entry in emitter.needs_return_address:
+                        continue
+                    typed = emitter.param_structs.get(entry, {})
+                    for value in writer.params:
+                        if value[0] != "r" or value[1] in typed:
+                            continue
+                        index = value[1]
+                        name = writer.vars.entry_name(index)
+                        if name is None or name != emitter.param_name(entry, value):
+                            continue
+
+                        uses = []
+                        valid = True
+                        for block in writer.function.blocks.values():
+                            for statement in block.statements + ([block.end] if block.end is not None else []):
+                                if statement is None:
+                                    continue
+                                if any(writer.vars.def_name(statement, defined) == name
+                                       for defined in writer.vars.statement_defs(statement)):
+                                    valid = False
+                                    break
+                                if any(isinstance(node, ir.Reg) and writer.vars.use_name(node) == name
+                                       for expression in ir.statement_expressions(statement)
+                                       for node in ir.walk(expression)):
+                                    valid = False
+                                    break
+                                for statement_id, used_index in writer.vars.implicit:
+                                    if statement_id != id(statement) \
+                                            or writer.vars.implicit_name(statement, used_index) != name:
+                                        continue
+                                    if not isinstance(statement, (ir.Call, ir.TailCall)) \
+                                            or statement.target is None:
+                                        valid = False
+                                        break
+                                    target = emitter.resolve(
+                                        statement.target & 0xFFFFFF,
+                                        getattr(statement, "entry", None))[0]
+                                    arguments = [argument for argument in emitter.by_value(target)
+                                                 if argument[0] == "r" and argument[1] == used_index]
+                                    if len(arguments) != 1:
+                                        valid = False
+                                        break
+                                    kind = emitter.param_structs.get(target, {}).get(arguments[0][1])
+                                    if not state_pointer(kind):
+                                        valid = False
+                                        break
+                                    uses.append(kind)
+                                if not valid:
+                                    break
+                            if not valid:
+                                break
+                        if not valid or not uses or len(set(uses)) != 1:
+                            continue
+
+                        # (with no call to it the program makes known, nothing agrees: a function only a task,
+                        # an interrupt or a code slot enters keeps its numbers)
+                        entry_callers = callers.get(entry)
+                        if not entry_callers:
+                            continue
+                        kind = uses[0]
+                        for caller, statement in entry_callers:
+                            previous = caller.current
+                            caller.current = statement
+                            try:
+                                caller_name = caller.implicit_value(index)
+                                held = caller.local_pointers.get(caller_name)
+                                if held is None:
+                                    held = caller.kept_pointer(index)
+                                if held is None and caller_name is not None \
+                                        and caller_name == caller.vars.entry_name(index):
+                                    # (the caller's own parameter, passed on as it came)
+                                    held = emitter.param_structs.get(caller.entry, {}).get(index)
+                            finally:
+                                caller.current = previous
+                            if held != kind:
+                                valid = False
+                                break
+                        if valid:
+                            emitter.param_structs.setdefault(entry, {})[index] = kind
+                            added = True
+                if not added:
+                    break
+
         for writer in writers.values():
             writer.retype()
     for entry, writer in writers.items():
