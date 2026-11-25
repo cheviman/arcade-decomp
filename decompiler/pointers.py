@@ -140,6 +140,8 @@ ELEMENTS = {}                  # structure -> element type: an array of one valu
 UNALIGNED = set()              # of those, the ones the program keeps at addresses that are not a multiple of
                                # their width ("elements ... unaligned"): read through a type of alignment 1
 RECORD_TABLES = {}             # program ROM address -> (name, ROM structure): a table of records, name[i].field
+RECORD_POINTERS = False        # a pointer the C keeps to a record of one of those tables, the table's address
+                               # plus whole records, reads &name[i] (the table itself) rather than rom_pointer()
 SCOPED_ARRAYS = {}             # (struct, family, offset) -> (bits, count): a family's field that is an array
 FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that is an array of 'count' elements
                                # of 'bits' (None: it goes on past the record's end), read STRUCT(p)->field[i]

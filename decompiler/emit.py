@@ -1576,6 +1576,10 @@ class FunctionWriter:
         if isinstance(node, ir.Const) and memory.CODE_LIST_ELEMENTS is not None \
                 and struct == memory.CODE_LIST_ELEMENTS and node.value in self.emitter.code_lists:
             return self.emitter.code_lists[node.value][0]
+        if pointers.RECORD_POINTERS:
+            element = self.record_element(node, struct, shift)
+            if element is not None:
+                return element
         if isinstance(node, ir.Const):
             place = state_place((node.value + shift) & 0xFFFFFF, struct, self.emitter.layouts) \
                 or self.named_place((node.value + shift) & 0xFFFFFF, struct)
@@ -1589,6 +1593,47 @@ class FunctionWriter:
             else:
                 value = base
         return f"{self.pointer_from(struct)}({self.stored(value, 32)})"
+
+    def record_element(self, node, struct, shift):
+        """C for the pointer to the 'struct' at the address 'node' ('shift' bytes on) where that is a record
+        of a table of the program ROM's records of that structure (pointers.RECORD_TABLES): the table's
+        address plus whole records, &traffic_path[path_step]; the table's name for its first record. None
+        for any other address."""
+        terms, constant = [], 0
+
+        def gather(n, sign):
+            nonlocal constant
+            if isinstance(n, ir.Const):
+                constant += sign * n.value
+            elif isinstance(n, ir.Op) and n.name == "add" and n.bits == pointers.POINTER_BITS:
+                gather(n.args[0], sign)
+                gather(n.args[1], sign)
+            elif isinstance(n, ir.Op) and n.name == "sub" and n.bits == pointers.POINTER_BITS \
+                    and isinstance(n.args[1], ir.Const):
+                gather(n.args[0], sign)
+                constant -= sign * n.args[1].value
+            else:
+                terms.append(n)
+        gather(node, 1)
+        address = (constant + shift) & 0xFFFFFFFF
+        table = pointers.RECORD_TABLES.get(address)
+        if table is None or table[1] != struct:
+            return None
+        size = pointers.STRUCTS[struct]
+        parts = []
+        for term in terms:
+            part = pointers.scaled_count(term, size)
+            if part is None:
+                return None
+            parts.append(part)
+        if not parts:
+            return table[0]
+        index = parts[0]
+        for part in parts[1:]:
+            widened_index = index if index.bits >= 32 else ir.op("zext", (index,), 32)
+            widened_part = part if part.bits >= 32 else ir.op("zext", (part,), 32)
+            index = ir.op("add", (widened_index, widened_part), 32)
+        return f"&{table[0]}[{self.record_number(index)}]"
 
     def place_in(self, name, own, base, offset, struct):
         """C for a pointer to the 'struct' at 'offset' bytes into the 'own' that pointer 'name' (read from
