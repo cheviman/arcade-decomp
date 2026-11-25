@@ -30,8 +30,11 @@ def main():
             if found:
                 break
     print("\n".join(report))
-    total = len(rom.ROM_FILES)
-    print(f"\n{len(found)}/{total} files of the '{rom.SET_NAME}' set")
+    # (a game that reads several versions says which set the files are: set_of, set_files)
+    files = rom.set_files(found) if hasattr(rom, "set_files") else rom.ROM_FILES
+    name = (rom.set_of(found) or rom.SET_NAME) if hasattr(rom, "set_of") else rom.SET_NAME
+    total = len(files)
+    print(f"\n{len(found)}/{total} files of the '{name}' set")
     return 0 if len(found) == total else 1
 
 

@@ -4,11 +4,11 @@ Description: runs every control script on the reference and on the translated ga
              frame, and checks that the static analysis alone finds all the code the reference ran
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    29-10-2026
+Modified:    25-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-only] [--translated] [--video]
-                                       [--sound] [--jobs N] [--bin DIR] [--out DIR]
+                                       [--sound] [--jobs N] [--bin DIR] [--out DIR] [--set SET]
   NAME            scripts of tests/controls to run (file names without .txt); all of them by default
   --reference-only  run the scripts on the reference alone (a game with no decompiled C yet): for
                   each, whether it ran to its end, the addresses it executed and how many of them no
@@ -28,6 +28,10 @@ Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-o
   --jobs N        run N scripts at a time (half the processors by default)
   --bin DIR       the executables to run (build/bin by default): another build of the game
   --out DIR       where the runs go (build/scenarios by default)
+  --set SET       another version of the game (a set the game's ROM module knows, rom/SET.zip): its scripts
+                  are tests/controls/SET, its runs go to build/scenarios_SET by default, the reference runs
+                  its ROM (--rom), and the static analysis runs on its program with its symbols
+                  (build/versions/SET/symbols.txt, tools/match_version.py)
 
 For every script: the reference (build/bin/s32ref, or the profile's REFERENCE) writes
 build/scenarios/NAME/{executed,called,hashes}.txt, the game (build/bin/GAME_game_headless, from
@@ -59,6 +63,9 @@ if STATIC_ANALYSIS:
 
 CONTROLS = ROOT / "tests" / "controls"
 RESULTS = ROOT / "build" / "scenarios"
+# the version run (--set): its ROM for the reference and the analysis, and its symbols
+VERSION_ROM = None
+SYMBOLS = ROOT / "symbols.txt"
 BIN = ROOT / "build" / "bin"
 SOUND_TIMING = ROOT / "build" / "sound" / "timing.txt"
 # what the reference takes to run as the game runs, for the comparison (mdref: --timing frames; kref and s32ref
@@ -77,6 +84,8 @@ def run_reference(script, out, video, sound=False, timing=True, options=()):
     if sound:
         extra += (["--sound-timing", str(SOUND_TIMING)] if timing else []) + ["--sound-hashes", str(out / "sound_hashes.txt"),
                                                                              "--sound-trace", str(out / "sound_executed.txt")]
+    if VERSION_ROM is not None:
+        extra += ["--rom", str(VERSION_ROM)]
     result = subprocess.run([str(executable(REFERENCE)), "--script", str(script),
                              "--trace", str(out / "executed.txt"), "--calls", str(out / "called.txt"),
                              "--hashes", str(out / "hashes.txt")] + extra,
@@ -126,10 +135,10 @@ def compare(reference_file, native_file):
 
 def static_check(names):
     """Executed addresses of the scenarios that the analysis without traces does not decode"""
-    image = rom.build_program(rom.load_set(ROOT / "rom"))
+    image = rom.build_program(rom.load_set(VERSION_ROM or ROOT / "rom"))
     traces = [RESULTS / name / "executed.txt" for name in names if (RESULTS / name / "executed.txt").exists()]
     executed, _ = disassemble.load_trace(traces)
-    analysis = disassemble.Analysis(image, disassemble.load_symbols(ROOT / "symbols.txt"))
+    analysis = disassemble.Analysis(image, disassemble.load_symbols(SYMBOLS))
     analysis.run()
     missing = sorted(address for address in executed if address not in analysis.instructions)
     # where each missing stretch is entered: not the next instruction of another missing one
@@ -175,8 +184,8 @@ def reference_only(names, jobs, video, sound):
         print(f"static analysis: none yet for the {game_profile.CPU}")
         return 1 if failures else 0
     executed, missing, entries = static_check(names)
-    image = rom.build_program(rom.load_set(ROOT / "rom"))
-    analysis = disassemble.Analysis(image, disassemble.load_symbols(ROOT / "symbols.txt"))
+    image = rom.build_program(rom.load_set(VERSION_ROM or ROOT / "rom"))
+    analysis = disassemble.Analysis(image, disassemble.load_symbols(SYMBOLS))
     analysis.run()
     print(f"static analysis: {executed - len(missing)} of {executed} executed addresses found without traces; "
           f"the scenarios run {executed - len(missing)} of its {len(analysis.instructions)} instructions")
@@ -186,8 +195,19 @@ def reference_only(names, jobs, video, sound):
 
 
 def main():
-    global BIN, RESULTS
+    global BIN, RESULTS, CONTROLS, VERSION_ROM, SYMBOLS
     arguments = sys.argv[1:]
+    if "--set" in arguments:
+        position = arguments.index("--set")
+        version = arguments[position + 1]
+        del arguments[position:position + 2]
+        CONTROLS = CONTROLS / version
+        RESULTS = ROOT / "build" / f"scenarios_{version}"
+        VERSION_ROM = ROOT / "rom" / f"{version}.zip"
+        SYMBOLS = ROOT / "build" / "versions" / version / "symbols.txt"
+        for needed in (CONTROLS, VERSION_ROM, SYMBOLS):
+            if not needed.exists():
+                raise SystemExit(f"{needed}: not found")
     native_only = "--native-only" in arguments
     game = "translated" if "--translated" in arguments else "decompiled"
     video = "--video" in arguments

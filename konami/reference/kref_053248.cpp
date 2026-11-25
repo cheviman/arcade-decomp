@@ -5,7 +5,7 @@
  *                 Simpsons'), to find code and record state per frame
  *    Version:     0.1.0
  *    Created:     05-11-2026
- *    Modified:    05-11-2026
+ *    Modified:    25-11-2026
  *    Author:      Sebastian Toyos
  *
  *    Not part of the game. Usage:
@@ -651,6 +651,7 @@ int main(int argc, char **argv)
 		std::cerr << "The ROM set in " << rom_folder << " cannot be read: " << problem << '\n';
 		return 1;
 	}
+	simpsons_version = uint8_t(game_rom_set);    // the version it read (where its program waits: frame.h)
 	if (!assets_folder.empty())
 		return check_assets(assets_folder);
 	simpsons_reset();

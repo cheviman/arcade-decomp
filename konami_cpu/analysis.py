@@ -9,10 +9,12 @@ Created:     05-11-2026
 Modified:    05-11-2026
 Author:      Sebastian Toyos
 
-Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...]   (the game's shim; default
-       ROM: rom/). Writes build/listing/BINARY.s and build/listing/report.txt. --trace adds the places a real run
-       executed (konami/reference/kref --trace) to check the analysis against them: how many it finds, and
-       executed places that fall inside an instruction it decoded (one of the two readings is wrong).
+Usage: python tools/disassemble.py [rom folder or .zip] [--trace executed.txt ...] [--symbols FILE] [--out DIR]
+       (the game's shim; default ROM: rom/). Writes build/listing/BINARY.s and build/listing/report.txt. --trace
+       adds the places a real run executed (konami/reference/kref --trace) to check the analysis against them: how
+       many it finds, and executed places that fall inside an instruction it decoded (one of the two readings is
+       wrong). --symbols and --out are for another version of the game: its symbols.txt (the game's own by
+       default), and the folder its listing and report go to.
 
 The CPU sees 64 KB: its program's last banks fixed at 8000-FFFF and one bank at a time in the window at
 6000-7FFF, which the CPU's output lines choose (SETLN). An instruction's place is its offset in the program
@@ -956,13 +958,20 @@ def main():
         position = arguments.index("--trace")
         traces.append(Path(arguments[position + 1]))
         del arguments[position:position + 2]
+    # (another version of the game: its own symbols.txt, and a folder for its listing and report)
+    options = {}
+    for option in ("--symbols", "--out"):
+        if option in arguments:
+            position = arguments.index(option)
+            options[option] = Path(arguments[position + 1])
+            del arguments[position:position + 2]
     source = Path(arguments[0]) if arguments else ROOT / "rom"
     image = rom.build_program(rom.load_set(source))
-    symbols_path = ROOT / "symbols.txt"
+    symbols_path = options.get("--symbols", ROOT / "symbols.txt")
     symbols = load_symbols(symbols_path) if symbols_path.exists() else {}
     analysis = Analysis(image, symbols)
     analysis.run()
-    out = ROOT / "build" / "listing"
+    out = options.get("--out", ROOT / "build" / "listing")
     out.mkdir(parents=True, exist_ok=True)
     write_listing(analysis, out / f"{game_profile.BINARY}.s")
     executed = load_trace(traces)[0] if traces else None
