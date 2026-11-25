@@ -1202,7 +1202,8 @@ class FunctionWriter:
                     name = self.vars.use_name(base)
                     if name is None:
                         continue
-                    if field[0] in pointers.BOARD_STRUCTS or (with_params and field[0] in pointers.ELEMENTS):
+                    if field[0] in pointers.BOARD_STRUCTS or (with_params and field[0] in pointers.ELEMENTS
+                                                             and field[0] != memory.CODE_LIST_ELEMENTS):
                         mixed.add(name)
                         continue
                     if field[3] or field[0] in pointers.ELEMENTS:
@@ -1290,6 +1291,8 @@ class FunctionWriter:
             return target if state_structure(target) else None
         if not isinstance(value, ir.Const):
             return None
+        if memory.CODE_LIST_ELEMENTS is not None and value.value in self.emitter.code_lists:
+            return memory.CODE_LIST_ELEMENTS
         address = value.value & 0xFFFFFF
         if address != value.value:
             return None
@@ -1570,6 +1573,9 @@ class FunctionWriter:
             inside = self.place_in(name, own, base, offset, struct) if offset >= 0 else None
             if inside is not None:
                 return inside
+        if isinstance(node, ir.Const) and memory.CODE_LIST_ELEMENTS is not None \
+                and struct == memory.CODE_LIST_ELEMENTS and node.value in self.emitter.code_lists:
+            return self.emitter.code_lists[node.value][0]
         if isinstance(node, ir.Const):
             place = state_place((node.value + shift) & 0xFFFFFF, struct, self.emitter.layouts) \
                 or self.named_place((node.value + shift) & 0xFFFFFF, struct)
@@ -3084,6 +3090,10 @@ class FunctionWriter:
                         bracket = text.find("[")
                         if bracket > 0 and text.endswith("]") and text[:bracket] in self.emitter.code_table_names:
                             return [f"{target[0]} = {text};"]    # (a table of code: it holds the functions' numbers)
+                    if isinstance(constant, ir.Load) and memory.CODE_LIST_ELEMENTS is not None:
+                        field = self.fields.get(id(constant))
+                        if field is not None and field[0] == memory.CODE_LIST_ELEMENTS:
+                            return [f"{target[0]} = {text};"]    # (a list of code: it holds the functions' numbers)
                     if isinstance(constant, ir.Load) and self.code_field(id(constant), constant.address):
                         return [f"{target[0]} = {text};"]    # (a code field read: the number it holds)
                     return [f"{target[0]} = function_number({text});"]
@@ -4156,6 +4166,8 @@ class Emitter:
                                     # memory.CODE_FIELDS: FUNCTION_name, its number in the state)
         self.code_table_names = frozenset()    # the program ROM's tables of code (memory.CODE_TABLES): the C
                                     # keeps them as arrays of the functions' numbers
+        self.code_lists = {}        # the program ROM's lists of code (memory.CODE_LIST_ELEMENTS):
+                                    # {address: (name, count, [FUNCTION_ names])}
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
                                     # something else puts its own in its place (decompile.py, replaced_functions)
         self.trampolines = {}       # entry -> (function, way in) of a function that only jumps to another
@@ -4390,6 +4402,9 @@ class Emitter:
                 # another copy of the ROM: its own value, which may be no address at all (OutRunners' memory
                 # test counts 0xFF000 bytes, the copy of vector_table's 0x03F000 in the code ROM's fourth mirror)
                 return None
+            if memory.CODE_LIST_ELEMENTS is not None and canonical in self.code_lists:
+                raise SystemExit(f"CODE_LIST_ELEMENTS: the list of code {self.code_lists[canonical][0]} "
+                                 f"used other than as a pointer")
             item = self.memory.tables.get(canonical)
             if item is not None:
                 return f"{item.name}_ADDRESS", cprint.PRIMARY

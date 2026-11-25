@@ -843,6 +843,34 @@ def rom_code_tables(program, named, code_addresses):
     return tables
 
 
+def rom_code_lists(program, code_addresses):
+    """{address: (name, count, [the FUNCTION_ name of each function])} for the program ROM's lists of code
+    (memory.CODE_LIST_ELEMENTS): each data label (program.symbols, kind "data") whose 32-bit word is a count
+    N, with a symbol at its address + 4 whose layout has record 4, code ((0, None),) and count N, and whose
+    N words from address + 4 (rom_value) are all keys of 'code_addresses'."""
+    lists = {}
+    for address, symbol in program.symbols.items():
+        if symbol.kind != "data":
+            continue
+        count = rom_value(program, address, 32)
+        if not count:
+            continue
+        handlers = program.symbols.get(address + 4)
+        if handlers is None or handlers.layout is None:
+            continue
+        if handlers.layout.record != 4 or handlers.layout.code != ((0, None),) or handlers.layout.count != count:
+            continue
+        words = []
+        for index in range(count):
+            value = rom_value(program, address + 4 + 4 * index, 32)
+            if value not in code_addresses:
+                break
+            words.append(code_addresses[value])
+        else:
+            lists[address] = (symbol.name, count, words)
+    return lists
+
+
 def fewer_controls(texts, writers, write_way, notes_of, read=None):
     """A function the structure leaves control variables in, written again with more code copied: a loop
     entered at two places from a larger piece of it (split_loop_entries with SPLIT_COPY), small blocks
@@ -1059,6 +1087,12 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             raise SystemExit("CODE_TABLES: a table of code holds functions' numbers (memory.CODE_FIELDS)")
         named.code_tables = rom_code_tables(program, named, emitter.code_addresses)
         emitter.code_table_names = frozenset(name for name, _ in named.code_tables.values())
+    if memory.CODE_LIST_ELEMENTS is not None:
+        if not memory.CODE_TABLES:
+            raise SystemExit("CODE_LIST_ELEMENTS: a list of code holds functions' numbers (memory.CODE_TABLES)")
+        # (every function of the code table: code_addresses leaves out the ones below 0x1000)
+        emitter.code_lists = rom_code_lists(program, {address: "FUNCTION_" + names[address] for address in table
+                                                      if address in names})
     emitter.flow = flow
     emitter.result_bits = dict(cleanup.RESULT_BITS)
     emitter.split_webs = split_webs
@@ -1332,6 +1366,11 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             code_lines.append("/* the program's tables of code: the numbers (enum game_function) of the functions they hold */")
             for address, (name, words) in sorted(named.code_tables.items()):
                 code_lines.append(f"extern const uint32_t {name}[{len(words)}];")
+        if emitter.code_lists:
+            code_lines.append("")
+            code_lines.append("/* the program's lists of code: a count, then the numbers (enum game_function) of the functions */")
+            for address, (name, count, words) in sorted(emitter.code_lists.items()):
+                code_lines.append(f"extern const uint32_t {name}[{count + 1}];")
         for address in table:
             if emitter.wrapper(address) is not None:
                 code_lines.append(f"void call_{names[address]}(void);")
@@ -1349,7 +1388,8 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         f"/* registers the whole program shares */\nextern uint32_t {context}\n\n"
         + code_section + "\n\n"
         + "\n".join(prototypes) + "\n\n#endif\n", encoding="ascii")
-    labels = [f"#define {name}_ADDRESS 0x{address:06X}u" for address, name in sorted(emitter.data_labels.items())]
+    labels = [f"#define {name}_ADDRESS 0x{address:06X}u" for address, name in sorted(emitter.data_labels.items())
+              if address not in emitter.code_lists and address - 4 not in emitter.code_lists]
     unused = sorted([f"{function} {value:X} {name}" for (function, value), name in emitter.constants.items()
                      if (function, value) not in emitter.constants_used]
                     + [f"window {function} {low:X} {high:X}" for function, low, high in emitter.windows
@@ -1426,6 +1466,14 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             code_tables += ("/* the program's tables of code, as the numbers of the functions they hold (enum game_function) */\n")
             for address, (name, words) in sorted(named.code_tables.items()):
                 code_tables += f"const uint32_t {name}[{len(words)}] =\n{{\n"
+                for word in words:
+                    code_tables += f"\t{word},\n"
+                code_tables += "};\n\n"
+        if emitter.code_lists:
+            code_tables += ("/* the program's lists of code: a count, then the numbers of the functions (enum game_function) */\n")
+            for address, (name, count, words) in sorted(emitter.code_lists.items()):
+                code_tables += f"const uint32_t {name}[{count + 1}] =\n{{\n"
+                code_tables += f"\t{count}u,\n"
                 for word in words:
                     code_tables += f"\t{word},\n"
                 code_tables += "};\n\n"

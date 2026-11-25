@@ -105,6 +105,11 @@ CODE_FIELDS = frozenset()
 # entry of a function the state's code fields may hold. The C keeps them as arrays of the functions'
 # numbers (enum game_function) in table.c, not as tables the assets supply. Needs CODE_FIELDS. False: off
 CODE_TABLES = False
+# the elements kind (pointers.ELEMENTS) through which the C reads the program ROM's lists of code: a 32-bit
+# count, then that many functions (a data label, and a described table of the functions at +4). The C
+# keeps them as arrays (the count, then the functions' numbers) in table.c, and the pointers into them as
+# pointers of this kind. Needs CODE_TABLES. None: off
+CODE_LIST_ELEMENTS = None
 HARDWARE = [(0x300000, 0x320000, "VIDEO"), (0x400000, 0x420000, "SPRITE_RAM"), (0x500000, 0x500010, "SPRITE_CONTROL"),
             (0x600000, 0x610000, "PALETTE"), (0x610000, 0x620000, "MIXER"), (0x700000, 0x702000, "SOUND"),
             (0xC00000, 0xC00080, "IO"), (0xD00000, 0xD00010, "IRQ"), (0xD80000, 0xD80010, "RANDOM")]
