@@ -107,7 +107,8 @@ KINDS = {
                    "(move_halfwords, move_string, set_bytes, search_bytes)", None),
     "pointer_conversions": ("pointers the C keeps turned back into the address the original holds where the C "
                             "still needs it, or made from one (address_of(current_object), pointer_to(address), "
-                            "rom_pointer(address))", None),
+                            "rom_pointer(address); a record of a table a number of bytes into it that is not whole "
+                            "records, record_at(table, bytes))", None),
 }
 # the kinds that keep the game's state in the board's memory model, counted in the game's C (not the sound
 # program's, whose memory is the sound board's)
@@ -298,7 +299,7 @@ def memory_model(source):
         "code_addresses": words(code_names | {"call_code"}),
         "table_addresses": words(casts.get("data_at", set()) | table_names),
         "page_links": re.compile(r"\b(?:LINKED|PAGE_ADD|IN_PAGE)\("),
-        "pointer_conversions": re.compile(r"\b(?:address_of|pointer_to|rom_pointer)\("),
+        "pointer_conversions": re.compile(r"\b(?:address_of|pointer_to|rom_pointer|record_at)\("),
         "ram_blocks": re.compile(r"\b(?:move_(?:string|bytes|halfwords|bytes_backward|halfwords_backward|bits_down|bits_up)"
                                  r"|set_(?:bytes|halfwords)|search_(?:bytes|bits_up))\("),
     }

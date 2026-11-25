@@ -142,6 +142,10 @@ UNALIGNED = set()              # of those, the ones the program keeps at address
 RECORD_TABLES = {}             # program ROM address -> (name, ROM structure): a table of records, name[i].field
 RECORD_POINTERS = False        # a pointer the C keeps to a record of one of those tables, the table's address
                                # plus whole records, reads &name[i] (the table itself) rather than rom_pointer()
+RECORD_OFFSETS = False         # with RECORD_POINTERS: a number of records worked out in fewer bits ((uint8_t)(x *
+                               # 2u) * 4u in records of 8: x & 0x7F), and a record a number of bytes into a table
+                               # that is not whole records (record_at(name, bytes)), read through the table
+                               # rather than rom_pointer()
 SCOPED_ARRAYS = {}             # (struct, family, offset) -> (bits, count): a family's field that is an array
 FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that is an array of 'count' elements
                                # of 'bits' (None: it goes on past the record's end), read STRUCT(p)->field[i]
@@ -413,6 +417,23 @@ def scaled_count(node, size, zeros=None):
     if factor > size and factor % size == 0:
         return ir.op("mul", (base, ir.Const(factor // size, base.bits)), base.bits)
     return None
+
+
+def outer_scaled_count(node, size):
+    """The number of whole records of 'size' bytes in a constant factor times an offset worked out in fewer
+    bits, where the two factors make the record: (uint8_t)(x * 2u) * 4u in records of 8 is x & 0x7F
+    (narrow_count with the size over the outer factor). None otherwise."""
+    factor, base = 1, node
+    while isinstance(base, ir.Op) and (base.name == "shl" and isinstance(base.args[1], ir.Const)
+                                       or base.name == "mul" and any(isinstance(arg, ir.Const) for arg in base.args)):
+        if base.name == "shl":
+            factor, base = factor << base.args[1].value, base.args[0]
+        else:
+            constant, other = (base.args[1], base.args[0]) if isinstance(base.args[1], ir.Const) else base.args
+            factor, base = factor * constant.value, other
+    if factor <= 1 or factor >= size or size % factor:
+        return None
+    return narrow_count(base, size // factor)
 
 
 def records_kind(kind):

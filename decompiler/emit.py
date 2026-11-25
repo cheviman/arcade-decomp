@@ -1623,8 +1623,10 @@ class FunctionWriter:
         parts = []
         for term in terms:
             part = pointers.scaled_count(term, size)
+            if part is None and pointers.RECORD_OFFSETS:
+                part = pointers.outer_scaled_count(term, size)
             if part is None:
-                return None
+                return self.record_bytes(table[0], terms) if pointers.RECORD_OFFSETS else None
             parts.append(part)
         if not parts:
             return table[0]
@@ -1634,6 +1636,16 @@ class FunctionWriter:
             widened_part = part if part.bits >= 32 else ir.op("zext", (part,), 32)
             index = ir.op("add", (widened_index, widened_part), 32)
         return f"&{table[0]}[{self.record_number(index)}]"
+
+    def record_bytes(self, name, terms):
+        """C for the record a number of bytes into the table 'name' that is not whole records, the sum of
+        'terms' (record_at, the runtime's): record_at(sprite_size_steps, piece->sprite * 4u)."""
+        offset = terms[0]
+        for term in terms[1:]:
+            widened_offset = offset if offset.bits >= 32 else ir.op("zext", (offset,), 32)
+            widened_term = term if term.bits >= 32 else ir.op("zext", (term,), 32)
+            offset = ir.op("add", (widened_offset, widened_term), 32)
+        return f"record_at({name}, {self.stored(offset, 32)})"
 
     def place_in(self, name, own, base, offset, struct):
         """C for a pointer to the 'struct' at 'offset' bytes into the 'own' that pointer 'name' (read from
