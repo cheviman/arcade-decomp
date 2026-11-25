@@ -64,8 +64,10 @@ KINDS = {
     "goto": ("goto statements", re.compile(r"\bgoto\b")),
     "control_variables": ("functions with bool control variables", None),
     "sub_functions": ("functions named after their address (sub_XXXXXX, the sound program's sound_XXXX)", None),
-    "unk_names": ("memory named after its address (unk_XXXXXX, and as its address unk_XXXXXX_ADDRESS)",
-                  re.compile(r"(?<!->)(?<!\.)\bunk_[0-9A-F]{4,6}(?:_ADDRESS)?\b")),
+    "unk_names": ("memory named after its address (unk_XXXXXX, and as its address unk_XXXXXX_ADDRESS; a member "
+                  "of the state's structure so named, game->unk_XXXXXX)",
+                  re.compile(r"(?:(?<!->)(?<!\.)\bunk_[0-9A-F]{4,6}|(?:(?<=->)|(?<=\.))unk_[0-9A-F]{6})"
+                             r"(?:_ADDRESS)?\b")),
     "rom_names": ("tables of the program ROM named after their address (rom_XXXXXX)",
                   re.compile(r"(?<!->)(?<!\.)\brom_[0-9A-F]{6}(?:_ADDRESS)?\b")),
     "unk_fields": ("fields of a structure named after their offset (->unk_XX)",

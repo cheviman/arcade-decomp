@@ -113,6 +113,15 @@ for byte with the original's. `src/ram.h` declares it, with static asserts on it
 places. A structure inside another is a member of it (`member STRUCT OFFSET NAME INNER[N]` in
 `symbols.txt`: `&screen->car`).
 
+The first step out of that model: a profile that sets `memory.HOST` (OutRunners: `"world"`) keeps the variables
+`memory.HOST_VARIABLES` names in a structure of their own in the host's memory (`world->game_frame_count`), the
+ones the code reaches only by name. The state's structure keeps their places, where the generated
+`world_project` puts them (`table.c`: the runtime calls it for the state's hash each frame) and `world_unproject`
+takes them back; the functions `memory.HOST_SYNCED` names, which reach memory by its address, open the runtime's
+window around their body (`world_ram_begin`, `world_ram_end`), while which the variables are in the work RAM. Such
+a variable has no `NAME_ADDRESS`, so that a use of its address does not compile, and the decompiler stops when one
+is read or written with the next ones at once (`AS16`).
+
 Where the code reaches a structure the C keeps a pointer, not an address: in the registers the whole
 program shares (`pointers.CONTEXT_KINDS`: `current_object->state`); in a function's own variables,
 parameters and results that point at one structure of the state or one record of the program ROM (`struct
@@ -164,6 +173,63 @@ git submodule update --remote tools/core
 
 and a commit of `tools/core`. A clone of a game takes its core with `git clone --recursive`, or
 `git submodule update --init` in a clone made without it.
+
+## A port's wider screen
+
+A decompilation whose port shows a wider screen than the board's (WIDE: 16:9, 20:9, 16:10) names every place where
+the code takes an object away, stops it, keeps it in or pushes it back at a side of the screen, by the edge and the
+margin past it, instead of leaving the board's numbers. The port moves them all at once by its sides, and nobody has
+to find them area by area from players' reports.
+
+The Simpsons' port fixed WIDE's edges one report at a time (issues 24, 29, 31, 32, 34, 35) until the 36 places were
+named (simpsons-decomp ce5a2e6). TMNT's issue 30: the skateboards' helicopters that come in at the left were put
+past the wider screen's side, where the game's screen x, unsigned, went under 0: the game read it as past the right
+edge, flew them away from the turtles and never took them off, and the area never ended.
+
+In the core, `symbols.txt` lines name the comparisons. `constant FUNCTION VALUE NAME(ARGS)` is a number the function
+compares with, written as a macro of the runtime's (ram.h does not define it); for a signed compare. `window
+FUNCTION LOW HIGH MACRO ARG...` is an unsigned 16-bit test of a value against LOW-HIGH (HIGH not in it), written
+`MACRO(value, ARG...)` or `!MACRO(...)` for outside; for an unsigned compare: x < HIGH is the window from 0, and 0
+is where an x left of the screen wraps, so the window's start moves left with the side too. The decompiler stops on
+a line the C does not use.
+
+In the game, `runtime/include/game/support.h` defines `SCREEN_LEFT` and `SCREEN_RIGHT` (the board's edges in the
+game's screen x: 0x40 and 0x180 in The Simpsons, 0x60 and 0x1A0 in TMNT), `SCREEN_MORE_LEFT` and `SCREEN_MORE_RIGHT`
+(0 on the board; `screen_more_left` and `screen_more_right` in a port's console build), `PAST_LEFT(margin)`,
+`PAST_RIGHT(margin)` and `X_BETWEEN(x, from, to)`, and `SCREEN_SPAN(left, right)` where the code keeps an x less the
+left limit to compare (The Simpsons').
+
+What is named is removal, stop, keep-in, push-back at an edge or past it. What keeps its number are the places
+inside the screen (a door that opens at the middle, a soldier who turns 0x60 in from the edge), which are the play's
+pace, and what a port decides to keep as the board's (where the Foot soldiers attack from, in TMNT).
+
+The port sets `screen_more_left` and `screen_more_right` to its sides at each frame's end; a function it replaces
+that must keep the board's edges calls the original with them at 0; a replacement the macros now do is dropped.
+
+The check is the scenarios identical (on the board the numbers are the same), and a port's headless check that
+reports the objects put in or gone in the sides' sight, with every area run in each WIDE against 4:3.
+
+## Projects built with it
+
+Each decompilation verified frame by frame against MAME, and its native port:
+
+- **SegaSonic The Hedgehog** (Sega System 32):
+  [segasonic-decomp](https://github.com/cheviman/segasonic-decomp) and
+  [segasonic-port](https://github.com/cheviman/segasonic-port).
+- **OutRunners** (Sega System Multi 32): [outrunners-decomp](https://github.com/cheviman/outrunners-decomp) and
+  [outrunners-port](https://github.com/cheviman/outrunners-port).
+- **Teenage Mutant Ninja Turtles** (Konami's 68000 board):
+  [tmntarcade-decomp](https://github.com/cheviman/tmntarcade-decomp) and
+  [tmnt-port](https://github.com/cheviman/tmnt-port).
+- **The Simpsons** (Konami's 053248 board): [simpsons-decomp](https://github.com/cheviman/simpsons-decomp) and
+  [simpsons-port](https://github.com/cheviman/simpsons-port).
+
+And by others:
+
+- **DonPachi** (Cave, 68000): [DonPachi Recomp](https://github.com/CapsLock4284/DonPachi-Recomp) by CapsLock4284,
+  for Windows and Linux, with the board's slowdown put back cycle for cycle.
+
+Made something with it? Open an issue and it goes on this list.
 
 ## Legal
 
