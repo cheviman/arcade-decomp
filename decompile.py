@@ -1414,7 +1414,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                                          f"code field: {line.strip()}")
     named.drop_unread(texts.values())
     emitter.layouts.drop_unread(texts.values())
-    (out_dir / "ram.h").write_text(
+    ram_h = (
         file_header("ram.h", "the game's variables, tables, board registers and structures")
         + f"#ifndef {game_profile.GUARD}_RAM_H\n#define {game_profile.GUARD}_RAM_H\n\n"
         + "\n".join(named.declarations()) + "\n\n/* data in the program ROM symbols.txt labels */\n"
@@ -1423,7 +1423,16 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         + "\n".join(emitter.layouts.declarations()) + "\n\n"
         + ("\n".join(memory.NOTES.get("state", []) + named.state_declaration()) + "\n\n" if memory.STATE else "")
         + ("\n".join(named.host_declaration()) + "\n\n" if memory.HOST else "")
-        + "#endif\n", encoding="ascii")
+        + "#endif\n")
+    if not memory.UNREAD_ADDRESSES:
+        # (an address no C text, game.h or ram.h's other lines read by its name: no #define NAME_ADDRESS for it)
+        define = re.compile(r"^#define (\w+_ADDRESS) 0x[0-9A-F]+u$")
+        lines = ram_h.splitlines()
+        words = set(re.findall(r"\w+", "\n".join(line for line in lines if not define.match(line))))
+        for text in [*texts.values(), (out_dir / "game.h").read_text(encoding="ascii")]:
+            words.update(re.findall(r"\w+", text))
+        ram_h = "\n".join(line for line in lines if not (found := define.match(line)) or found.group(1) in words) + "\n"
+    (out_dir / "ram.h").write_text(ram_h, encoding="ascii")
     if memory.HOST:
         # (a variable read or written with the next ones at once, AS16(world->x), would take another's bytes in
         # the host's memory: it stays in the work RAM)

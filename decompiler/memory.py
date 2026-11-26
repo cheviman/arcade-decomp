@@ -63,6 +63,9 @@ ROM_NAMES_FROM = 0x1000                      # constants below are numbers, neve
 # that the runtime sets from the game's table registry (table.c: game_tables), read by name (NAME[i]),
 # never through ROM_FUNCTION and the table's address
 LOADED_TABLES = False
+# write a variable's, table's or data label's #define NAME_ADDRESS 0x... in ram.h even when no C text reads it
+# (False: only those the C reads by address)
+UNREAD_ADDRESSES = True
 NOTES = {
     "variables": ["/* the game's variables in work RAM; SCREEN_1 and SCREEN_2 are the blocks of the two screens,",
                   "   which the code reaches through screen (R25 of the task that runs each) */"],
