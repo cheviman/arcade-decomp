@@ -35,6 +35,7 @@ class Z80Cpu:
     FOUR = re.compile(r"(?!)")  # (an address that is no place starts its line as a place does: kept by its kind)
     CODE_KINDS = ("func", "code", "file", "loop", "via")
     DATA_KINDS = ("data", "table", "jumps", "fill")
+    CODE_TABLE_KINDS = ("jumps",)    # (tables of code the analysis follows only by their lines: the second match's)
     FLOW_JUMP = dis.FLOW_JUMP
     FLOW_RETURN = dis.FLOW_RETURN
 

@@ -17,7 +17,9 @@ Usage: python tools/match_version.py VERSION_ROM [--base BASE_ROM] [--out DIR]  
        name went to) and DIR/PREFIXplaces.txt (each base function's and named data's place, and the version's), PREFIX
        the name's before 'symbols.txt' ('sound_' for sound_symbols.txt). DIR is build/versions/SET by default.
        versions/SET/NAME holds the version's own lines, 'drop NAME' for a base function the version has not though
-       its code was paired (its lines are not carried), and 'drop struct NAME' for a structure the version gives its
+       its code was paired (its lines are not carried) or for base data the version has another shape of (a table
+       of more entries: its data, table and jumps lines are not carried, the version's own give it), and 'drop struct
+       NAME' for a structure the version gives its
        own shape (its own struct and field lines then).
 
 A version of a program is mostly the same code, moved: a routine put in or taken out moves everything after it in its
@@ -28,7 +30,9 @@ the program (what the CPU's model says moves: an address loaded, an absolute ope
 three instructions or more of the same shape in both is the same code; between two such runs, as many instructions of
 the same kind in both are too (the same instruction with another constant: a count, a coordinate). A base function no
 run reached is looked for in the whole version by its bytes, with those operands left out, once: a routine moved to
-another bank.
+another bank. A CPU whose analysis follows a table of code only by its line (the Z80's jumps: CODE_TABLE_KINDS) has
+its version analysed and matched again with the tables the first match carried: code of one shape repeated (effect
+after effect) is told apart once the version's analysis has it all, as the base's has.
 
 The data a pair of instructions names (the analysis' named_by: the tables and values the code loads the address of)
 is the same data in both: what the base's instruction names at an address, the version's names at its own. A place of
@@ -40,7 +44,7 @@ instructions {place: instruction}, named_by {place: the places it names}), decod
 functions(analysis), area_of, names_program, shape, kind, kept (which bytes of an instruction do not move),
 target_place, operand_value, cpu_of, bank_of, place_from, FLOW_JUMP and FLOW_RETURN, load_symbols(path), and for the
 symbols' lines: TOKEN (a place in a line), FOUR (an address that is no place: RAM), is_place(value), place_text(place),
-CODE_KINDS and DATA_KINDS.
+CODE_KINDS and DATA_KINDS (and CODE_TABLE_KINDS, if any).
 """
 import importlib
 import re
@@ -465,11 +469,12 @@ def translate(cpu, text, places):
     return cpu.TOKEN.sub(moved, text)
 
 
-def rewrite_symbols(cpu, lines, places, gone, entries=None, structs=()):
+def rewrite_symbols(cpu, lines, places, gone, entries=None, structs=(), data=()):
     """symbols.txt's lines carried to the version: (its lines, the ones that could not be). 'places' maps the base's
     places to the version's, 'gone' names the functions the version does not have; 'entries' gives a function's name
     its base entry, so that a local's sites stay about as far from its function's start as they were; 'structs' names
-    the structures the version gives its own shape (their struct and field lines are not carried). A line that
+    the structures the version gives its own shape (their struct and field lines are not carried), 'data' the named
+    data it gives its own lines for (their place lines are not carried). A line that
     cannot be carried is kept as a comment ('#? ' and the line), and so is a code line whose table of targets was not
     carried"""
     out, review = [], []
@@ -496,7 +501,9 @@ def rewrite_symbols(cpu, lines, places, gone, entries=None, structs=()):
             out.append(translate(cpu, line, places))
         elif cpu.TOKEN.fullmatch(words[0]) and len(words) >= 2 and words[1] in cpu.CODE_KINDS + cpu.DATA_KINDS:
             calls = [word.split("=", 1)[1] for word in words[3:] if word.startswith("calls=")]
-            if int(words[0], 16) in places and not any(table in tables_gone for table in calls):
+            if words[1] in cpu.DATA_KINDS and len(words) > 2 and words[2].split("[")[0] in data:
+                drop(line)
+            elif int(words[0], 16) in places and not any(table in tables_gone for table in calls):
                 out.append(translate(cpu, line, places))
             else:
                 drop(line)
@@ -504,13 +511,19 @@ def rewrite_symbols(cpu, lines, places, gone, entries=None, structs=()):
             out.append(line)
         elif words[0] == "local" and len(words) >= 3:
             where = words[2].split(",")
-            if words[1] in gone or not all(cpu.TOKEN.fullmatch(part) and int(part, 16) in places for part in where)                     or not near_its_start(words[1], where):
+            # (a site 'entry' is the function's entry, wherever it went: it stays as it is)
+            sites = [part for part in where if part != "entry"]
+            if words[1] in gone or not all(cpu.TOKEN.fullmatch(part) and int(part, 16) in places for part in sites) \
+                    or not near_its_start(words[1], sites):
                 drop(line)
                 continue
             start = line.index(words[2], line.index(words[1]) + len(words[1]))
-            moved = ",".join(format(places[int(part, 16)], "06X") for part in where)
+            moved = ",".join(part if part == "entry" else cpu.place_text(places[int(part, 16)]) for part in where)
             out.append(line[:start] + moved + line[start + len(words[2]):])
         elif words[0] in BY_FUNCTION and len(words) >= 2 and words[1] in gone:
+            drop(line)
+        elif words[0] == "scoped" and len(words) >= 3 and words[2] in gone:
+            # (a function's own name for a field of its family: scoped FAMILY FUNCTION OFFSET NAME TYPE)
             drop(line)
         elif words[0] in ("struct", "field") and len(words) >= 2 and words[1] in structs:
             drop(line)
@@ -546,13 +559,15 @@ def carry(match, symbols_lines):
         function = base_functions.get(entry, [])
         first = next((place for place in function if place in match.code), None)
         # (most of the function paired, and only its first few instructions not)
-        if first is None or 2 * sum(1 for place in function if place in match.code) < len(function)                 or function.index(first) > MOVED_ENTRY_MOST:
+        if first is None or 2 * sum(1 for place in function if place in match.code) < len(function) \
+                or function.index(first) > MOVED_ENTRY_MOST:
             return None
         index = bisect_left(version_places, match.code[first])
         start = None
         while index > 0 and match.code[first] - version_places[index - 1] <= 3 * MOVED_ENTRY_MOST:
             previous = version_places[index - 1]
-            if previous in paired or previous + match.version.instructions[previous].length != version_places[index]                     or cpu.area_of(previous) != cpu.area_of(match.code[first]):
+            if previous in paired or previous + match.version.instructions[previous].length != version_places[index] \
+                    or cpu.area_of(previous) != cpu.area_of(match.code[first]):
                 break
             start, index = previous, index - 1
         if start is None or len([place for place in version_places[index:] if place < match.code[first]]) \
@@ -573,7 +588,8 @@ def carry(match, symbols_lines):
         """Whether the version function a base function was paired with can take its name: no other base
         function's first instruction went there or starts there (moved_entry), and its first instruction is new or the
         base function's own"""
-        return target not in entry_places and all(other == entry or found != target for other, found in moved.items())             and (target not in base_of or owner.get(base_of[target]) == entry)
+        return target not in entry_places and all(other == entry or found != target for other, found in moved.items()) \
+            and (target not in base_of or owner.get(base_of[target]) == entry)
 
     gone = set()
     for place, line_kind, name in named:
@@ -634,11 +650,13 @@ def check_own_places(set_name, places, prefix=""):
 
 def carry_program(cpu, set_name, base_image, version_image, name, out):
     """Carries the base's symbols file 'name' (symbols.txt, sound_symbols.txt) to the version: out/name,
-    out/PREFIXreview.txt, out/PREFIXplaces.txt and out/own_NAME (PREFIX: the name's before 'symbols.txt')"""
+    out/PREFIXreview.txt, out/PREFIXplaces.txt, out/own_NAME and, for a CPU with CODE_TABLE_KINDS, out/tables_NAME
+    (PREFIX: the name's before 'symbols.txt')"""
     prefix = name[:-len("symbols.txt")]
     own = ROOT / "versions" / set_name / name
     # the version's own lines; 'drop NAME' takes a base function the version has not, though its code may be
-    # paired (a table's entry past its end that leads elsewhere in the version), with its lines out; 'drop struct
+    # paired (a table's entry past its end that leads elsewhere in the version), with its lines out, or the base's
+    # data of that name, which the version's own lines give another shape (a table of more entries); 'drop struct
     # NAME' a structure the version gives its own shape (its own struct and field lines)
     own_lines = own.read_text(encoding="utf-8").splitlines() if own.exists() else []
     dropped = {line.split()[1] for line in own_lines if len(line.split()) == 2 and line.split()[0] == "drop"}
@@ -649,26 +667,51 @@ def carry_program(cpu, set_name, base_image, version_image, name, out):
     own_path.write_text("\n".join(own_lines) + "\n", encoding="utf-8")
 
     base_path = ROOT / name
-    match = Match(cpu, base_image, cpu.load_symbols(base_path), version_image, cpu.load_symbols(own_path)).run()
+    base_symbols = cpu.load_symbols(base_path)
     lines = base_path.read_text(encoding="utf-8").splitlines()
-    places, gone = carry(match, lines)
     entries = {line.split()[2]: int(line.split()[0], 16) for line in lines
                if len(line.split()) > 2 and cpu.TOKEN.fullmatch(line.split()[0]) and line.split()[1] == "func"}
-    unknown = sorted(dropped - set(entries))
+    data_names = {words[2].split("[")[0] for words in (line.split() for line in lines)
+                  if len(words) > 2 and cpu.TOKEN.fullmatch(words[0]) and words[1] in cpu.DATA_KINDS}
+    unknown = sorted(dropped - set(entries) - data_names)
     if unknown:
-        raise SystemExit(f"versions/{set_name}/{name}: drop of no base function: {', '.join(unknown)}")
-    for function in dropped:
-        places.pop(entries[function], None)
-    gone |= dropped
-    check_own_places(set_name, places, prefix)
+        raise SystemExit(f"versions/{set_name}/{name}: drop of no base function or data: {', '.join(unknown)}")
     unknown = sorted(own_structs - {line.split()[1] for line in lines if line.split()[:1] == ["struct"]})
     if unknown:
         raise SystemExit(f"versions/{set_name}/{name}: drop of no base structure: {', '.join(unknown)}")
-    carried, review = rewrite_symbols(cpu, lines, places, gone, entries, own_structs)
+    dropped_data = dropped - set(entries)
+    dropped -= dropped_data
+
+    def carried_by(version_symbols):
+        match = Match(cpu, base_image, base_symbols, version_image, cpu.load_symbols(version_symbols)).run()
+        places, gone = carry(match, lines)
+        for function in dropped:
+            places.pop(entries[function], None)
+        gone |= dropped
+        return (match, places, gone) + rewrite_symbols(cpu, lines, places, gone, entries, own_structs, dropped_data)
+
+    match, places, gone, carried, review = carried_by(own_path)
+    # (a CPU whose code a table of code reaches that its analysis does not follow without the table's line, the Z80:
+    # the version's analysis with the tables the first match carried, which the version's own lines do not give at
+    # their places, and the match again: code of one shape repeated, effect after effect, is told apart once the
+    # version's analysis has it all, as the base's has; tables_NAME)
+    table_kinds = getattr(cpu, "CODE_TABLE_KINDS", ())
+    if table_kinds:
+        own_tables = {line.split()[0] for line in own_lines if len(line.split()) > 1 and line.split()[1] in table_kinds}
+        tables = [line for line in carried if len(line.split()) > 1 and line.split()[1] in table_kinds
+                  and cpu.TOKEN.fullmatch(line.split()[0]) and line.split()[0] not in own_tables]
+        tables_path = out / f"tables_{name}"
+        tables_path.write_text("\n".join(own_lines + tables) + "\n", encoding="utf-8")
+        match, places, gone, carried, review = carried_by(tables_path)
+    check_own_places(set_name, places, prefix)
 
     header = [f"# {set_name}: generated by tools/match_version.py from {name} (the base set's) and "
               f"versions/{set_name}/{name}; lines '#? ' are the base's the version could not be given"]
-    (out / name).write_text("\n".join(header + carried + own_lines) + "\n", encoding="utf-8")
+    # (an own line the carry gives as well, word for word, once: a base function the version's own lines place, its
+    # code reached by what the version's analysis does not follow without it, and found there by the match)
+    given = {tuple(line.split()) for line in carried if line.split() and not line.startswith("#")}
+    own_out = [line for line in own_lines if line.startswith("#") or tuple(line.split()) not in given]
+    (out / name).write_text("\n".join(header + carried + own_out) + "\n", encoding="utf-8")
 
     # the version's functions no base function's name went to: its own code, to be named
     reached = {places[place] for place in entries.values() if place in places}
@@ -678,7 +721,7 @@ def carry_program(cpu, set_name, base_image, version_image, name, out):
     base_names = {int(line.split()[0], 16): line.split()[2] for line in lines
                   if len(line.split()) > 2 and cpu.TOKEN.fullmatch(line.split()[0]) and line.split()[1] == "func"}
     changed = [f"{cpu.place_text(entry)} -> {cpu.place_text(target)} {base_names.get(entry, '')}"
-               for entry, target in sorted(match.changed.items())]
+               for entry, target in sorted(match.changed.items()) if base_names.get(entry) not in dropped]
     report = [f"{set_name}: {len(match.code)} of {len(match.base.instructions)} base instructions matched "
               f"({len(match.version.instructions)} in the version)"]
     report += [f"  {what}: {count}" for what, count in match.how.items()]
