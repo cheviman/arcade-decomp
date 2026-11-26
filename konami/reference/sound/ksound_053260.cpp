@@ -726,11 +726,16 @@ void on_instruction(ks::offs_t address)
 }
 
 // a data read of the Z80's (not an opcode or an argument fetch): the program ROM's bytes are noted with the
-// instruction that reads them
+// instruction that reads them (the ROM is what the board's sound_offset places in the region: The Simpsons' below
+// C000, Sunset Riders' below F000)
 uint8_t data_read(ks::offs_t address)
 {
-	if (g_record_rom_reads && address < 0xC000u)
-		g_rom_read_set.insert(uint64_t(g_instruction) << 32 | uint32_t(KB(sound_offset)(uint16_t(address))));
+	if (g_record_rom_reads)
+	{
+		const int32_t offset = KB(sound_offset)(uint16_t(address));
+		if (offset >= 0)
+			g_rom_read_set.insert(uint64_t(g_instruction) << 32 | uint32_t(offset));
+	}
 	return KB(z80_read)(uint16_t(address));
 }
 
