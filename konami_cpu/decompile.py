@@ -78,8 +78,8 @@ from . import emit  # noqa: E402
 from . import function as functions  # noqa: E402
 
 ROOT = game_profile.ROOT
-SYMBOLS = ROOT / "symbols.txt"
-REPORTS = ROOT / "build" / "decompile"
+SYMBOLS = game_profile.SYMBOLS
+REPORTS = game_profile.DECOMPILE_REPORTS
 CREATED = getattr(game_profile, "DECOMPILED", "06-11-2026")    # when src/ was first written
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 REGISTERS = {name: index for index, name in functions.KONAMI.register_names.items()}    # param and local lines
@@ -531,7 +531,7 @@ def keyed_names(known):
 def piece_names():
     """{key: name} of the pieces of the program's data the assets hold (assets/data/layout.txt): the names the tables
     the C reads take, so without the file there is no C"""
-    layout = ROOT / "assets" / "data" / "layout.txt"
+    layout = game_profile.ASSETS / "data" / "layout.txt"
     found = {}
     if not layout.exists():
         raise SystemExit(f"{layout} is not there: the C reads the program's data by the names of the assets' pieces")
@@ -634,7 +634,7 @@ def write_index(out_dir, program, built, names, entries, files):
                         callees[entry].add(target)
                         callers[target].add(entry)
     executed = set()
-    for trace in sorted((ROOT / "build" / "scenarios_frames").glob("*/executed.txt")):
+    for trace in sorted(game_profile.FRAME_SCENARIOS.glob("*/executed.txt")):
         for line in trace.read_text(encoding="ascii").splitlines():
             if line and not line.startswith("#"):
                 executed.add(int(line.split()[0], 16))
@@ -952,7 +952,7 @@ def write_c(program, out_dir, variables_path=None, trace=False):
         f"void game_firq(void)\n{{\n\t{names[firq]}();\n}}\n\n"
         + "\n".join(table_registry(named, texts)) + "\n", encoding="ascii")
 
-    reports = REPORTS if out_dir.resolve() == (ROOT / "src").resolve() else out_dir
+    reports = REPORTS if out_dir.resolve() == game_profile.SOURCE.resolve() else out_dir
     reports.mkdir(parents=True, exist_ok=True)
     write_index(reports, program, built, names, entries, files)
     kept = {names.get(entry, ""): text for entry, text in texts.items()}
@@ -981,7 +981,7 @@ def main(arguments):
     global SYMBOLS
     arguments = list(arguments)
     decompiler_emit.CHECKED_JUMPS = "--checks" in arguments
-    out_dir = ROOT / "src"
+    out_dir = game_profile.SOURCE
     variables_path = None
     for option in ("--out", "--symbols", "--variables"):
         if option in arguments:
@@ -1001,7 +1001,7 @@ def main(arguments):
     if not checking:
         piece_names()    # (before the analysis: without the assets' pieces there is no C to write)
     started = time.time()
-    program = load_program(Path(arguments[0]) if arguments else ROOT / "rom")
+    program = load_program(Path(arguments[0]) if arguments else game_profile.ROM)
     print(f"analysis:   {len(program.entries)} functions, {time.time() - started:.0f} s")
     if checking:
         return check(program)

@@ -220,10 +220,14 @@ def residue(image, classes):
     referenced data that runs on to the next known thing), at a bank's end or in a gap between its pieces, the same,
     piece after piece back from its end, as the bytes at their offsets in another bank where they are known (code or
     data), is fill. A run next to bytes the game reads is not, unless only fill follows it to its bank's end: a table
-    the same as another bank's (kept on purpose, the game reads some of it) is that table"""
+    the same as another bank's (kept on purpose, the game reads some of it) is that table. In a version of a program
+    built over an earlier one (the profile's earlier_program: its bytes, all of them explained), the earlier build's
+    bytes at the same place are what its buffer kept too: where the version's code got shorter, what followed is left"""
     size = getattr(game_profile.rom, "RESIDUE_BANK_SIZE", None)
     if not size:
         return
+    earlier = getattr(game_profile, "earlier_program", None)
+    earlier = earlier() if earlier else None
     banks = len(image) // size
     loose = (UNKNOWN, DATA)
     runs = []
@@ -250,9 +254,10 @@ def residue(image, classes):
                 offset = begin % size
                 if offset + place - begin > size:
                     continue
-                if any(image[other:other + place - begin] == image[begin:place]
-                       and any(classes.get(byte, UNKNOWN) not in loose for byte in range(other, other + place - begin))
-                       for other in (each * size + offset for each in range(banks) if each != bank)):
+                if earlier is not None and earlier[begin:place] == image[begin:place] or any(
+                        image[other:other + place - begin] == image[begin:place]
+                        and any(classes.get(byte, UNKNOWN) not in loose for byte in range(other, other + place - begin))
+                        for other in (each * size + offset for each in range(banks) if each != bank)):
                     piece = begin
                     break
             if piece is None:
@@ -436,11 +441,11 @@ def main():
             raise SystemExit(USAGE)
         read_folders.append(arguments[position + 1])
         del arguments[position:position + 2]
-    source = Path(arguments[0]) if arguments else ROOT / "rom"
+    source = Path(arguments[0]) if arguments else getattr(game_profile, "ROM", ROOT / "rom")
 
     image = game_profile.rom.build_program(game_profile.rom.load_set(source))
     executed, _ = disassemble.load_trace(trace_paths)
-    analysis = disassemble.Analysis(image, disassemble.load_symbols(ROOT / "symbols.txt"), executed)
+    analysis = disassemble.Analysis(image, disassemble.load_symbols(getattr(game_profile, "SYMBOLS", ROOT / "symbols.txt")), executed)
     analysis.run()
     # the data the game's engines read, walked from where the code hands it over (the profile's DATA_WALK:
     # a module of the game's tools whose spans(analysis) gives {first: (stop, kind)}) is described data
@@ -452,7 +457,7 @@ def main():
     references = data_references(analysis, reads)
     classes = classify(analysis, references, reads)
 
-    out_dir = ROOT / "build" / "listing"
+    out_dir = getattr(game_profile, "LISTING", ROOT / "build" / "listing")
     out_dir.mkdir(parents=True, exist_ok=True)
     lines = write_coverage(analysis, references, classes, out_dir / "coverage.txt", reads, summing)
     if walked:

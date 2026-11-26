@@ -51,7 +51,7 @@ CPU_REGISTER = getattr(game_profile, "NOISE_REGISTERS", r"r\d+")
 # table holds name their cases after the functions they run); by default, by its variable (jump_target)
 CODE_CASE = re.compile(r"\bcase 0x0[0-9A-F]{5}u:") if getattr(game_profile, "CODE_SWITCH_CASES", False) else None
 BASELINE = ROOT / "tools" / "noise_baseline.txt"
-UNNAMED_ADDRESSES = ROOT / "build" / "decompile" / "unnamed_addresses.txt"
+UNNAMED_ADDRESSES = getattr(game_profile, "DECOMPILE_REPORTS", ROOT / "build" / "decompile") / "unnamed_addresses.txt"
 
 FUNCTION = re.compile(r"^(?:static )?\w[\w ]*?\b(\w+)\((.*)\)$")
 # a result written back through its pointer from the function's variable for it, whole or the part the
@@ -326,7 +326,7 @@ def clean_measure(paths, extra, registers=None, faithful=False):
 
 def main():
     arguments = sys.argv[1:]
-    source = ROOT / "src"
+    source = getattr(game_profile, "SOURCE", ROOT / "src")
     if "--src" in arguments:
         source = Path(arguments[arguments.index("--src") + 1]).resolve()
     sources = sorted(path for path in source.rglob("*.c"))

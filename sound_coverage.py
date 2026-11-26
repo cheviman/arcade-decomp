@@ -56,7 +56,7 @@ from decompiler import cpu  # noqa: E402  (the Z80's register names, for param l
 from z80 import analysis  # noqa: E402
 
 ROOT = game_profile.ROOT
-SYMBOLS = ROOT / "sound_symbols.txt"
+SYMBOLS = getattr(game_profile, "SOUND_SYMBOLS", ROOT / "sound_symbols.txt")
 USAGE = "Usage: python tools/sound_coverage.py [rom folder or .zip] [--trace FILE|FOLDER ...] [--reads FOLDER ...]"
 
 CODE = "code"
@@ -418,7 +418,7 @@ def main():
             del arguments[position:position + 2]
     if len(arguments) > 1 or any(argument.startswith("--") for argument in arguments):
         raise SystemExit(USAGE)
-    source = Path(arguments[0]) if arguments else ROOT / "rom"
+    source = Path(arguments[0]) if arguments else getattr(game_profile, "ROM", ROOT / "rom")
 
     image = game_profile.rom.build_sound(game_profile.rom.load_set(source))
     program = analysis.load_program(image, SYMBOLS)
@@ -430,7 +430,7 @@ def main():
     reads, summing = load_reads(read_folders, program.code_end) if read_folders else (None, None)
     lines = report(program, description, classes, executed, reads, summing)
 
-    out_dir = ROOT / "build" / "listing"
+    out_dir = getattr(game_profile, "LISTING", ROOT / "build" / "listing")
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "sound_coverage.txt").write_text("\n".join(lines) + "\n", encoding="ascii")
     # on the screen: the counts, and from the unknown runs on (the first 10 of them), not the pieces

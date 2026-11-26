@@ -28,10 +28,10 @@ Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-o
   --jobs N        run N scripts at a time (half the processors by default)
   --bin DIR       the executables to run (build/bin by default): another build of the game
   --out DIR       where the runs go (build/scenarios by default)
-  --set SET       another version of the game (a set the game's ROM module knows, rom/SET.zip): its scripts
-                  are tests/controls/SET, its runs go to build/scenarios_SET by default, the reference runs
-                  its ROM (--rom), and the static analysis runs on its program with its symbols
-                  (build/versions/SET/symbols.txt, tools/match_version.py)
+  --set SET       another version of the game (a set the game's ROM module knows, rom/SET.zip; the game's profile
+                  takes it): its scripts are tests/controls/SET, its runs go to build/scenarios_SET by default, the
+                  reference runs its ROM (--rom) with its sound timing, and the static analysis runs on its program
+                  with its symbols (build/versions/SET/symbols.txt, tools/match_version.py)
 
 For every script: the reference (build/bin/s32ref, or the profile's REFERENCE) writes
 build/scenarios/NAME/{executed,called,hashes}.txt, the game (build/bin/GAME_game_headless, from
@@ -61,13 +61,16 @@ if STATIC_ANALYSIS:
     disassemble = importlib.import_module(getattr(game_profile, "ANALYSIS", "disassemble"))
     dis = importlib.import_module(getattr(game_profile, "DISASSEMBLER", "v60.disassembler"))
 
-CONTROLS = ROOT / "tests" / "controls"
-RESULTS = ROOT / "build" / "scenarios"
-# the version run (--set): its ROM for the reference and the analysis, and its symbols
-VERSION_ROM = None
-SYMBOLS = ROOT / "symbols.txt"
+# (a version of the game, --set SET, which the game's profile takes from the command line and gives its scripts, runs,
+# ROM, symbols and sound timing for: the profile's CONTROLS, SCENARIOS, ROM, SYMBOLS and SOUND_TIMING)
+VERSION = getattr(game_profile, "VERSION", False)
+CONTROLS = getattr(game_profile, "CONTROLS", ROOT / "tests" / "controls")
+RESULTS = getattr(game_profile, "SCENARIOS", ROOT / "build" / "scenarios")
+# the version's ROM for the reference and the analysis, and its symbols
+VERSION_ROM = game_profile.ROM if VERSION else None
+SYMBOLS = getattr(game_profile, "SYMBOLS", ROOT / "symbols.txt")
 BIN = ROOT / "build" / "bin"
-SOUND_TIMING = ROOT / "build" / "sound" / "timing.txt"
+SOUND_TIMING = getattr(game_profile, "SOUND_TIMING", ROOT / "build" / "sound" / "timing.txt")
 # what the reference takes to run as the game runs, for the comparison (mdref: --timing frames; kref and s32ref
 # do by default); the runs on the reference alone keep its own pace
 REFERENCE_OPTIONS = list(getattr(game_profile, "REFERENCE_OPTIONS", []))
@@ -195,16 +198,9 @@ def reference_only(names, jobs, video, sound):
 
 
 def main():
-    global BIN, RESULTS, CONTROLS, VERSION_ROM, SYMBOLS
+    global BIN, RESULTS
     arguments = sys.argv[1:]
-    if "--set" in arguments:
-        position = arguments.index("--set")
-        version = arguments[position + 1]
-        del arguments[position:position + 2]
-        CONTROLS = CONTROLS / version
-        RESULTS = ROOT / "build" / f"scenarios_{version}"
-        VERSION_ROM = ROOT / "rom" / f"{version}.zip"
-        SYMBOLS = ROOT / "build" / "versions" / version / "symbols.txt"
+    if VERSION:
         for needed in (CONTROLS, VERSION_ROM, SYMBOLS):
             if not needed.exists():
                 raise SystemExit(f"{needed}: not found")

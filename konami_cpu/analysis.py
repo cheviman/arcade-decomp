@@ -859,7 +859,8 @@ class Analysis:
         """What the coverage (the core's coverage.py) reads: every byte of code -> the place of its instruction
         (owner), the places of the code addresses of the tables (data_words, -> the place each holds), the data
         fields of the tables symbols.txt describes (data_fields), and the bytes whose layout is known (described):
-        the vectors, the tables of code and the bytes of the tables of banks read with them"""
+        the vectors, the tables of code and the bytes of the tables of banks read with them; and the fill symbols.txt
+        names ('ADDRESS fill BYTES': a byte left between two routines, which no other bank repeats)"""
         self.owner = {}
         self.data_words = dict(self.entry_fields)
         self.data_fields = {}
@@ -876,6 +877,9 @@ class Analysis:
         self.described += [(place, place + 1) for place in sorted(self.bank_entries)]
         for address, symbol in self.symbols.items():
             layout = symbol.layout
+            if symbol.kind == "fill":
+                self.fill.append((address, address + int(symbol.name, 0)))
+                continue
             if symbol.kind != "data" or layout is None or layout.count is None:
                 continue
             bank = bank_of(address)
@@ -965,13 +969,13 @@ def main():
             position = arguments.index(option)
             options[option] = Path(arguments[position + 1])
             del arguments[position:position + 2]
-    source = Path(arguments[0]) if arguments else ROOT / "rom"
+    source = Path(arguments[0]) if arguments else game_profile.ROM
     image = rom.build_program(rom.load_set(source))
-    symbols_path = options.get("--symbols", ROOT / "symbols.txt")
+    symbols_path = options.get("--symbols", game_profile.SYMBOLS)
     symbols = load_symbols(symbols_path) if symbols_path.exists() else {}
     analysis = Analysis(image, symbols)
     analysis.run()
-    out = options.get("--out", ROOT / "build" / "listing")
+    out = options.get("--out", game_profile.LISTING)
     out.mkdir(parents=True, exist_ok=True)
     write_listing(analysis, out / f"{game_profile.BINARY}.s")
     executed = load_trace(traces)[0] if traces else None

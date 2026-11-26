@@ -76,9 +76,10 @@ from z80 import function as functions  # noqa: E402
 from z80 import lift  # noqa: E402
 from z80 import pairs  # noqa: E402
 
-SYMBOLS = ROOT / "sound_symbols.txt"
-ROM_SET = ROOT / "rom"
-REPORTS = ROOT / "build" / "sound"    # the listing and the index naming works from
+SYMBOLS = getattr(game_profile, "SOUND_SYMBOLS", ROOT / "sound_symbols.txt")
+ROM_SET = getattr(game_profile, "ROM", ROOT / "rom")
+REPORTS = getattr(game_profile, "SOUND_REPORTS", ROOT / "build" / "sound")    # the listing and the index naming works from
+SOURCE = getattr(game_profile, "SOURCE", ROOT / "src")    # (the sound program's C goes to its sound/)
 INTERRUPT_HANDLER = 0x0038
 # when the C was first written (the profile's SOUND_CREATED; System 32's by default); the files say when it was
 # last written too
@@ -532,7 +533,7 @@ def write_c(program, out_dir, variables_path=None):
     if variables_path is not None:
         write_variables(variables_path, writers, names, texts)
     # the reports of the sound program's source go beside the build; those of another copy, with it
-    reports = REPORTS if out_dir.resolve() == (ROOT / "src" / "sound").resolve() else out_dir
+    reports = REPORTS if out_dir.resolve() == (SOURCE / "sound").resolve() else out_dir
     reports.mkdir(parents=True, exist_ok=True)
     write_reports(program, built, flow, names, reports)
 
@@ -747,7 +748,7 @@ def write_timing(program, path):
 def main():
     global SYMBOLS
     arguments = sys.argv[1:]
-    out_dir = ROOT / "src" / "sound"
+    out_dir = SOURCE / "sound"
     if "--out" in arguments:
         position = arguments.index("--out")
         out_dir = Path(arguments[position + 1])
@@ -763,7 +764,7 @@ def main():
         del arguments[position:position + 2]
     from decompiler import emit as decompiler_emit
     decompiler_emit.CHECKED_JUMPS = "--checks" in arguments
-    timing_path = ROOT / "build" / "sound" / "timing.txt"
+    timing_path = getattr(game_profile, "SOUND_TIMING", ROOT / "build" / "sound" / "timing.txt")
     if "--timing" in arguments:
         position = arguments.index("--timing")
         timing_path = Path(arguments[position + 1])

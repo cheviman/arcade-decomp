@@ -38,7 +38,7 @@ import game_profile  # noqa: E402  (the game's: its root, its ROM set, its setti
 ROOT = game_profile.ROOT
 from v60 import disassembler as dis  # noqa: E402
 
-SYMBOL_KINDS = ("func", "code", "data")
+SYMBOL_KINDS = ("func", "code", "data", "fill")    # (fill: bytes no code or data is, 'ADDRESS fill BYTES')
 FORK = -1                       # a record kind (kinds=) that ends its array with a table of arrays
 STACK_POINTER = 31
 MAX_RECORDS = 4096

@@ -105,6 +105,12 @@ def load_symbols(path):
     return symbols
 
 
+# a program read without all its symbols (another version's, while its own are carried over to it: z80/versions.py):
+# a table of code addresses with no length gives no entries, and a jump that goes nowhere known is left, instead of
+# stopping the analysis
+LENIENT = False
+
+
 @dataclass
 class Analysis:
     instructions: dict = field(default_factory=dict)     # address -> dis.Instruction
@@ -277,7 +283,7 @@ class Program:
             if not new:
                 break
         for address, instruction in analysis.instructions.items():
-            if instruction.flow == dis.FLOW_JUMP and instruction.target is None \
+            if instruction.flow == dis.FLOW_JUMP and instruction.target is None and not LENIENT \
                     and address not in analysis.jump_tables and address not in analysis.slot_jumps:
                 raise SystemExit(f"{address:04X}: {instruction.text} goes where neither sound_symbols.txt nor "
                                  "what the registers hold says")
@@ -285,6 +291,8 @@ class Program:
     def code_table(self, start, user):
         """The entries of the table of code addresses at 'start', which 'user' goes through"""
         symbol = self.symbols.get(start)
+        if (symbol is None or symbol.kind != "jumps") and LENIENT:
+            return []
         if symbol is None or symbol.kind != "jumps":
             raise SystemExit(f"the table of code addresses at {start:04X} ({user}) has no length in "
                              "sound_symbols.txt")

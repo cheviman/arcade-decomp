@@ -302,16 +302,16 @@ class FunctionWriter:
 def main(arguments):
     if not FRAME_WAITS or FIRQ_POINT is None:
         raise SystemExit("game_profile.py: no FRAME_WAITS or FIRQ_POINT (where the program waits for its frame)")
-    source = Path(arguments[0]) if arguments else ROOT / "rom"
+    source = Path(arguments[0]) if arguments else game_profile.ROM
     image = game_profile.rom.build_program(game_profile.rom.load_set(source))
-    symbols = analysis.load_symbols(ROOT / "symbols.txt")
+    symbols = analysis.load_symbols(game_profile.SYMBOLS)
     program = Program(image, symbols)
     missing = [place for place in FRAME_WAITS | {FIRQ_POINT} if place not in program.placed]
     if missing:
         raise SystemExit(f"game_profile.py: {', '.join(f'{place:06X}' for place in missing)} no instruction of the "
                          "program")
 
-    out_dir = ROOT / "build" / "generated"
+    out_dir = game_profile.GENERATED
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("program_*.c"):
         old.unlink()
