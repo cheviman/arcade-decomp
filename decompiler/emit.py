@@ -3301,8 +3301,25 @@ class FunctionWriter:
 
     def nodes(self, nodes, depth):
         lines = []
+        run = []    # consecutive blocks of straight code: one run for the reroll (a block a step of 256 LDIs)
         for position, node in enumerate(nodes):
+            if self.emitter.reroll and isinstance(node, structure.Code) and not self.emitter.trace:
+                run += self.code_lines(node)
+                continue
+            if run:
+                lines += ["\t" * depth + line for line in rerolled(run)]
+                run = []
             lines += self.node(node, depth, position == len(nodes) - 1)
+        if run:
+            lines += ["\t" * depth + line for line in rerolled(run)]
+        return lines
+
+    def code_lines(self, node):
+        """A block's statements, as written (an assignment of a variable to itself, two registers that hold one
+        variable, does nothing and is left out)"""
+        lines = []
+        for statement in node.statements:
+            lines += [line for line in self.statement(statement) if not SELF_ASSIGNMENT.fullmatch(line)]
         return lines
 
     def node(self, node, depth, last):

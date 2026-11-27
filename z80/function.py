@@ -5,7 +5,7 @@ Name:        function.py
 Description: the sound program's functions as control-flow graphs of IR blocks, with the time they take
 Version:     0.1.0
 Created:     13-10-2026
-Modified:    21-10-2026
+Modified:    27-11-2026
 Author:      Sebastian Toyos
 
 Takes the functions tools/z80/analysis.py splits the program into, lifts every instruction to IR
@@ -17,7 +17,11 @@ fetches up to it); a
 condition that sends a JR, DJNZ, CALL or RET the long way adds its extra cycles on that way
 (Effect("z80_cycles")). A block ends after every call, so a callee starts when its caller's time says.
 DI and EI become Effects; EI as the last instruction of a block delays interrupts by that block start,
-as the Z80 delays them by one instruction.
+as the Z80 delays them by one instruction. A run of block steps written out one by one (LDI, LDD and the
+like, two or more in a row: SegaSonic's copy_sample_page is 256 LDIs, 4106 cycles) is a block a step: the
+Z80 takes interrupts between any two of them, and a run in one block would hold the timer's interrupt past
+its next period, whose tick is then lost (the music slower than MAME's: SegaSonic's player report,
+27-11-2026).
 
 The main loop's top (the "loop" line of sound_symbols.txt) is where the program waits for the board:
 every way into it returns to the board, which calls it again while the board's time is ahead.
@@ -30,6 +34,7 @@ from . import lift
 from . import timing
 
 CONDITIONS = ("nz", "z", "nc", "c", "po", "pe", "p", "m")
+STEPS = ("ldi", "ldd", "cpi", "cpd", "ini", "ind", "outi", "outd")    # one step of a block move or block I/O
 
 
 def condition(name):
@@ -47,16 +52,21 @@ def is_stack_swap(instruction):
 
 def leaders(program):
     """Where blocks start, the same for every function and for the reference's timing (s32ref reads them):
-    entries, every target, and the instruction after anything that branches, jumps, returns or calls."""
+    entries, every target, the instruction after anything that branches, jumps, returns or calls, and every
+    step of a run of block steps (STEPS, two or more in a row: the Z80 takes interrupts between them)."""
+    instructions = program.analysis.instructions
     found = set(program.entries)
-    for address, instruction in program.analysis.instructions.items():
+    for address, instruction in instructions.items():
         following = (address + instruction.length) & 0xFFFF
         for target in program.successors(instruction):
             if target != following:
                 found.add(target)
         if instruction.flow in (dis.FLOW_BRANCH, dis.FLOW_JUMP, dis.FLOW_RETURN, dis.FLOW_CALL):
             found.add(following)
-    return found & set(program.analysis.instructions)
+        if instruction.mnemonic in STEPS and following in instructions and instructions[following].mnemonic in STEPS:
+            found.add(address)
+            found.add(following)
+    return found & set(instructions)
 
 
 class Builder:
