@@ -95,6 +95,8 @@ def configure():
     memory.HOST = None
     memory.HOST_VARIABLES = frozenset()
     memory.HOST_SYNCED = frozenset()
+    memory.ROM_FIELDS = frozenset()
+    memory.ROM_FIELD_SYNCS = frozenset()
 
 
 def build_functions(program):

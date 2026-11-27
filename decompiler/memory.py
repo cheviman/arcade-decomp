@@ -104,6 +104,17 @@ HOST_SYNCED = frozenset()
 # into game_functions[]) and the generated projection (src/projection.c) puts the address in its place for the
 # state's hash. Empty: off
 CODE_FIELDS = frozenset()
+# the scoped fields of the state's objects that hold an address in the program ROM ("struct.family.member", a
+# scoped field whose target is a ROM structure or elements kind): the C keeps a typed pointer for each in the
+# object's host part (union object_host in struct HOST, reached with host_of(object)), and the generated projection
+# puts the address the original holds into the object's bytes by the family of its handler. Needs HOST and
+# CODE_FIELDS. Empty: off
+ROM_FIELDS = frozenset()
+# (function, name): the clears of an object's bytes the C follows by making the object's host part again from
+# its bytes: after each call of the function or helper 'name' in 'function', the object at the call's first
+# argument (an address: object_sync_at), and after each store of struct object's own member 'name' there (the last
+# of a clear the code makes itself, start_object's slot), that object (object_sync)
+ROM_FIELD_SYNCS = frozenset()
 # the program ROM's tables that hold only code: a named table of 32-bit elements with a count, every word the
 # entry of a function the state's code fields may hold. The C keeps them as arrays of the functions'
 # numbers (enum game_function) in table.c, not as tables the assets supply. Needs CODE_FIELDS. False: off

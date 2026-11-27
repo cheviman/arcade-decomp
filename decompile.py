@@ -1081,6 +1081,63 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     else:
         emitter.code_addresses = {address: names[address] + "_ADDRESS" for address in table
                                   if address >= 0x1000 and address in names}
+    if memory.CODE_FIELDS and memory.HOST:
+        nested = emitter.layouts.nested
+
+        def loop_index(depth):
+            return "index" if depth == 0 else f"index_{depth + 1}"
+
+        def places(struct, target, text, count, loops):
+            """(C expression, enclosing loop bounds) of each place 'struct' holds a 'target' in: an array at
+            any level is a loop of its own."""
+            if count and count > 1:
+                text, loops = f"{text}[{loop_index(len(loops))}]", loops + [count]
+            if struct == target:
+                return [(text, loops)]
+            found = []
+            for _offset, (name, inner, inner_count) in sorted(nested.get(struct, {}).items()):
+                found += places(inner, target, f"{text}.{name}", inner_count, loops)
+            return found
+    if memory.ROM_FIELDS:
+        if memory.HOST is None:
+            raise SystemExit("ROM_FIELDS: the projection that puts the addresses back is HOST's (memory.HOST)")
+        if not memory.CODE_FIELDS:
+            raise SystemExit("ROM_FIELDS: an object's family comes from its handler, a code field (memory.CODE_FIELDS)")
+        rom_fields = []
+        for entry in sorted(memory.ROM_FIELDS):
+            parts = entry.split(".")
+            if len(parts) != 3:
+                raise SystemExit(f"ROM_FIELDS: {entry} is no struct.family.member")
+            struct, family, member = parts
+            if struct != "object":
+                raise SystemExit(f"ROM_FIELDS: {entry} is no struct.family.member")
+            scoped = emitter.layouts.scoped.get("object", {}).get(family, {})
+            offset = None
+            for off, (name, _bits, _signed) in scoped.items():
+                if name == member:
+                    offset = off
+                    break
+            if offset is None:
+                raise SystemExit(f"ROM_FIELDS: {entry} is no scoped field")
+            if offset % 4:
+                raise SystemExit(f"ROM_FIELDS: {entry} is no scoped field")
+            target = pointers.SCOPED_TARGETS.get(("object", family, offset))
+            if target is None or target[1] != 32:
+                raise SystemExit(f"ROM_FIELDS: {entry} holds no 32-bit link")
+            link = target[0]
+            kind = pointers.link_kind(link)
+            if kind[0] not in pointers.ROM_STRUCTS:
+                raise SystemExit(f"ROM_FIELDS: {entry} points at no ROM structure")
+            bias = kind[1]
+            ctype = emitter.pointer_ctype(kind[0])
+            rom_fields.append((family, member, offset, ctype, bias))
+        rom_fields.sort(key=lambda f: (f[0], f[2]))
+        rom_families = sorted(set(f[0] for f in rom_fields))
+        emitter.rom_fields = rom_fields
+    else:
+        rom_fields = []
+        rom_families = []
+        emitter.rom_fields = []
     if memory.CODE_TABLES:
         # (a table of code holds functions' numbers: nothing of it is ROM data the assets supply)
         if not memory.CODE_FIELDS:
@@ -1317,6 +1374,11 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
     for entry in set(joined) | set(redispatched) | split:
         if entry in texts and emitter.shared_results.get(emitter.names.get(entry)):
             texts[entry] = writers[entry].write()
+    for function, name in sorted(memory.ROM_FIELD_SYNCS):
+        # (a pair that syncs nothing: a name misspelt, or a clear the C writes another way)
+        lines = next((texts[entry] for entry in texts if emitter.names.get(entry) == function), "").splitlines()
+        if not any(name in line and after.strip().startswith("object_sync") for line, after in zip(lines, lines[1:])):
+            raise SystemExit(f"ROM_FIELD_SYNCS: ({function}, {name}): {function} has no {name} with a sync after it")
     if variables_path is not None:
         write_variables(variables_path, writers, names, texts)
     if fields_path is not None:
@@ -1414,6 +1476,60 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                                          f"code field: {line.strip()}")
     named.drop_unread(texts.values())
     emitter.layouts.drop_unread(texts.values())
+    object_places = []
+    if rom_fields and memory.HOST:
+        object_roots = [(block_struct, f"{memory.STATE}->{name}", count)
+                        for _address, name, block_struct, count in memory.STATE_BLOCKS
+                        if block_struct is not None]
+        object_roots += [(inner, f"{memory.STATE}->{name}", count)
+                         for _offset, (name, inner, count) in sorted(nested.get(memory.STATE, {}).items())]
+        for block_struct, text, count in object_roots:
+            object_places += places(block_struct, "object", text, count, [])
+    host_lines = named.host_declaration() if memory.HOST else []
+    if rom_fields and memory.HOST:
+        union_lines = [
+            "/* an object's fields that hold an address in the program ROM, as the pointers the C keeps (memory.ROM_FIELDS):",
+            "   each family's in the slot of its offset in the object (offset / 4), so that two families' fields at the",
+            "   same bytes share a slot as they share the bytes; host_of(object) is the object's, and the projection puts",
+            "   the addresses into the object's bytes by its handler's family */",
+            "union object_host",
+            "{",
+        ]
+        for family in rom_families:
+            family_fields = sorted(((m, o, c) for f, m, o, c, b in rom_fields if f == family), key=lambda x: x[1])
+            union_lines.append("\tstruct")
+            union_lines.append("\t{")
+            prev_end = 0
+            for member, offset, ctype in family_fields:
+                slot = offset // 4
+                if slot > prev_end:
+                    union_lines.append(f"\t\tconst void *unused_{prev_end:X}[0x{slot - prev_end:X}];")
+                union_lines.append(f"\t\t{ctype}{member};")
+                prev_end = slot + 1
+            union_lines.append("\t} " + family + ";")
+        union_lines.append("};")
+        world_members = []
+        for text, loops in object_places:
+            if len(loops) > 1:
+                raise SystemExit("ROM_FIELDS: nested object arrays are not supported")
+            base = text.split("[")[0]
+            name = base.partition("->")[2].replace(".", "_")
+            if loops:
+                world_members.append(f"\tunion object_host {name}[0x{loops[0]:X}];")
+            else:
+                world_members.append(f"\tunion object_host {name};")
+        declarations = [
+            "union object_host *object_host(const struct object *object);",
+            "#define host_of(record) _Generic((record), struct object *: object_host, const struct object *: object_host)(record)",
+            "void object_sync(const struct object *object);",
+            "void object_sync_at(uint32_t address);",
+        ]
+        host_lines = union_lines + [""] + host_lines
+        struct_idx = host_lines.index(f"struct {memory.HOST}")
+        close_idx = host_lines.index("};", struct_idx)
+        host_lines[close_idx:close_idx] = world_members
+        clear_idx = host_lines.index(f"void {memory.HOST}_clear(void);")
+        host_lines[clear_idx + 1:clear_idx + 1] = declarations
     ram_h = (
         file_header("ram.h", "the game's variables, tables, board registers and structures")
         + f"#ifndef {game_profile.GUARD}_RAM_H\n#define {game_profile.GUARD}_RAM_H\n\n"
@@ -1422,7 +1538,7 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
         + "\n".join(numbers) + "\n\n/* the game's structures in work RAM */\n"
         + "\n".join(emitter.layouts.declarations()) + "\n\n"
         + ("\n".join(memory.NOTES.get("state", []) + named.state_declaration()) + "\n\n" if memory.STATE else "")
-        + ("\n".join(named.host_declaration()) + "\n\n" if memory.HOST else "")
+        + ("\n".join(host_lines) + "\n\n" if memory.HOST else "")
         + "#endif\n")
     if not memory.UNREAD_ADDRESSES:
         # (an address no C text, game.h or ram.h's other lines read by its name: no #define NAME_ADDRESS for it)
@@ -1548,23 +1664,6 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                 "\treturn number != NO_FUNCTION ? number : address;",
                 "}", ""]
         if memory.HOST:
-            nested = emitter.layouts.nested
-
-            def loop_index(depth):
-                return "index" if depth == 0 else f"index_{depth + 1}"
-
-            def places(struct, target, text, count, loops):
-                """(C expression, enclosing loop bounds) of each place 'struct' holds a 'target' in: an array at
-                any level is a loop of its own."""
-                if count and count > 1:
-                    text, loops = f"{text}[{loop_index(len(loops))}]", loops + [count]
-                if struct == target:
-                    return [(text, loops)]
-                found = []
-                for _offset, (name, inner, inner_count) in sorted(nested.get(struct, {}).items()):
-                    found += places(inner, target, f"{text}.{name}", inner_count, loops)
-                return found
-
             def conversions(function):
                 """C lines converting each code field of the state's records through 'function'."""
                 lines = []
@@ -1595,6 +1694,129 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                             lines.append(f"{indent}{place}.{member} = {function}({place}.{member});")
                 return lines
 
+            if rom_fields:
+                proj_block = [
+                    "/* the families of the objects' fields that hold an address in the program ROM (memory.ROM_FIELDS), and the one",
+                    "   of each function of game_functions[]: the family its name starts with (an object's handler says which",
+                    "   family's fields the object holds) */",
+                    "enum object_family",
+                    "{",
+                    "\tOBJECT_FAMILY_NONE,",
+                ]
+                for family in rom_families:
+                    proj_block.append(f"\tOBJECT_FAMILY_{family},")
+                proj_block.append("};")
+                proj_block.append("")
+                proj_block.append("static const uint8_t function_families[FUNCTION_COUNT] =")
+                proj_block.append("{")
+                for address in table:
+                    if address in names:
+                        family = emitter.family_of(address, "object")
+                        if family in rom_families:
+                            proj_block.append(f"\t[FUNCTION_{names[address]}] = OBJECT_FAMILY_{family},")
+                proj_block.append("};")
+                proj_block.append("")
+                proj_block.append("/* the address the original holds for a pointer into the program's data, 'bias' bytes into the record it")
+                proj_block.append("   points at (0 for none) */")
+                proj_block.append("static uint32_t rom_address(const void *pointer, uint32_t bias)")
+                proj_block.append("{")
+                proj_block.append("\treturn pointer == NULL ? 0u : address_of(pointer) + bias;")
+                proj_block.append("}")
+                proj_block.append("")
+                proj_block.append("/* the pointer for such an address: the record 'bias' bytes before it (none for 0) */")
+                proj_block.append("static const void *rom_place(uint32_t address, uint32_t bias)")
+                proj_block.append("{")
+                proj_block.append("\treturn address == 0u ? NULL : rom_pointer(address - bias);")
+                proj_block.append("}")
+                proj_block.append("")
+                proj_block.append("/* the family of an object's handler (OBJECT_FAMILY_NONE for a number that is no function's) */")
+                proj_block.append("static unsigned object_family(const struct object *object)")
+                proj_block.append("{")
+                proj_block.append("\treturn object->handler < FUNCTION_COUNT ? function_families[object->handler] : OBJECT_FAMILY_NONE;")
+                proj_block.append("}")
+                proj_block.append("")
+                proj_block.append("/* an object's ROM fields into its bytes, by its handler's family: the addresses the original holds there */")
+                proj_block.append("static void object_project(struct object *object, const union object_host *host)")
+                proj_block.append("{")
+                proj_block.append("\tswitch (object_family(object))")
+                proj_block.append("\t{")
+                for family in rom_families:
+                    proj_block.append(f"\tcase OBJECT_FAMILY_{family}:")
+                    for member, offset, ctype, bias in sorted(
+                            ((m, o, c, b) for f, m, o, c, b in rom_fields if f == family), key=lambda x: x[1]):
+                        proj_block.append(f"\t\tobject->{family}.{member} = rom_address(host->{family}.{member}, {bias}u);")
+                    proj_block.append("\t\tbreak;")
+                proj_block.append("\tdefault:")
+                proj_block.append("\t\tbreak;")
+                proj_block.append("\t}")
+                proj_block.append("}")
+                proj_block.append("")
+                proj_block.append("/* and back: the pointers of its family's fields from its bytes, every other slot none (an object started")
+                proj_block.append("   again by its bytes keeps nothing of the one before) */")
+                proj_block.append("static void object_unproject(const struct object *object, union object_host *host)")
+                proj_block.append("{")
+                proj_block.append("\tmemset(host, 0, sizeof *host);")
+                proj_block.append("\tswitch (object_family(object))")
+                proj_block.append("\t{")
+                for family in rom_families:
+                    proj_block.append(f"\tcase OBJECT_FAMILY_{family}:")
+                    for member, offset, ctype, bias in sorted(
+                            ((m, o, c, b) for f, m, o, c, b in rom_fields if f == family), key=lambda x: x[1]):
+                        proj_block.append(f"\t\thost->{family}.{member} = rom_place(object->{family}.{member}, {bias}u);")
+                    proj_block.append("\t\tbreak;")
+                proj_block.append("\tdefault:")
+                proj_block.append("\t\tbreak;")
+                proj_block.append("\t}")
+                proj_block.append("}")
+                proj_block.append("")
+                proj_block.append("/* the host part of an object of the state's (host_of): its union object_host in struct "
+                                  + memory.HOST + ", by its place */")
+                proj_block.append("union object_host *object_host(const struct object *object)")
+                proj_block.append("{")
+                proj_block.append("\tconst uintptr_t place = (uintptr_t)object;")
+                proj_block.append("")
+                for text, loops in object_places:
+                    if loops:
+                        base = text.split("[")[0]
+                        name = base.partition("->")[2].replace(".", "_")
+                        proj_block.append(f"\tif (place - (uintptr_t){base} < sizeof {base})")
+                        proj_block.append(f"\t\treturn &{memory.HOST}->{name}[(place - (uintptr_t){base}) / sizeof (struct object)];")
+                    else:
+                        name = text.partition("->")[2].replace(".", "_")
+                        proj_block.append(f"\tif (object == &{text})")
+                        proj_block.append(f"\t\treturn &{memory.HOST}->{name};")
+                proj_block.append("\tboard_outside(address_of(object));")
+                proj_block.append("}")
+                proj_block.append("")
+                proj_block.append("/* an object's host part made again from its bytes, after code wrote them without its family's names: a link")
+                proj_block.append("   a spawner stores (its parameter, its list_data) or the clear of a new object's (start_object's) */")
+                proj_block.append("void object_sync(const struct object *object)")
+                proj_block.append("{")
+                proj_block.append("\tobject_unproject(object, object_host(object));")
+                proj_block.append("}")
+                proj_block.append("")
+                proj_block.append("/* the same for the object at an address, after a clear of its bytes by address (memory.ROM_FIELD_SYNCS) */")
+                proj_block.append("void object_sync_at(uint32_t address)")
+                proj_block.append("{")
+                proj_block.append("\tobject_sync((const struct object *)ram(address));")
+                proj_block.append("}")
+                proj_block.append("")
+                proj += proj_block
+            object_project_lines = []
+            object_unproject_lines = []
+            if rom_fields:
+                for text, loops in object_places:
+                    if loops:
+                        base = text.split("[")[0]
+                        name = base.partition("->")[2].replace(".", "_")
+                        object_project_lines.append(f"\tfor (size_t index = 0; index < 0x{loops[0]:X}; index++)")
+                        object_project_lines.append(f"\t\tobject_project(&{text}, &{memory.HOST}->{name}[index]);")
+                        object_unproject_lines.append(f"\tfor (size_t index = 0; index < 0x{loops[0]:X}; index++)")
+                        object_unproject_lines.append(f"\t\tobject_unproject(&{text}, &{memory.HOST}->{name}[index]);")
+                    else:
+                        name = text.partition("->")[2].replace(".", "_")
+                        object_project_lines.append(f"\tobject_project(&{text}, &{memory.HOST}->{name});")
+                        object_unproject_lines.append(f"\tobject_unproject(&{text}, &{memory.HOST}->{name});")
             proj += named.host_projection()
             proj.append("")
             for index, line in enumerate(proj):
@@ -1602,14 +1824,20 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                     end = index
                     while proj[end] != "}":
                         end += 1
-                    proj[end:end] = conversions("function_address")
+                    if rom_fields:
+                        proj[end:end] = object_project_lines + conversions("function_address")
+                    else:
+                        proj[end:end] = conversions("function_address")
                     break
             for index, line in enumerate(proj):
                 if line == f"void {memory.HOST}_unproject(void)":
                     start = index
                     while proj[start] != "{":
                         start += 1
-                    proj[start + 1:start + 1] = conversions("address_function")
+                    if rom_fields:
+                        proj[start + 1:start + 1] = conversions("address_function") + object_unproject_lines
+                    else:
+                        proj[start + 1:start + 1] = conversions("address_function")
                     break
         (out_dir / "projection.c").write_text("\n".join(proj) + "\n", encoding="ascii")
     branches = sum(isinstance(block.end, ir.Branch) for function in built.values() for block in function.blocks.values())

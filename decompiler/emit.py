@@ -326,6 +326,9 @@ class Names:
         """(C text, signed) for memory with a name, or None. A read of several fields' bytes at once is
         those fields put together (composed_read)."""
         found = self.writer.memory(load.address, load.bits, id(load))
+        if found is not None and self.writer.emitter.rom_fields \
+                and self.writer.rom_field(found[0]) is not None:
+            raise SystemExit(f"ROM_FIELDS: {self.writer.function.name}: {found[0]} read as a number")
         if found is not None and found[0].startswith(("AS", "AT")) and cprint.part_read(found[0]) is None:
             composed = self.writer.composed_read(load.address, load.bits, id(load))
             if composed is not None:
@@ -1532,6 +1535,18 @@ class FunctionWriter:
             return f"({self.emitter.pointer_ctype(struct)}){name}"
         return f"{self.pointer_from(struct)}({name})"
 
+    def rom_field(self, text):
+        """(base, family, member, struct, bias) when text ends with ->{family}.{member} of a ROM field; else None."""
+        if not self.emitter.rom_fields:
+            return None
+        for family, member, offset, ctype, bias in self.emitter.rom_fields:
+            suffix = f"->{family}.{member}"
+            if text.endswith(suffix) and len(text) > len(suffix):
+                base = text[:-len(suffix)]
+                kind = pointers.link_kind(pointers.SCOPED_TARGETS[("object", family, offset)][0])
+                return base, family, member, kind[0], kind[1]
+        return None
+
     def pointer_from(self, struct):
         """The runtime's function that gives a pointer to a 'struct' for an address: rom_pointer for the
         program ROM's records (read in place), pointer_to for the rest."""
@@ -1573,6 +1588,20 @@ class FunctionWriter:
             inside = self.place_in(name, own, base, offset, struct) if offset >= 0 else None
             if inside is not None:
                 return inside
+        if self.emitter.rom_fields and isinstance(base, ir.Load):
+            place = self.memory(base.address, base.bits, id(base))
+            if place is not None:
+                field = self.rom_field(place[0])
+                if field is not None:
+                    base_text, family, member, fstruct, fbias = field
+                    if fstruct == struct:
+                        moved = offset + fbias
+                        size = pointers.STRUCTS[struct]
+                        host = f"host_of({base_text})->{family}.{member}"
+                        if moved % size == 0:
+                            count = moved // size
+                            return host if not count else f"{host} + {count}" if count > 0 else f"{host} - {-count}"
+                        raise SystemExit(f"ROM_FIELDS: {self.function.name}: {host} read as a pointer to {struct} {moved} bytes on")
         if isinstance(node, ir.Const) and memory.CODE_LIST_ELEMENTS is not None \
                 and struct == memory.CODE_LIST_ELEMENTS and node.value in self.emitter.code_lists:
             return self.emitter.code_lists[node.value][0]
@@ -2685,6 +2714,16 @@ class FunctionWriter:
         walking = isinstance(base, ir.Reg) and self.own_web(base) and self.vars.use_name(base) in self.walks
         held = self.kept_node(base) if (not base_offset or walking) and table is None and block is None else None
         kept = held is not None and held[1] == struct
+        if not kept and self.emitter.rom_fields and table is None and block is None and not base_offset \
+                and isinstance(base, ir.Load):
+            place = self.memory(base.address, base.bits, id(base))
+            if place is not None:
+                field = self.rom_field(place[0])
+                if field is not None:
+                    base_text, family, member, fstruct, fbias = field
+                    if fstruct == struct:
+                        held = (f"host_of({base_text})->{family}.{member}", struct)
+                        kept = True
         if table is not None:
             # a table of records by its name: hud_gauge_positions_3p[player].y
             pointer = table[0]
@@ -3154,6 +3193,28 @@ class FunctionWriter:
                     if isinstance(constant, ir.Load) and self.code_field(id(constant), constant.address):
                         return [f"{target[0]} = {text};"]    # (a code field read: the number it holds)
                     return [f"{target[0]} = function_number({text});"]
+                if self.emitter.rom_fields:
+                    field = self.rom_field(target[0])
+                    if field is not None:
+                        base_text, family, member, fstruct, fbias = field
+                        host = f"host_of({base_text})->{family}.{member}"
+                        constant = statement.value
+                        while isinstance(constant, ir.Op) and constant.name in ("zext", "fits", "trunc"):
+                            constant = constant.args[0]
+                        if isinstance(constant, ir.Const) and constant.value == 0:
+                            return [f"{host} = NULL;"]
+                        text = self.pointer_value(constant, fstruct, -fbias)
+                        if text.startswith(("rom_pointer(", "pointer_to(")):
+                            raise SystemExit(f"ROM_FIELDS: {self.function.name}: no typed pointer for {host} = {text}")
+                        if text == f"{host} + 1":
+                            return [f"{host}++;"]
+                        if text == f"{host} - 1":
+                            return [f"{host}--;"]
+                        if text.startswith(f"{host} + "):
+                            return [f"{host} += {text[len(host) + 3:]};"]
+                        if text.startswith(f"{host} - "):
+                            return [f"{host} -= {text[len(host) + 3:]};"]
+                        return [f"{host} = {text};"]
                 if target[0].startswith(("AS", "AT")) or self.family_splits(statement):
                     split = self.split_store(statement)
                     if split is not None:
@@ -3164,6 +3225,25 @@ class FunctionWriter:
                     composed = self.composed_store(statement)
                     if composed is not None:
                         return composed
+                if self.emitter.rom_fields:
+                    store_field = self.fields.get(id(statement))
+                    parts = target[0].rpartition("->")
+                    if store_field is not None and store_field[0] == "object" and parts[0] \
+                            and parts[2] in self.emitter.layouts.names["object"].values():
+                        # (a store memory.ROM_FIELD_SYNCS names: the end of a clear of the object's bytes)
+                        if (self.function.name, parts[2]) in memory.ROM_FIELD_SYNCS:
+                            return [assigned, f"object_sync({parts[0]});"]
+                        # (an object of a known family with no ROM field keeps nothing in its host part)
+                        if self.field_family(store_field, statement) in \
+                                {None} | {field[0] for field in self.emitter.rom_fields}:
+                            field_offset = next((off for off, nm in self.emitter.layouts.names["object"].items()
+                                                 if nm == parts[2]), None)
+                            if field_offset is not None:
+                                store_start = field_offset
+                                store_end = field_offset + statement.bits // 8
+                                for fam, mem, off, ctype, bias in self.emitter.rom_fields:
+                                    if store_start < off + 4 and store_end > off:
+                                        return [assigned, f"object_sync({parts[0]});"]
                 return [assigned]
             text = self.stored(value, statement.bits)
             device = self.emitter.memory.device(address) if address is not None else None
@@ -3509,7 +3589,8 @@ class FunctionWriter:
         if name == "move_string":
             shorter = self.string_move(statement)
             if shorter is not None:
-                return [shorter]
+                helper = re.match(r"(\w+)\(", shorter)
+                return [shorter] + (self.call_syncs(helper.group(1), shorter) if helper else [])
             source, length1, dest, length2, size, fill, downward = (self.exact(arg) for arg in args)
             # (R26, the fill, only where the move fills)
             fill_value = "0u" if isinstance(args[5], ir.Const) and not args[5].value else self.fill_register()
@@ -3873,9 +3954,32 @@ class FunctionWriter:
             return f"{target_name} = {self.converted(call, held, wanted)};"
         return f"{target_name} = {call};"
 
+    def call_syncs(self, callee, line):
+        """After a call of 'callee' (a function or a support.h helper such as move_halfwords) that
+        memory.ROM_FIELD_SYNCS names for this function, a clear of an object's bytes by address: the line that
+        makes the object's host part again from its bytes, object_sync_at(the call's first argument); else []."""
+        if (self.function.name, callee) not in memory.ROM_FIELD_SYNCS:
+            return []
+        first = line.find("(") + 1
+        depth = 0
+        for index in range(first, len(line)):
+            if line[index] in "([":
+                depth += 1
+            elif line[index] in ")]":
+                if not depth:
+                    break
+                depth -= 1
+            elif line[index] == "," and not depth:
+                break
+        if not line[first:index].strip():
+            raise SystemExit(f"ROM_FIELD_SYNCS: {self.function.name}: {line} takes no address to sync after")
+        return [f"object_sync_at({line[first:index].strip()});"]
+
     def call(self, statement):
         if statement.target is not None:
-            return [self.call_text(statement.target & 0xFFFFFF, statement.return_address)]
+            line = self.call_text(statement.target & 0xFFFFFF, statement.return_address)
+            callee = self.emitter.names.get(self.emitter.resolve(statement.target & 0xFFFFFF)[0])
+            return [line] + self.call_syncs(callee, line)
         if statement.slot is not None:
             if memory.CODE_FIELDS:
                 # the slot holds a function's number: the runtime's call_function runs it from game_functions[],
@@ -3937,8 +4041,12 @@ class FunctionWriter:
                 self.not_copied.update(self.results)
                 callee = self.emitter.resolve(end.target, end.entry)[0]
                 call = self.call_expression(end.target, None, end.entry)
+                if self.call_syncs(self.emitter.names.get(callee), call):
+                    raise SystemExit(f"ROM_FIELDS: {self.function.name}: {call} returns its value, no line after it")
                 return [f"return {self.converted(call, self.emitter.result_structs.get(callee), self.emitter.result_structs.get(self.entry))};"]
-            return [self.call_text(end.target, None, end.entry)] + self.copy_out() + [self.return_text()]
+            line = self.call_text(end.target, None, end.entry)
+            callee = self.emitter.names.get(self.emitter.resolve(end.target, end.entry)[0])
+            return [line] + self.call_syncs(callee, line) + self.copy_out() + [self.return_text()]
         if isinstance(end, ir.InterruptReturn):
             if not (isinstance(end.frame, ir.Const) and end.frame.value == 0):
                 raise EmitError(f"{self.function.name}: RETIS drops stack")
@@ -4221,6 +4329,7 @@ class Emitter:
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
         self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS (with
                                     # memory.CODE_FIELDS: FUNCTION_name, its number in the state)
+        self.rom_fields = []        # (family, member, offset, ctype, bias) of memory.ROM_FIELDS (decompile.py)
         self.code_table_names = frozenset()    # the program ROM's tables of code (memory.CODE_TABLES): the C
                                     # keeps them as arrays of the functions' numbers
         self.code_lists = {}        # the program ROM's lists of code (memory.CODE_LIST_ELEMENTS):
