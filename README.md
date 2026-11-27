@@ -90,6 +90,11 @@ Nothing here is a game's: no ROM, no names, no data.
 - `data_formats.py`, `asset_formats.py`: the program's data as text, and the graphics and samples as PNG and
   WAV files, and back, byte for byte. `formats/common.py` holds the data formats' helpers; `formats` is a
   namespace package (no `__init__.py`), so the game's `tools/formats/` adds its own formats to it.
+- `konami/k053260.py`: a K053260's sample ROM as WAV files and `samples.txt`, and back byte for byte, from the
+  samples the game's tools say its driver plays (place, length, PCM or KADPCM, rate): a sample whose bytes
+  others' files hold has no file of its own, two files that share bytes must agree on them, and the bytes no
+  sample plays are WAVs or lines of their own (Sunset Riders' `tools/sound_assets.py`; The Simpsons' copy is
+  to move here). `konami` is a namespace package too.
 - `check_scenarios.py`: every control script of the game's `tests/controls/` run on the reference and on the
   game (or the translation scaffold), compared frame by frame (state, and with `--video` and `--sound` the
   pictures and the sound), and the static analysis checked against all the code the reference ran.
