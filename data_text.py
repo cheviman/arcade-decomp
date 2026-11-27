@@ -1,7 +1,7 @@
 r"""
 Name:        data_text.py
 Description: a program's data pieces as text by name, and back byte for byte
-Version:     0.2.0
+Version:     0.3.0
 Created:     27-11-2026
 Modified:    27-11-2026
 Author:      Sebastian Toyos
@@ -18,6 +18,10 @@ character and \xNN for any byte (a # or a " in a text is \x23 or \x22). What a f
 SystemExit and a message that says the file, the section and the line. sound_data_text.py is the Z80's format over
 this (little endian, 16-bit refs, 4 hex digits); the 68000's is Format("big", 4, 6, ...) (Sunset Riders'
 tools/data_assets.py, with its colours and characters).
+
+A kind whose lines say what its bytes give rather than the bytes (a packed map's cells) has a packer: read's
+packers, {KIND: pack(data, lines, where)}, the bytes of a section whose [NAME] line's comment is that KIND from the
+bytes its lines give and its lines (for a hint a line holds).
 """
 import re
 from bisect import bisect_right
@@ -327,8 +331,9 @@ class Format:
                          for place, name, length, family in sorted(layout)]
         (out / "layout.txt").write_text("\n".join(layout_lines) + "\n", encoding="ascii")
 
-    def read(self, out, functions):
-        """{name: (place, bytes)} of the pieces the folder 'out' gives ('functions': {address: name}, for the refs)"""
+    def read(self, out, functions, packers=None):
+        """{name: (place, bytes)} of the pieces the folder 'out' gives ('functions': {address: name}, for the refs;
+        'packers': {kind: pack(data, lines, where)}, the bytes of the sections of a kind whose lines are not them)"""
         out = Path(out)
         layout_path = out / "layout.txt"
         if not layout_path.exists():
@@ -347,7 +352,7 @@ class Format:
         families = {}
         for name, (_, _, family) in layout.items():
             families.setdefault(family, set()).add(name)
-        sections = {}
+        sections, kinds = {}, {}
         for family in families:
             path = out / f"{family}.txt"
             if not path.exists():
@@ -362,6 +367,8 @@ class Format:
                     if current in sections.get(family, {}):
                         raise SystemExit(f"{path}: section {current} again")
                     sections.setdefault(family, {})[current] = []
+                    comment = line[end + 1:].split("#", 1)
+                    kinds[family, current] = comment[1].strip() if len(comment) == 2 else None
                 elif line.startswith("  ") and current is not None:
                     sections[family][current].append(line.strip())
         for name, (_, _, family) in layout.items():
@@ -375,6 +382,9 @@ class Format:
         for name, (place, length, family) in layout.items():
             where = f"{family}.txt [{name}]"
             data = self.read_lines(sections[family][name], names, where)
+            pack = (packers or {}).get(kinds[family, name])
+            if pack is not None:
+                data = pack(data, sections[family][name], where)
             if len(data) != length:
                 raise SystemExit(f"{where}: {len(data)} bytes, the layout says {length}")
             pieces[name] = (place, data)
