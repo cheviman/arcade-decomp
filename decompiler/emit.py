@@ -326,6 +326,9 @@ class Names:
         """(C text, signed) for memory with a name, or None. A read of several fields' bytes at once is
         those fields put together (composed_read)."""
         found = self.writer.memory(load.address, load.bits, id(load))
+        if found is not None and self.writer.emitter.rom_fields \
+                and self.writer.rom_field(found[0]) is not None:
+            raise SystemExit(f"ROM_FIELDS: {self.writer.function.name}: {found[0]} read as a number")
         if found is not None and found[0].startswith(("AS", "AT")) and cprint.part_read(found[0]) is None:
             composed = self.writer.composed_read(load.address, load.bits, id(load))
             if composed is not None:
@@ -417,6 +420,11 @@ class Printer(cprint.Printer):
                 return cprint.Value(f"({test}) {'==' if node.name == 'eq' else '!='} 0u", cprint.EQUALITY, True, "int")
         if isinstance(node, ir.Const) and node.bits == cpu.current.address_bits and id(node) not in self.writer.numbers():
             if node.value in self.writer.emitter.code_addresses and id(node) not in self.writer.sum_operands():
+                if memory.CODE_FIELDS:
+                    # (only a store into a code field holds a function's number, which the store prints itself:
+                    # memory.CODE_FIELDS)
+                    raise SystemExit(f"{self.writer.function.name}: the code address {node.value:06X} used other "
+                                     f"than stored into a code field (memory.CODE_FIELDS)")
                 # the address of code the program stores in a slot (an object's handler): its name
                 return cprint.Value(self.writer.emitter.code_addresses[node.value], cprint.PRIMARY, True, "u32")
             named = self.writer.emitter.address_text(node.value)
@@ -537,10 +545,39 @@ def element_place(struct, offset, inner, layouts):
     return None
 
 
+def _nested_path(struct, offset, target, layouts):
+    """Dotted path from 'struct' to the member at 'offset' (of type 'target', or any when None),
+    descending into nested structs recorded in layouts.nested."""
+    nested = layouts.nested.get(struct, {})
+    for n_off, (name, sub_struct, count) in sorted(nested.items()):
+        sub_size = pointers.STRUCTS.get(sub_struct, 0)
+        if sub_size == 0:
+            continue
+        span = sub_size * count
+        if n_off <= offset < n_off + span:
+            if count > 1:
+                idx, rem = divmod(offset - n_off, sub_size)
+            else:
+                idx, rem = None, offset - n_off
+            if rem == 0 and (target is None or target == sub_struct):
+                return name if idx is None else f"{name}[{idx}]"
+            sub = _nested_path(sub_struct, rem, target, layouts)
+            if sub is None:
+                return None    # (inside a nested member: none of the outer structure's fields is there)
+            return f"{name}[{idx}].{sub}" if idx is not None else f"{name}.{sub}"
+    field = layouts.lookup(struct, offset)    # (offset, bits) of the field holding 'offset'
+    if field is None or field[0] != offset:
+        return None
+    if target is not None and (target not in layouts.TYPES or layouts.TYPES[target][0] != field[1]):
+        return None    # (a pointer to a structure, or to values of another width, is not this field's)
+    return layouts.names.get(struct, {}).get(offset)
+
+
 def state_place(value, struct, layouts):
     """C for a pointer to the 'struct' at the constant address 'value' when a block of the game's state is
     one there, or holds one (a structure inside it: &game->screen_2.car; for an array of values, a field
-    whose values are as wide: &game->screen_1.stretch_ends[0]); None otherwise."""
+    whose values are as wide: &game->screen_1.stretch_ends[0]; a nested member at any depth:
+    &game->eeprom.settings.eeprom_write_count); None otherwise."""
     if memory.STATE is None:
         return None
     for address, member, block_struct, count in memory.STATE_BLOCKS:
@@ -558,6 +595,9 @@ def state_place(value, struct, layouts):
             found = element_place(block_struct, offset, struct, layouts)
             if found is not None and found[1] == layouts.TYPES[pointers.ELEMENTS[struct]][1]:
                 return f"&{place}.{found[0]}"
+        path = _nested_path(block_struct, offset, struct, layouts)
+        if path is not None:
+            return f"&{place}.{path}"
     return None
 
 
@@ -571,6 +611,17 @@ def state_block(value, struct):
         if size and address <= value < address + size * count and (value - address) % size == 0:
             return f"{memory.STATE}->{member}", (value - address) // size if count > 1 else None
     return None
+
+
+def only_block(struct):
+    """state_block() for any pointer to a 'struct' when the game's state holds exactly one (one block of one
+    record, no other block of that structure); None otherwise."""
+    if memory.STATE is None:
+        return None
+    blocks = [(member, count) for _, member, block_struct, count in memory.STATE_BLOCKS if block_struct == struct]
+    if len(blocks) != 1 or blocks[0][1] != 1:
+        return None
+    return f"{memory.STATE}->{blocks[0][0]}", None
 
 
 def group_key(statements):
@@ -1154,7 +1205,8 @@ class FunctionWriter:
                     name = self.vars.use_name(base)
                     if name is None:
                         continue
-                    if field[0] in pointers.BOARD_STRUCTS or (with_params and field[0] in pointers.ELEMENTS):
+                    if field[0] in pointers.BOARD_STRUCTS or (with_params and field[0] in pointers.ELEMENTS
+                                                             and field[0] != memory.CODE_LIST_ELEMENTS):
                         mixed.add(name)
                         continue
                     if field[3] or field[0] in pointers.ELEMENTS:
@@ -1163,9 +1215,49 @@ class FunctionWriter:
         self.current = writing
         kinds = {name: next(iter(structs)) for name, structs in found.items()
                  if len(structs) == 1 and name not in mixed and name not in excluded and name is not None}
+        if memory.TYPED_POINTERS:
+            definitions, other_definitions = {}, set()
+            moves = getattr(self.fields, "moves", {})
+            for block in self.function.blocks.values():
+                for statement in block.statements + ([block.end] if block.end is not None else []):
+                    for index in self.vars.statement_defs(statement):
+                        name = self.vars.def_name(statement, index)
+                        if name is None:
+                            continue
+                        local = index not in self.context or (
+                            index in self.scratch_context and name != self.emitter.context_name(index))
+                        if isinstance(statement, ir.SetReg) and index == statement.index and local:
+                            before = moves.get(id(statement), ({}, None))[0]
+                            definitions.setdefault(name, []).append((statement.value, before))
+                        else:
+                            other_definitions.add(name)
+            while True:
+                added = False
+                known = dict(kinds)
+                for name, values in definitions.items():
+                    if name in excluded or name in mixed or name in walked or name in other_definitions:
+                        continue
+                    produced = [self.typed_definition_kind(value, before, known) for value, before in values]
+                    if not produced or any(kind is None for kind in produced) or len(set(produced)) != 1:
+                        continue
+                    struct = produced[0]
+                    if found.get(name, {struct}) - {struct} or kinds.get(name, struct) != struct:
+                        continue
+                    if name not in kinds:
+                        kinds[name] = struct
+                        added = True
+                if not added:
+                    break
         walks = {}
+        walk_parameters = ({self.vars.entry_name(value[1]) for value in self.params if value[0] == "r"}
+                           if with_params else
+                           {self.vars.entry_name(index) for index in self.emitter.param_structs.get(self.entry, {})})
         for name in walked & set(kinds):
-            steps = self.walk_steps(name, kinds[name]) if not with_params else None
+            if with_params:
+                steps = self.walk_steps(name, kinds[name], True) \
+                    if memory.TYPED_POINTERS and name in walk_parameters else None
+            else:
+                steps = self.walk_steps(name, kinds[name], memory.TYPED_POINTERS and name in walk_parameters)
             if steps is None:
                 del kinds[name]
             else:
@@ -1179,7 +1271,47 @@ class FunctionWriter:
                     kinds[name] = struct
         return kinds
 
-    def walk_steps(self, name, struct):
+    def typed_definition_kind(self, value, state, known):
+        """The state structure kind a local definition proves it carries, or None."""
+        def state_structure(struct):
+            return struct in pointers.STRUCTS and struct not in pointers.ROM_STRUCTS \
+                and struct not in pointers.BOARD_STRUCTS
+
+        if isinstance(value, ir.Reg):
+            kept = self.kept_pointer(value.index)
+            if state_structure(kept):
+                return kept
+            name = self.vars.use_name(value)
+            if state_structure(known.get(name)):
+                return known[name]
+            parameter = self.emitter.param_structs.get(self.entry, {}).get(value.index)
+            if state_structure(parameter):
+                return parameter
+        if isinstance(value, ir.Load):
+            if value.bits != pointers.POINTER_BITS:
+                return None
+            target = pointers.target_of(value.address, state, value.bits)
+            return target if state_structure(target) else None
+        if not isinstance(value, ir.Const):
+            return None
+        if memory.CODE_LIST_ELEMENTS is not None and value.value in self.emitter.code_lists:
+            return memory.CODE_LIST_ELEMENTS
+        address = value.value & 0xFFFFFF
+        if address != value.value:
+            return None
+        for start, member, struct, count in memory.STATE_BLOCKS:
+            size = pointers.STRUCTS.get(struct, 0) if struct is not None else 0
+            if not size or count is None or not start <= address < start + size * count:
+                continue
+            offset = (address - start) % size
+            if offset == 0:
+                return struct
+            path, inner, inner_offset = self.emitter.layouts.member_target(struct, offset)
+            if path and inner_offset == 0 and state_structure(inner):
+                return inner
+        return None
+
+    def walk_steps(self, name, struct, typed_parameter=False):
         """How the C keeps 'name', a variable of the function's own that points into a 'struct' past its
         start (a pointer that walks its record: it reads a field and moves on to the next), as a pointer to
         the record it is in: {id(statement): ("step", records moved) for a step it takes, ("set", how far
@@ -1200,6 +1332,8 @@ class FunctionWriter:
             for statement_id, index in self.vars.implicit:
                 self._implicit_reads.setdefault(statement_id, []).append(index)
         steps = {}
+        has_moved = False
+        interior = False
         writing = self.current
         try:
             for block in self.function.blocks.values():
@@ -1220,6 +1354,8 @@ class FunctionWriter:
                         kind = before.get(hit[2].index)
                         if hit[0] != struct or kind is None or kind[0] != struct or kind[1] != hit[3]:
                             return None
+                        if typed_parameter and not has_moved and hit[3] != 0:
+                            return None
                         bases += 1
                     defined = isinstance(statement, ir.SetReg) and self.vars.def_name(statement, statement.index) == name
                     step, distance = None, 0
@@ -1232,12 +1368,16 @@ class FunctionWriter:
                     # and a value (turntable_scenery_show's group + 2u + group->item_list_offset)
                     reads = [node for expression in ir.statement_expressions(statement) for node in ir.walk(expression)
                              if isinstance(node, ir.Reg) and self.vars.use_name(node) == name]
+                    if typed_parameter and interior and len(reads) > bases + (step is not None):
+                        return None
                     if len(reads) > bases + (step is not None):
                         kind = before.get(reads[0].index)
                         if kind is None or kind[0] != struct or (kind[1] and self.walk_member(struct, kind[1]) is None):
                             return None
                     for index in self._implicit_reads.get(id(statement), ()):
                         if self.vars.implicit_name(statement, index) == name:
+                            if typed_parameter and interior:
+                                return None
                             kind = before.get(index)
                             if kind is None or kind[0] != struct:
                                 return None    # (a call, or the end of the function, that reads it)
@@ -1256,9 +1396,16 @@ class FunctionWriter:
                     kind = before.get(step.index)
                     if kind is None or kind[0] != struct:
                         return None
-                    moved = kind[1] + distance - after[1]
-                    if moved % size:
+                    if typed_parameter and not has_moved and kind[1] != 0:
                         return None
+                    moved = kind[1] + distance - after[1]
+                    if moved % size and (not typed_parameter or not memory.TYPED_POINTERS
+                                         or self.walk_member(struct, moved % size) is None):
+                        return None
+                    if typed_parameter:
+                        has_moved = True
+                        if moved % size:
+                            interior = True
                     steps[id(statement)] = ("step", moved // size)
         finally:
             self.current = writing
@@ -1388,6 +1535,18 @@ class FunctionWriter:
             return f"({self.emitter.pointer_ctype(struct)}){name}"
         return f"{self.pointer_from(struct)}({name})"
 
+    def rom_field(self, text):
+        """(base, family, member, struct, bias) when text ends with ->{family}.{member} of a ROM field; else None."""
+        if not self.emitter.rom_fields:
+            return None
+        for family, member, offset, ctype, bias in self.emitter.rom_fields:
+            suffix = f"->{family}.{member}"
+            if text.endswith(suffix) and len(text) > len(suffix):
+                base = text[:-len(suffix)]
+                kind = pointers.link_kind(pointers.SCOPED_TARGETS[("object", family, offset)][0])
+                return base, family, member, kind[0], kind[1]
+        return None
+
     def pointer_from(self, struct):
         """The runtime's function that gives a pointer to a 'struct' for an address: rom_pointer for the
         program ROM's records (read in place), pointer_to for the rest."""
@@ -1429,6 +1588,27 @@ class FunctionWriter:
             inside = self.place_in(name, own, base, offset, struct) if offset >= 0 else None
             if inside is not None:
                 return inside
+        if self.emitter.rom_fields and isinstance(base, ir.Load):
+            place = self.memory(base.address, base.bits, id(base))
+            if place is not None:
+                field = self.rom_field(place[0])
+                if field is not None:
+                    base_text, family, member, fstruct, fbias = field
+                    if fstruct == struct:
+                        moved = offset + fbias
+                        size = pointers.STRUCTS[struct]
+                        host = f"host_of({base_text})->{family}.{member}"
+                        if moved % size == 0:
+                            count = moved // size
+                            return host if not count else f"{host} + {count}" if count > 0 else f"{host} - {-count}"
+                        raise SystemExit(f"ROM_FIELDS: {self.function.name}: {host} read as a pointer to {struct} {moved} bytes on")
+        if isinstance(node, ir.Const) and memory.CODE_LIST_ELEMENTS is not None \
+                and struct == memory.CODE_LIST_ELEMENTS and node.value in self.emitter.code_lists:
+            return self.emitter.code_lists[node.value][0]
+        if pointers.RECORD_POINTERS:
+            element = self.record_element(node, struct, shift)
+            if element is not None:
+                return element
         if isinstance(node, ir.Const):
             place = state_place((node.value + shift) & 0xFFFFFF, struct, self.emitter.layouts) \
                 or self.named_place((node.value + shift) & 0xFFFFFF, struct)
@@ -1442,6 +1622,59 @@ class FunctionWriter:
             else:
                 value = base
         return f"{self.pointer_from(struct)}({self.stored(value, 32)})"
+
+    def record_element(self, node, struct, shift):
+        """C for the pointer to the 'struct' at the address 'node' ('shift' bytes on) where that is a record
+        of a table of the program ROM's records of that structure (pointers.RECORD_TABLES): the table's
+        address plus whole records, &traffic_path[path_step]; the table's name for its first record. None
+        for any other address."""
+        terms, constant = [], 0
+
+        def gather(n, sign):
+            nonlocal constant
+            if isinstance(n, ir.Const):
+                constant += sign * n.value
+            elif isinstance(n, ir.Op) and n.name == "add" and n.bits == pointers.POINTER_BITS:
+                gather(n.args[0], sign)
+                gather(n.args[1], sign)
+            elif isinstance(n, ir.Op) and n.name == "sub" and n.bits == pointers.POINTER_BITS \
+                    and isinstance(n.args[1], ir.Const):
+                gather(n.args[0], sign)
+                constant -= sign * n.args[1].value
+            else:
+                terms.append(n)
+        gather(node, 1)
+        address = (constant + shift) & 0xFFFFFFFF
+        table = pointers.RECORD_TABLES.get(address)
+        if table is None or table[1] != struct:
+            return None
+        size = pointers.STRUCTS[struct]
+        parts = []
+        for term in terms:
+            part = pointers.scaled_count(term, size)
+            if part is None and pointers.RECORD_OFFSETS:
+                part = pointers.outer_scaled_count(term, size)
+            if part is None:
+                return self.record_bytes(table[0], terms) if pointers.RECORD_OFFSETS else None
+            parts.append(part)
+        if not parts:
+            return table[0]
+        index = parts[0]
+        for part in parts[1:]:
+            widened_index = index if index.bits >= 32 else ir.op("zext", (index,), 32)
+            widened_part = part if part.bits >= 32 else ir.op("zext", (part,), 32)
+            index = ir.op("add", (widened_index, widened_part), 32)
+        return f"&{table[0]}[{self.record_number(index)}]"
+
+    def record_bytes(self, name, terms):
+        """C for the record a number of bytes into the table 'name' that is not whole records, the sum of
+        'terms' (record_at, the runtime's): record_at(sprite_size_steps, piece->sprite * 4u)."""
+        offset = terms[0]
+        for term in terms[1:]:
+            widened_offset = offset if offset.bits >= 32 else ir.op("zext", (offset,), 32)
+            widened_term = term if term.bits >= 32 else ir.op("zext", (term,), 32)
+            offset = ir.op("add", (widened_offset, widened_term), 32)
+        return f"record_at({name}, {self.stored(offset, 32)})"
 
     def place_in(self, name, own, base, offset, struct):
         """C for a pointer to the 'struct' at 'offset' bytes into the 'own' that pointer 'name' (read from
@@ -1486,7 +1719,7 @@ class FunctionWriter:
             if item is None or item.bits != bits or item.signed != signed:
                 return None
             return item.name if item.indexed else f"&{item.name}"    # (a table read whole is its value)
-        found = self.variable_at(address) if memory.STATE is not None else None
+        found = self.variable_at(address, bits) if memory.STATE is not None else None
         return f"&{found[0]}" if found is not None and found[1] == bits and found[2] == signed else None
 
     def register_read(self, node):
@@ -1634,6 +1867,12 @@ class FunctionWriter:
             return None
         layouts = self.emitter.layouts
         found = layouts.lookup(hit[0], hit[1])
+        if found is None or found[0] != hit[1]:
+            # no field of the structure starts there: the one of a member structure that holds it
+            member_path, member_struct, member_offset = layouts.member_target(hit[0], hit[1])
+            if member_path:
+                hit = (member_struct, member_offset) + tuple(hit[2:])
+                found = layouts.lookup(hit[0], hit[1])
         exact = found == (hit[1], load.bits)
         family = self.field_family(hit, statement)
         if family is not None:
@@ -1760,7 +1999,16 @@ class FunctionWriter:
         if field is not None and field[0] == "global":
             # through a pointer to a variable: as the variable
             own = self.own_variable(field[1], bits)
-            return own if own is not None else self.emitter.memory.access(field[1], bits, self.exact, indexed=True)
+            if own is not None:
+                return own
+            value = memory.constant_address(field[1])    # (an address expression: a constant one only)
+            block_result = self.block_field(value, bits) if value is not None else None
+            if block_result is not None:
+                return block_result
+            block_result = self.block_variable_field(field[1], bits)
+            if block_result is not None:
+                return block_result
+            return self.emitter.memory.access(field[1], bits, self.exact, indexed=True)
         if field is not None:
             text, signed = self.field_access(field, bits)
             return text, signed, True
@@ -1769,11 +2017,96 @@ class FunctionWriter:
             own = self.own_variable(value, bits)
             if own is not None:
                 return own
+            block_result = self.block_field(value, bits)
+            if block_result is not None:
+                return block_result
         own = self.own_element(address, bits)
         if own is not None:
             return own
         return self.emitter.memory.access(address, bits, self.exact, indexed=self.counted_index(address),
                                           signed_text=self.signed_text)
+
+    def block_field(self, value, bits):
+        """(text, signed, True) for a field of a STATE_BLOCKS block at 'value', or None."""
+        if memory.STATE is None:
+            return None
+        for block_addr, member, structure, count in memory.STATE_BLOCKS:
+            if structure is None:
+                continue
+            block_size = pointers.STRUCTS.get(structure, 0)
+            if block_size == 0 or not (block_addr <= value < block_addr + block_size * count):
+                continue
+            result = self.variable_at(value, bits)
+            if result is not None:
+                if result[1] < bits:
+                    return (cprint.part(bits, result[0], 0, result[1], result[2]), False, True)
+                return result[0], result[2], True
+        return None
+
+    def block_variable_parts(self, node):
+        """(constant, variable) for an address that is one constant plus one variable, or None."""
+        constant = 0
+        variables = []
+        stack = [node]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, ir.Const):
+                constant += item.value
+            elif isinstance(item, ir.Op) and item.name == "add":
+                stack.extend(item.args)
+            else:
+                variables.append(item)
+        if len(variables) == 1:
+            return constant & 0xFFFFFFFF, variables[0]
+        return None
+
+    def block_variable_field(self, address, bits):
+        """(text, signed, True) for a variable offset into a one-record STATE_BLOCKS block, or None."""
+        if memory.STATE is None:
+            return None
+        parts = self.block_variable_parts(address)
+        if parts is None:
+            return None
+        constant, variable = parts
+        for block_addr, member, structure, count in memory.STATE_BLOCKS:
+            if structure is None or count != 1:
+                continue
+            block_size = pointers.STRUCTS.get(structure, 0)
+            if block_size == 0 or not (block_addr <= constant < block_addr + block_size):
+                continue
+            prefix = f"{memory.STATE}->{member}."
+            result = self.block_element(structure, constant - block_addr, variable, bits, prefix)
+            if result is not None:
+                return result
+            macro = {8: "AT8", 16: "AT16", 32: "AT32"}.get(bits)
+            if macro is None:
+                return None
+            offset = constant - block_addr
+            place = variable if offset == 0 else ir.op("add", (variable, ir.Const(offset, 32)), 32)
+            return f"{macro}({memory.STATE}->{member}, {self.printer.any(place).text})", False, True
+        return None
+
+    def block_element(self, structure, offset, variable, bits, prefix):
+        """(text, signed, True) for an element of an array field of 'structure' at 'offset' plus
+        'variable', or None."""
+        width = bits // 8
+        if width > 1:
+            count = pointers.scaled_count(variable, width)
+            if count is None:
+                return None
+        else:
+            count = variable
+        for probe in (offset, offset + width):
+            found = self.layout_lvalue(structure, probe, width, prefix)
+            if found is None or found[1][0] != "scalar":
+                continue
+            matched = re.fullmatch(r"(.*)\[(\d+)\]", found[0])
+            if matched is None:
+                continue
+            element = int(matched.group(2)) - (probe - offset) // width
+            index = count if element == 0 else ir.op("add", (count, ir.Const(element & 0xFFFFFFFF, 32)), 32)
+            return f"{matched.group(1)}[{self.record_number(index)}]", found[1][2], True
+        return None
 
     def signed_text(self, node):
         """C for a signed value as the number it is (an index from a table's middle: 64 + steering)."""
@@ -1943,7 +2276,7 @@ class FunctionWriter:
             return None
         position = start
         while position < start + size:
-            piece = self.variable_at(position)
+            piece = self.variable_at(position, bits)
             if piece is None or position + piece[1] // 8 > start + size or memory.bus_only(position, piece[1]):
                 return None
             self.signed_pieces[piece[0]] = piece[2]
@@ -2000,6 +2333,12 @@ class FunctionWriter:
                             number = (position - start) // (bits // 8)
                             found = (start, bits)
                             break
+                if found is None and scoped is None:
+                    # (a field of a structure that is a member of this one, by where it is in this one)
+                    _, inner, inner_position = layouts.member_target(struct, position)
+                    held = layouts.lookup(inner, inner_position) if inner != struct else None
+                    if held is not None:
+                        found = (position - inner_position + held[0], held[1])
                 if found is None:
                     return None
                 start, width = found
@@ -2024,9 +2363,9 @@ class FunctionWriter:
             return None
         position = first
         while position < first + size:
-            found = next((self.variable_at(start) + (start,) for start in range(position, position - 4, -1)
-                          if self.variable_at(start) is not None
-                          and start + self.variable_at(start)[1] // 8 > position), None)
+            found = next((self.variable_at(start, bits) + (start,) for start in range(position, position - 4, -1)
+                          if self.variable_at(start, bits) is not None
+                          and start + self.variable_at(start, bits)[1] // 8 > position), None)
             if found is None or memory.bus_only(found[3], found[1]):
                 return None
             text, width, signed, start = found
@@ -2115,10 +2454,32 @@ class FunctionWriter:
             lines.append(f"{target} = ({target} & 0x{keep:X}u) | {shifted};")
         return lines
 
-    def variable_at(self, address):
+    def variable_at(self, address, bits=None):
         """(C, bits, signed) of the variable that starts at a work RAM address, or of the element of an
         array that does, or of the board's variable at an address of its plain memories (io lines there: the
         bookkeeping's halfwords in the RAM the sound program shares); None if none does."""
+        if bits is not None and memory.STATE_BLOCKS and memory.STATE is not None:
+            for block_addr, member, structure, count in memory.STATE_BLOCKS:
+                if structure is None:
+                    continue
+                block_size = pointers.STRUCTS.get(structure, 0)
+                if block_size == 0 or not (block_addr <= address < block_addr + block_size * count):
+                    continue
+                element_index = (address - block_addr) // block_size
+                element_offset = (address - block_addr) % block_size
+                if element_index >= count:
+                    continue
+                prefix = (f"{memory.STATE}->{member}." if count == 1
+                          else f"{memory.STATE}->{member}[{element_index}].")
+                result = self.layout_lvalue(structure, element_offset, bits // 8, prefix)
+                if result is not None and result[1][0] == "scalar":
+                    return result[0], result[1][1], result[1][2]
+                for length in (4, 2, 1):
+                    if length >= bits // 8:
+                        continue
+                    narrower = self.layout_lvalue(structure, element_offset, length, prefix)
+                    if narrower is not None and narrower[1][0] == "scalar":
+                        return narrower[0], narrower[1][1], narrower[1][2]
         board = memory.plain_hardware(address)
         variables = self.emitter.memory.board if board else self.emitter.memory.variables
         scoped = self.emitter.memory.scoped.get(self.global_family) if self.global_family and not board else None
@@ -2296,6 +2657,36 @@ class FunctionWriter:
     def field_lvalue(self, field, bits):
         return self.field_access(field, bits)[0]
 
+    def member_array_path(self, struct, offset):
+        """(member path, array field name, signed, element bits) for an element of an array field of a
+        structure that is a member of 'struct' (pointers.MEMBERS), at 'offset' bytes into 'struct'; None
+        otherwise."""
+        members = pointers.MEMBERS.get(struct)
+        if not members:
+            return None
+        layouts = self.emitter.layouts
+        for start, (name, inner, count) in members.items():
+            inner_size = pointers.STRUCTS.get(inner)
+            if not inner_size:
+                continue
+            count = 1 if count is None else int(count)
+            if not start <= offset < start + inner_size * count:
+                continue
+            member_number = (offset - start) // inner_size
+            if member_number >= count:
+                continue
+            inner_offset = (offset - start) % inner_size
+            for (array_struct, field_start), (element_bits, element_count) in pointers.FIELD_ARRAYS.items():
+                if array_struct != inner or inner_offset != field_start:
+                    continue
+                array_name = layouts.names.get(inner, {}).get(field_start)
+                if array_name is None or array_name.startswith(("unk_", "var_")):
+                    continue
+                signed = layouts.signed.get(inner, {}).get(field_start, False)
+                path = name + (f"[{member_number}]" if count > 1 else "")
+                return path, array_name, signed, element_bits
+        return None
+
     def field_access(self, field, bits):
         """(C, signed) for an access of 'bits' to a field: by the name of the family's own field when the
         function's object is accessed, or the structure's; a name that holds exactly those bytes first."""
@@ -2313,9 +2704,26 @@ class FunctionWriter:
             if isinstance(base, ir.Const) and not base_offset and table is None else None
         if block is not None and block[1] is None and index is not None:
             block = None    # (records counted on from a block that is one: by its address)
+        if block is None and table is None and not isinstance(base, ir.Const) and not base_offset and index is None:
+            # a pointer at the start of a structure the game's state holds only one of: that block, as a
+            # constant address of it is (test_mode_game_assignments_time's current_object: game->eeprom)
+            only = only_block(struct)
+            held = self.kept_node(base)
+            if only is not None and (held is None or held[1] != struct):
+                block = only
         walking = isinstance(base, ir.Reg) and self.own_web(base) and self.vars.use_name(base) in self.walks
         held = self.kept_node(base) if (not base_offset or walking) and table is None and block is None else None
         kept = held is not None and held[1] == struct
+        if not kept and self.emitter.rom_fields and table is None and block is None and not base_offset \
+                and isinstance(base, ir.Load):
+            place = self.memory(base.address, base.bits, id(base))
+            if place is not None:
+                field = self.rom_field(place[0])
+                if field is not None:
+                    base_text, family, member, fstruct, fbias = field
+                    if fstruct == struct:
+                        held = (f"host_of({base_text})->{family}.{member}", struct)
+                        kept = True
         if table is not None:
             # a table of records by its name: hud_gauge_positions_3p[player].y
             pointer = table[0]
@@ -2370,7 +2778,24 @@ class FunctionWriter:
             member = "" if element else "."
         else:
             member = "->"
+        if element_number is not None:
+            member_array = self.member_array_path(struct, offset)
+            if member_array is not None and member_array[3] == bits:
+                path, array_name, signed, _ = member_array
+                return f"{pointer}{member}{path}.{array_name}[{self.record_number(element_number)}]", signed
         found = layouts.lookup(struct, offset)
+        if found is None and not element:
+            path, inner, inner_offset = layouts.member_target(struct, offset)
+            if inner != struct:
+                # a place inside a structure that is a member of this one: by the member's own field
+                # (screen->mixer_values.colour_offset_select, a byte of it a part)
+                member, struct, offset, family = f"{member}{path}.", inner, inner_offset, None
+                held = pointers.array_holding(struct, offset) if element_number is None else None
+                if held is not None and held[0] != offset:
+                    width = held[1] // 8
+                    element_number = ir.Const((offset - held[0]) // width, 32)
+                    offset = held[0] + (offset - held[0]) % width
+                found = layouts.lookup(struct, offset)
         if found is None:
             # a place only the family's own fields name: a wider access the C writes as the fields it holds
             # (song_title_show's slide and y, one 32-bit write)
@@ -2677,6 +3102,33 @@ class FunctionWriter:
             lines.append(f"{self.use(('f', flag))} = {source} & 1u;")
         return lines
 
+    def code_field(self, key, address):
+        """True when what is at 'address' (key: the id of the IR node that reaches it) is a code field of
+        memory.CODE_FIELDS: a member of a record (struct object's handler), or a HOST variable."""
+        if not memory.CODE_FIELDS:
+            return False
+        candidates = [address]
+        for candidate in (key, id(address)):
+            field = self.fields.get(candidate)
+            if field is None:
+                continue
+            if field[0] == "global" and len(field) > 1 and getattr(field[1], "bits", None) is not None:
+                candidates.append(field[1])
+            elif isinstance(field[0], str) and field[0] in self.emitter.layouts.names:
+                found = self.emitter.layouts.lookup(field[0], field[1])
+                if found is not None:
+                    member = self.emitter.layouts.names[field[0]].get(found[0])
+                    if member is not None and f"{field[0]}.{member}" in memory.CODE_FIELDS:
+                        return True
+        for candidate in candidates:
+            value = memory.constant_address(candidate)
+            if value is None:
+                continue
+            item = self.emitter.memory.variables.get(value)
+            if item is not None and item.host and item.name in memory.CODE_FIELDS:
+                return True
+        return False
+
     def statement(self, statement):
         self.current = statement
         if isinstance(statement, ir.SetTemp):
@@ -2722,6 +3174,47 @@ class FunctionWriter:
             target = self.memory(statement.address, statement.bits, id(statement))
             address = memory.constant_address(statement.address)
             if target is not None and target[2] and (address is None or not memory.bus_only(address, statement.bits)):
+                if self.code_field(id(statement), statement.address):
+                    # a code field holds a function's number: a constant is its name, anything else its number
+                    constant = statement.value
+                    while isinstance(constant, ir.Op) and constant.name in ("zext", "fits", "trunc"):
+                        constant = constant.args[0]
+                    if isinstance(constant, ir.Const) and constant.value in self.emitter.code_addresses:
+                        return [f"{target[0]} = {self.emitter.code_addresses[constant.value]};"]
+                    text = self.stored(statement.value, statement.bits)
+                    if isinstance(constant, ir.Load) and self.emitter.code_table_names:
+                        bracket = text.find("[")
+                        if bracket > 0 and text.endswith("]") and text[:bracket] in self.emitter.code_table_names:
+                            return [f"{target[0]} = {text};"]    # (a table of code: it holds the functions' numbers)
+                    if isinstance(constant, ir.Load) and memory.CODE_LIST_ELEMENTS is not None:
+                        field = self.fields.get(id(constant))
+                        if field is not None and field[0] == memory.CODE_LIST_ELEMENTS:
+                            return [f"{target[0]} = {text};"]    # (a list of code: it holds the functions' numbers)
+                    if isinstance(constant, ir.Load) and self.code_field(id(constant), constant.address):
+                        return [f"{target[0]} = {text};"]    # (a code field read: the number it holds)
+                    return [f"{target[0]} = function_number({text});"]
+                if self.emitter.rom_fields:
+                    field = self.rom_field(target[0])
+                    if field is not None:
+                        base_text, family, member, fstruct, fbias = field
+                        host = f"host_of({base_text})->{family}.{member}"
+                        constant = statement.value
+                        while isinstance(constant, ir.Op) and constant.name in ("zext", "fits", "trunc"):
+                            constant = constant.args[0]
+                        if isinstance(constant, ir.Const) and constant.value == 0:
+                            return [f"{host} = NULL;"]
+                        text = self.pointer_value(constant, fstruct, -fbias)
+                        if text.startswith(("rom_pointer(", "pointer_to(")):
+                            raise SystemExit(f"ROM_FIELDS: {self.function.name}: no typed pointer for {host} = {text}")
+                        if text == f"{host} + 1":
+                            return [f"{host}++;"]
+                        if text == f"{host} - 1":
+                            return [f"{host}--;"]
+                        if text.startswith(f"{host} + "):
+                            return [f"{host} += {text[len(host) + 3:]};"]
+                        if text.startswith(f"{host} - "):
+                            return [f"{host} -= {text[len(host) + 3:]};"]
+                        return [f"{host} = {text};"]
                 if target[0].startswith(("AS", "AT")) or self.family_splits(statement):
                     split = self.split_store(statement)
                     if split is not None:
@@ -2732,6 +3225,25 @@ class FunctionWriter:
                     composed = self.composed_store(statement)
                     if composed is not None:
                         return composed
+                if self.emitter.rom_fields:
+                    store_field = self.fields.get(id(statement))
+                    parts = target[0].rpartition("->")
+                    if store_field is not None and store_field[0] == "object" and parts[0] \
+                            and parts[2] in self.emitter.layouts.names["object"].values():
+                        # (a store memory.ROM_FIELD_SYNCS names: the end of a clear of the object's bytes)
+                        if (self.function.name, parts[2]) in memory.ROM_FIELD_SYNCS:
+                            return [assigned, f"object_sync({parts[0]});"]
+                        # (an object of a known family with no ROM field keeps nothing in its host part)
+                        if self.field_family(store_field, statement) in \
+                                {None} | {field[0] for field in self.emitter.rom_fields}:
+                            field_offset = next((off for off, nm in self.emitter.layouts.names["object"].items()
+                                                 if nm == parts[2]), None)
+                            if field_offset is not None:
+                                store_start = field_offset
+                                store_end = field_offset + statement.bits // 8
+                                for fam, mem, off, ctype, bias in self.emitter.rom_fields:
+                                    if store_start < off + 4 and store_end > off:
+                                        return [assigned, f"object_sync({parts[0]});"]
                 return [assigned]
             text = self.stored(value, statement.bits)
             device = self.emitter.memory.device(address) if address is not None else None
@@ -2878,6 +3390,10 @@ class FunctionWriter:
             candidates = set()
             for start in range(offset + low, offset + low - 4, -1):
                 width = layouts.fields.get(struct, {}).get(start)
+                if width is None:
+                    _, inner, inner_start = layouts.member_target(struct, start)    # (a member structure's field)
+                    if inner != struct:
+                        width = layouts.fields.get(inner, {}).get(inner_start)
                 if width is not None:
                     candidates.add((start, width))
                 for (overlay_start, overlay_bits) in layouts.overlays.get(struct, {}):
@@ -2930,7 +3446,13 @@ class FunctionWriter:
         if value < 0x10000 or not value & 0xFFFF or not memory.program_rom(value):
             return None
         named = self.emitter.address_text(value)
-        return named[0] if named is not None else self.emitter.code_addresses.get(value)
+        if named is not None:
+            return named[0]
+        code_name = self.emitter.code_addresses.get(value)
+        if code_name is not None and memory.CODE_FIELDS:
+            raise SystemExit(f"{self.function.name}: the code address {value:06X} used other than stored into a "
+                             f"code field (memory.CODE_FIELDS)")
+        return code_name
 
     def compound(self, lvalue, operation, right):
         """'lvalue op= right;', or ++ and --; adding 0xFFFFFFFA takes 6 away, as the expressions say it."""
@@ -3067,7 +3589,8 @@ class FunctionWriter:
         if name == "move_string":
             shorter = self.string_move(statement)
             if shorter is not None:
-                return [shorter]
+                helper = re.match(r"(\w+)\(", shorter)
+                return [shorter] + (self.call_syncs(helper.group(1), shorter) if helper else [])
             source, length1, dest, length2, size, fill, downward = (self.exact(arg) for arg in args)
             # (R26, the fill, only where the move fills)
             fill_value = "0u" if isinstance(args[5], ir.Const) and not args[5].value else self.fill_register()
@@ -3107,11 +3630,19 @@ class FunctionWriter:
             return None
         unit = "bytes" if size.value == 1 else "halfwords"
         if length1 == length2:
+            if memory.TYPED_MOVES and not downward.value and isinstance(length1, ir.Const):
+                typed = self.typed_move(source, dest, length1.value * size.value)
+                if typed is not None:
+                    return typed
             # the same count both ways: a copy (MOVCD from the last element down, for overlapping moves)
             backward = "_backward" if downward.value else ""
             return f"move_{unit}{backward}({self.address_argument(dest)}, {self.address_argument(source)}, " \
                    f"{self.exact(length1)});"
         if fill.value and not downward.value and length1 == ir.Const(0, length1.bits):
+            if memory.TYPED_MOVES and size.value == 1 and isinstance(length2, ir.Const):
+                typed = self.typed_fill(dest, length2.value)
+                if typed is not None:
+                    return typed
             return f"set_{unit}({self.address_argument(dest)}, {self.exact(length2)}, {self.fill_register()});"
         return None
 
@@ -3131,6 +3662,227 @@ class FunctionWriter:
                 offset = node.value - 0x200000
                 return "WORK_RAM" if not offset else f"WORK_RAM + 0x{offset:X}u"
         return self.exact(node)
+
+    def typed_move(self, source, dest, length):
+        """A C statement for a forward copy of 'length' bytes when the ends are one exact typed thing,
+        or None: memset for a source in the ROM's zero block, or an assignment / memcpy for the same type."""
+        if length <= 0:
+            return None
+        destination = self.typed_lvalue(dest, length)
+        if destination is None:
+            return None
+        if self.zero_source(source, length):
+            text, _, is_array = destination
+            return f"memset({text}, 0, sizeof {text});" if is_array else f"memset(&{text}, 0, sizeof {text});"
+        source_typed = self.typed_lvalue(source, length)
+        if source_typed is None or source_typed[1] != destination[1]:
+            return None
+        if not self.copy_proven_disjoint(source, dest, length):
+            return None
+        dest_text, _, dest_array = destination
+        source_text = source_typed[0]
+        if dest_array:
+            return f"memcpy({dest_text}, {source_text}, sizeof {dest_text});"
+        return f"{dest_text} = {source_text};"
+
+    def typed_fill(self, dest, length):
+        """memset for a fill of 'length' bytes with the fill register's byte (R26) when the destination is one exact
+        typed thing (typed_lvalue), or None."""
+        destination = self.typed_lvalue(dest, length)
+        if destination is None:
+            return None
+        text, _, is_array = destination
+        value = self.fill_register()
+        return f"memset({text}, {value}, sizeof {text});" if is_array else f"memset(&{text}, {value}, sizeof {text});"
+
+    def zero_source(self, source, length):
+        """True when 'source' is a constant address whose whole range lies inside ZERO_BLOCK."""
+        if memory.ZERO_BLOCK is None:
+            return False
+        if not isinstance(source, ir.Const):
+            return False
+        start = source.value & 0xFFFFFF
+        end = start + length
+        block_start, block_end = memory.ZERO_BLOCK
+        return block_start <= start and end <= block_end
+
+    def copy_proven_disjoint(self, source, dest, length):
+        """True when the source and destination ranges are proven not to overlap: both at constant addresses,
+        or both so many bytes on from the same base (two members of one structure). Two other pointers may
+        point at the same place (a function handed the same record twice), where a memcpy or a structure's
+        assignment would be undefined, so nothing else proves it."""
+        s_base, s_off = constant_parts(source)
+        d_base, d_off = constant_parts(dest)
+        if isinstance(s_base, ir.Const) and isinstance(d_base, ir.Const):
+            s_start = (s_base.value + s_off) & 0xFFFFFF
+            d_start = (d_base.value + d_off) & 0xFFFFFF
+        elif s_base == d_base:
+            s_start, d_start = s_off, d_off
+        else:
+            return False
+        return not (s_start < d_start + length and d_start < s_start + length)
+
+    def typed_lvalue(self, node, length):
+        """(C lvalue, a key of its C type, whether it is an array) for exactly 'length' bytes at 'node',
+        or None: a state item or member of the game's state, or a member of a structure a register points at."""
+        if length <= 0:
+            return None
+        base, offset = constant_parts(node)
+        if isinstance(base, ir.Const):
+            return self.typed_state_lvalue(base, offset, length)
+        if isinstance(base, ir.Reg):
+            return self.typed_pointer_lvalue(base, offset, length)
+        if isinstance(base, ir.Load):
+            return self.typed_loaded_lvalue(base, offset, length)
+        return None
+
+    def typed_state_lvalue(self, base, offset, length):
+        """typed_lvalue() for a constant work RAM address."""
+        address = (base.value + offset) & 0xFFFFFF
+        if not memory.work_ram(address) or not memory.work_ram(address + length - 1):
+            return None
+        for item in self.emitter.memory.state_items():
+            if item.host:
+                count = item.count if item.indexed else 1
+                if count is None:
+                    continue
+                size = item.bits // 8 * count
+                if item.address < address + length and address < item.address + size:
+                    return None
+        for item in self.emitter.memory.state_items():
+            if item.address == address and not item.host:
+                count = item.count if item.indexed else 1
+                if count is None:
+                    continue
+                if item.bits // 8 * count == length:
+                    key = ("array", ("scalar", item.bits, item.signed), count) if item.indexed else \
+                        ("scalar", item.bits, item.signed)
+                    return item.c, key, bool(item.indexed)
+        if memory.STATE_BLOCKS and memory.STATE is not None:
+            for block_addr, member, structure, count in memory.STATE_BLOCKS:
+                if structure is None:
+                    continue
+                block_size = pointers.STRUCTS.get(structure, 0)
+                if block_size == 0:
+                    continue
+                total_size = block_size * count
+                if address < block_addr or address + length > block_addr + total_size:
+                    continue
+                element_index = (address - block_addr) // block_size
+                element_offset = (address - block_addr) % block_size
+                if element_index >= count:
+                    continue
+                if element_index == 0 and element_offset == 0 and length == total_size:
+                    if count == 1:
+                        return f"{memory.STATE}->{member}", ("struct", structure), False
+                    return f"{memory.STATE}->{member}", ("array", ("struct", structure), count), True
+                if element_offset == 0 and length == block_size:
+                    if count == 1:
+                        return f"{memory.STATE}->{member}", ("struct", structure), False
+                    return f"{memory.STATE}->{member}[{element_index}]", ("struct", structure), False
+                if count == 1:
+                    prefix = f"{memory.STATE}->{member}."
+                else:
+                    prefix = f"{memory.STATE}->{member}[{element_index}]."
+                return self.layout_lvalue(structure, element_offset, length, prefix)
+        if memory.STATE is not None and memory.VARIABLES is not None and address >= memory.VARIABLES:
+            return self.layout_lvalue("global", address - memory.VARIABLES, length, f"{memory.STATE}->")
+        return None
+
+    def typed_pointer_lvalue(self, base, offset, length):
+        """typed_lvalue() for a register holding a pointer to a game structure plus a constant offset."""
+        held = self.kept_node(base)
+        if held is None:
+            return None
+        name, struct = held
+        size = pointers.STRUCTS.get(struct, 0)
+        if size == 0:
+            return None
+        if offset < 0 or offset + length > size:
+            return None
+        if offset == 0 and size == length:
+            return f"*{name}", ("struct", struct), False
+        return self.layout_lvalue(struct, offset, length, f"{name}->")
+
+    def typed_loaded_lvalue(self, base, offset, length):
+        """typed_lvalue() for a pointer read from a field that symbols.txt says points at a structure (field screen 24
+        race u32 race: RACE(screen->race)) plus a constant offset."""
+        hit = self.fields.get(id(base))
+        if hit is None:
+            return None
+        target = pointers.TARGETS.get((hit[0], hit[1]))
+        if target is None or target[1] != base.bits:
+            return None
+        struct = target[0]
+        size = pointers.STRUCTS.get(struct, 0)
+        if size == 0 or offset < 0 or offset + length > size:
+            return None
+        pointer = f"{struct.upper()}({self.printer.any(base).text})"
+        if offset == 0 and size == length:
+            return f"*{pointer}", ("struct", struct), False
+        return self.layout_lvalue(struct, offset, length, f"{pointer}->")
+
+    def layout_lvalue(self, struct, offset, length, prefix):
+        """(C lvalue, key, whether it is an array) for exactly 'length' bytes at 'offset' of 'struct',
+        or None."""
+        nested = self.emitter.layouts.nested.get(struct, {})
+        for nest_offset, (name, nest_struct, count) in nested.items():
+            nest_size = pointers.STRUCTS.get(nest_struct, 0)
+            if nest_size == 0:
+                continue
+            if offset < nest_offset or offset + length > nest_offset + nest_size * count:
+                continue
+            elem_index = (offset - nest_offset) // nest_size
+            elem_offset = (offset - nest_offset) % nest_size
+            if elem_index >= count:
+                continue
+            if elem_index == 0 and elem_offset == 0 and length == nest_size * count:
+                if count == 1:
+                    return f"{prefix}{name}", ("struct", nest_struct), False
+                return f"{prefix}{name}", ("array", ("struct", nest_struct), count), True
+            if elem_offset == 0 and length == nest_size:
+                if count == 1:
+                    return f"{prefix}{name}", ("struct", nest_struct), False
+                return f"{prefix}{name}[{elem_index}]", ("struct", nest_struct), False
+            if count == 1:
+                return self.layout_lvalue(nest_struct, elem_offset, length, f"{prefix}{name}.")
+            return self.layout_lvalue(nest_struct, elem_offset, length, f"{prefix}{name}[{elem_index}].")
+        found = self.emitter.layouts.lookup(struct, offset) or pointers.array_holding(struct, offset)
+        if found is None:
+            return None
+        field_offset, field_bits = found
+        field_size = field_bits // 8
+        names = self.emitter.layouts.names.get(struct, {})
+        signed = self.emitter.layouts.signed.get(struct, {})
+        if field_offset != offset:
+            if field_size != length or (offset - field_offset) % field_size != 0:
+                return None
+            elem_index = (offset - field_offset) // field_size
+            count = self.emitter.layouts.array_count(struct, field_offset)
+            if count is None or elem_index >= count:
+                return None
+            name = names.get(field_offset)
+            if name is None:
+                return None
+            return (f"{prefix}{name}[{elem_index}]",
+                    ("scalar", field_bits, signed.get(field_offset, False)), False)
+        if field_size == length:
+            name = names.get(offset)
+            if name is None:
+                return None
+            count = self.emitter.layouts.array_count(struct, offset)
+            if count is not None and count > 1:
+                return f"{prefix}{name}[0]", ("scalar", field_bits, signed.get(offset, False)), False
+            return f"{prefix}{name}", ("scalar", field_bits, signed.get(offset, False)), False
+        count = self.emitter.layouts.array_count(struct, offset)
+        if count is not None and count > 0:
+            if field_size * count == length:
+                name = names.get(offset)
+                if name is None:
+                    return None
+                return (f"{prefix}{name}",
+                        ("array", ("scalar", field_bits, signed.get(offset, False)), count), True)
+        return None
 
     def arguments(self, target, return_address, entry=None):
         values = []
@@ -3202,10 +3954,47 @@ class FunctionWriter:
             return f"{target_name} = {self.converted(call, held, wanted)};"
         return f"{target_name} = {call};"
 
+    def call_syncs(self, callee, line):
+        """After a call of 'callee' (a function or a support.h helper such as move_halfwords) that
+        memory.ROM_FIELD_SYNCS names for this function, a clear of an object's bytes by address: the line that
+        makes the object's host part again from its bytes, object_sync_at(the call's first argument); else []."""
+        if (self.function.name, callee) not in memory.ROM_FIELD_SYNCS:
+            return []
+        first = line.find("(") + 1
+        depth = 0
+        for index in range(first, len(line)):
+            if line[index] in "([":
+                depth += 1
+            elif line[index] in ")]":
+                if not depth:
+                    break
+                depth -= 1
+            elif line[index] == "," and not depth:
+                break
+        if not line[first:index].strip():
+            raise SystemExit(f"ROM_FIELD_SYNCS: {self.function.name}: {line} takes no address to sync after")
+        return [f"object_sync_at({line[first:index].strip()});"]
+
     def call(self, statement):
         if statement.target is not None:
-            return [self.call_text(statement.target & 0xFFFFFF, statement.return_address)]
+            line = self.call_text(statement.target & 0xFFFFFF, statement.return_address)
+            callee = self.emitter.names.get(self.emitter.resolve(statement.target & 0xFFFFFF)[0])
+            return [line] + self.call_syncs(callee, line)
         if statement.slot is not None:
+            if memory.CODE_FIELDS:
+                # the slot holds a function's number: the runtime's call_function runs it from game_functions[],
+                # and refuses a number that is no function's
+                value = statement.address
+                while isinstance(value, ir.Op) and value.name in ("zext", "fits", "trunc"):
+                    value = value.args[0]
+                if isinstance(value, ir.Load):
+                    found = self.code_field(id(value), value.address) or self.code_field(id(statement), value.address)
+                else:
+                    found = self.code_field(id(statement), statement.address)
+                if found:
+                    return [f"call_function({self.expr(statement.address)});"]
+                raise SystemExit(f"{self.function.name}: call_code of a value that is not a code field "
+                                 f"(memory.CODE_FIELDS)")
             return [f"call_code({self.expr(statement.address)});"]
         if not statement.choices:
             raise EmitError(f"{self.function.name}: a computed call with no known targets")
@@ -3252,8 +4041,12 @@ class FunctionWriter:
                 self.not_copied.update(self.results)
                 callee = self.emitter.resolve(end.target, end.entry)[0]
                 call = self.call_expression(end.target, None, end.entry)
+                if self.call_syncs(self.emitter.names.get(callee), call):
+                    raise SystemExit(f"ROM_FIELDS: {self.function.name}: {call} returns its value, no line after it")
                 return [f"return {self.converted(call, self.emitter.result_structs.get(callee), self.emitter.result_structs.get(self.entry))};"]
-            return [self.call_text(end.target, None, end.entry)] + self.copy_out() + [self.return_text()]
+            line = self.call_text(end.target, None, end.entry)
+            callee = self.emitter.names.get(self.emitter.resolve(end.target, end.entry)[0])
+            return [line] + self.call_syncs(callee, line) + self.copy_out() + [self.return_text()]
         if isinstance(end, ir.InterruptReturn):
             if not (isinstance(end.frame, ir.Const) and end.frame.value == 0):
                 raise EmitError(f"{self.function.name}: RETIS drops stack")
@@ -3551,7 +4344,13 @@ class Emitter:
         self.param_pointers = {}    # entry -> the registers symbols.txt says it takes pointers to a structure in
         self.result_bits = {}       # entry -> bits of the register it returns, where narrower (cleanup.RESULT_BITS)
         self.second_entries = {}    # entry -> its other ways in (decompile.py), taken by entry_point
-        self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS
+        self.code_addresses = {}    # address of code calls through memory slots reach -> NAME_ADDRESS (with
+                                    # memory.CODE_FIELDS: FUNCTION_name, its number in the state)
+        self.rom_fields = []        # (family, member, offset, ctype, bias) of memory.ROM_FIELDS (decompile.py)
+        self.code_table_names = frozenset()    # the program ROM's tables of code (memory.CODE_TABLES): the C
+                                    # keeps them as arrays of the functions' numbers
+        self.code_lists = {}        # the program ROM's lists of code (memory.CODE_LIST_ELEMENTS):
+                                    # {address: (name, count, [FUNCTION_ names])}
         self.replaced = {}          # function name -> the macro its definition is written with (BOARD_ORIGINAL):
                                     # something else puts its own in its place (decompile.py, replaced_functions)
         self.trampolines = {}       # entry -> (function, way in) of a function that only jumps to another
@@ -3759,8 +4558,25 @@ class Emitter:
                 if found is not None:
                     # a place inside an array (symbols.txt: var NAME[COUNT]): its address plus how far in
                     return f"{found[0].name}_ADDRESS + 0x{address - found[0].address:X}u", cprint.ADD
-            # (a name made up of the address, a place the code reaches as a field, is no name for it)
-            return (f"{item.name}_ADDRESS", cprint.PRIMARY) if item is not None and not item.unnamed else None
+            if item is not None and not item.unnamed:
+                return f"{item.name}_ADDRESS", cprint.PRIMARY
+            if memory.STATE is not None:
+                for state_address, member, block_struct, count in memory.STATE_BLOCKS:
+                    size = pointers.STRUCTS.get(block_struct) if block_struct is not None else None
+                    if not size or not state_address <= address < state_address + size * count:
+                        continue
+                    number, offset = divmod(address - state_address, size)
+                    place = f"{memory.STATE}->{member}" + (f"[{number}]" if count > 1 else "")
+                    if offset == 0:
+                        return f"address_of(&{place})", cprint.PRIMARY
+                    layouts = self.layouts
+                    inside = layouts.member_at(block_struct, offset, None)
+                    if inside is not None:
+                        return f"address_of(&{place}.{inside})", cprint.PRIMARY
+                    path = _nested_path(block_struct, offset, None, layouts)
+                    if path is not None:
+                        return f"address_of(&{place}.{path})", cprint.PRIMARY
+            return None
         if memory.program_rom(address):
             if address < memory.ROM_NAMES_FROM and address not in self.referenced:
                 return None    # (a number below it is no address, unless an instruction names it as one)
@@ -3769,6 +4585,9 @@ class Emitter:
                 # another copy of the ROM: its own value, which may be no address at all (OutRunners' memory
                 # test counts 0xFF000 bytes, the copy of vector_table's 0x03F000 in the code ROM's fourth mirror)
                 return None
+            if memory.CODE_LIST_ELEMENTS is not None and canonical in self.code_lists:
+                raise SystemExit(f"CODE_LIST_ELEMENTS: the list of code {self.code_lists[canonical][0]} "
+                                 f"used other than as a pointer")
             item = self.memory.tables.get(canonical)
             if item is not None:
                 return f"{item.name}_ADDRESS", cprint.PRIMARY
@@ -3960,7 +4779,11 @@ class Emitter:
             return None
         lines = comment_lines(f"How call_code() runs {self.names[entry]} from a slot that holds its address: with 0 "
                               "for what it takes, and what it hands back dropped.")
-        lines += [f"static void call_{entry:06X}(void)", "{"]
+        if memory.CODE_FIELDS:
+            # (the number the state holds names it: game.h declares it, table.c's game_functions[] holds it)
+            lines += [f"void call_{self.names[entry]}(void)", "{"]
+        else:
+            lines += [f"static void call_{entry:06X}(void)", "{"]
         # what it hands back goes into variables named as the function names its result pointers
         if by_pointer:
             lines.append("\tuint32_t " + ", ".join(f"{self.param_name(entry, value)} = 0" for value in by_pointer) + ";")

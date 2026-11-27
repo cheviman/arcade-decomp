@@ -63,6 +63,9 @@ ROM_NAMES_FROM = 0x1000                      # constants below are numbers, neve
 # that the runtime sets from the game's table registry (table.c: game_tables), read by name (NAME[i]),
 # never through ROM_FUNCTION and the table's address
 LOADED_TABLES = False
+# write a variable's, table's or data label's #define NAME_ADDRESS 0x... in ram.h even when no C text reads it
+# (False: only those the C reads by address)
+UNREAD_ADDRESSES = True
 NOTES = {
     "variables": ["/* the game's variables in work RAM; SCREEN_1 and SCREEN_2 are the blocks of the two screens,",
                   "   which the code reaches through screen (R25 of the task that runs each) */"],
@@ -85,6 +88,9 @@ NAMED_BASES = {}
 STATE = None
 # (address, member, structure or None, count of structures or bytes) of the blocks of STATE's structure
 STATE_BLOCKS = ()
+TYPED_MOVES = False    # write a copy of a constant count as typed C when its ends are each one exact thing
+TYPED_POINTERS = False # carry proven state pointers through local values
+ZERO_BLOCK = None      # (start, end) of a block of zeros in the ROM: a copy from inside it is a memset
 # The game's variables the C keeps in a structure of their own in the host's memory, reached through a pointer of
 # this name (world->frame_count), instead of in STATE's: the ones HOST_VARIABLES names, which the code reaches only
 # by name. STATE's structure keeps their places, where the generated HOST_project puts them (the state's hash,
@@ -93,6 +99,31 @@ HOST = None
 HOST_VARIABLES = frozenset()
 # the generated functions whose body HOST_project and HOST_unproject bracket (they reach memory by its address)
 HOST_SYNCED = frozenset()
+# the state's fields that hold the address of code: "struct.member" for a member of a record (struct object's
+# handler), or the name of a HOST variable; the C keeps a function's number there (enum game_function, an index
+# into game_functions[]) and the generated projection (src/projection.c) puts the address in its place for the
+# state's hash. Empty: off
+CODE_FIELDS = frozenset()
+# the scoped fields of the state's objects that hold an address in the program ROM ("struct.family.member", a
+# scoped field whose target is a ROM structure or elements kind): the C keeps a typed pointer for each in the
+# object's host part (union object_host in struct HOST, reached with host_of(object)), and the generated projection
+# puts the address the original holds into the object's bytes by the family of its handler. Needs HOST and
+# CODE_FIELDS. Empty: off
+ROM_FIELDS = frozenset()
+# (function, name): the clears of an object's bytes the C follows by making the object's host part again from
+# its bytes: after each call of the function or helper 'name' in 'function', the object at the call's first
+# argument (an address: object_sync_at), and after each store of struct object's own member 'name' there (the last
+# of a clear the code makes itself, start_object's slot), that object (object_sync)
+ROM_FIELD_SYNCS = frozenset()
+# the program ROM's tables that hold only code: a named table of 32-bit elements with a count, every word the
+# entry of a function the state's code fields may hold. The C keeps them as arrays of the functions'
+# numbers (enum game_function) in table.c, not as tables the assets supply. Needs CODE_FIELDS. False: off
+CODE_TABLES = False
+# the elements kind (pointers.ELEMENTS) through which the C reads the program ROM's lists of code: a 32-bit
+# count, then that many functions (a data label, and a described table of the functions at +4). The C
+# keeps them as arrays (the count, then the functions' numbers) in table.c, and the pointers into them as
+# pointers of this kind. Needs CODE_TABLES. None: off
+CODE_LIST_ELEMENTS = None
 HARDWARE = [(0x300000, 0x320000, "VIDEO"), (0x400000, 0x420000, "SPRITE_RAM"), (0x500000, 0x500010, "SPRITE_CONTROL"),
             (0x600000, 0x610000, "PALETTE"), (0x610000, 0x620000, "MIXER"), (0x700000, 0x702000, "SOUND"),
             (0xC00000, 0xC00080, "IO"), (0xD00000, 0xD00010, "IRQ"), (0xD80000, 0xD80010, "RANDOM")]
@@ -272,13 +303,14 @@ class Item:
 
 
 class Memory:
-    def __init__(self, names, accesses, data_names=None, own=None):
+    def __init__(self, names, accesses, data_names=None, own=None, layouts=None):
         """'names': disassemble.Names; 'accesses': (address expression, bits) of every read and write;
         'data_names': {address: name} of the data labels symbols.txt has (tables of code addresses), which
         name the tables that start there; 'own': {family: accesses} of the reads and writes a family of
         functions makes of work RAM it names its own way (scoped global): an indexed one makes the family's
         variable an array, and leaves alone the variable the rest of the program knows there."""
         self.variables = {}
+        self.layouts = layouts
         self.tables = {}
         self.hardware = {}
         # where a list walk starts: a structure there would have the list's head as one of its fields
@@ -343,6 +375,8 @@ class Memory:
                 continue
             if where is None or (where == "hardware" and parts is not None):
                 continue
+            if where == "variables" and self.layouts is not None and self._in_block_field(value, bits):
+                continue
             widths[where].setdefault(value, Counter())[bits] += 1
             if parts is not None:
                 indexed.add(value)
@@ -372,6 +406,8 @@ class Memory:
                 item.state = True
         if HOST is not None:
             self.mark_host()
+        # address -> (name, words): the program ROM's tables of code (memory.CODE_TABLES), which are no asset
+        self.code_tables = {}
 
     def state_items(self):
         """The work RAM's variables under every name: the program's, the narrower ones over their first
@@ -397,6 +433,68 @@ class Memory:
                         and item.address < other.address + size(other):
                     raise SystemExit(f"HOST_VARIABLES: {name} shares bytes with {other.name}")
             item.host = True
+
+    def _in_block_field(self, address, bits):
+        """Whether the 'bits' at a constant address inside a STATE_BLOCKS block (structure not None) are
+        named by the block's layout (_block_has_field): the block's member path names them, so Memory adds
+        no unnamed item for them."""
+        for block_addr, member, structure, count in STATE_BLOCKS:
+            if structure is None:
+                continue
+            block_size = pointers.STRUCTS.get(structure, 0)
+            if block_size == 0 or not (block_addr <= address < block_addr + block_size * count):
+                continue
+            if self._block_has_field(structure, (address - block_addr) % block_size, bits):
+                return True
+        return False
+
+    def _scalar_at(self, struct, pos):
+        """The size in bytes of the scalar field or array element that starts exactly at 'pos' in
+        'struct', or None if 'pos' is not the start of such an item (e.g. it is inside a nested
+        member)."""
+        nested = self.layouts.nested.get(struct, {})
+        for nest_offset, (name, nest_struct, count) in nested.items():
+            nest_size = pointers.STRUCTS.get(nest_struct, 0)
+            if nest_size == 0:
+                continue
+            if nest_offset <= pos < nest_offset + nest_size * count:
+                return None
+        found = self.layouts.lookup(struct, pos) or pointers.array_holding(struct, pos)
+        if found is None:
+            return None
+        field_offset, field_bits = found
+        elem_size = field_bits // 8
+        if pos == field_offset:
+            return elem_size
+        if (pos - field_offset) % elem_size != 0:
+            return None
+        count = self.layouts.array_count(struct, field_offset)
+        if count is None or (pos - field_offset) // elem_size >= count:
+            return None
+        return elem_size
+
+    def _block_has_field(self, struct, offset, bits):
+        """Whether the bits // 8 bytes at 'offset' of the layout 'struct' are named by the layout,
+        descending through nested structures, so that no unnamed item is made for them: a field or an
+        array element of exactly 'bits' there, or whole fields or elements laid end to end over them,
+        the first one starting at 'offset' (a halfword over two bytes of an array, read as each by its
+        path), none of them inside a nested member."""
+        nested = self.layouts.nested.get(struct, {})
+        for nest_offset, (name, nest_struct, count) in nested.items():
+            nest_size = pointers.STRUCTS.get(nest_struct, 0)
+            if nest_size == 0:
+                continue
+            if not (nest_offset <= offset < nest_offset + nest_size * count):
+                continue
+            return self._block_has_field(nest_struct, (offset - nest_offset) % nest_size, bits)
+        end = offset + bits // 8
+        place = offset
+        while place < end:
+            size = self._scalar_at(struct, place)
+            if size is None or place + size > end:
+                return False
+            place += size
+        return True
 
     def add_unnamed(self, items, widths, name_of):
         for address, counts in sorted(widths.items()):
@@ -594,6 +692,8 @@ class Memory:
                             lines += self.declare(overlay, RAM_MACRO, RAM_FUNCTION)
         lines += [""] + NOTES["tables"]
         for address, item in sorted(self.tables.items()):
+            if address in self.code_tables:
+                continue    # (a table of code is C data of function numbers: table.c)
             lines += self.declare(item, ROM_MACRO, ROM_FUNCTION)
         lines += [""] + NOTES["hardware"]
         for address, item in sorted(self.hardware.items()):
@@ -743,7 +843,13 @@ class Memory:
         for function, to, source in ((f"{HOST}_project", STATE, HOST), (f"{HOST}_unproject", HOST, STATE)):
             lines += [comments[function], f"void {function}(void)", "{"]
             for item in self.host_items():
-                if item.indexed:
+                if item.name in CODE_FIELDS:
+                    # a code field: the C keeps a function's number, the work RAM the address
+                    if to == STATE:
+                        lines.append(f"\t{to}->{item.name} = function_address({source}->{item.name});")
+                    else:
+                        lines.append(f"\t{to}->{item.name} = address_function({source}->{item.name});")
+                elif item.indexed:
                     lines += [f"\tfor (size_t index = 0; index < 0x{item.count:X}; index++)",
                               f"\t\t{to}->{item.name}[index] = {source}->{item.name}[index];"]
                 else:
@@ -756,7 +862,7 @@ class Memory:
         records."""
         if not LOADED_TABLES:
             return []
-        found = [(address, item.name) for address, item in self.tables.items()]
+        found = [(address, item.name) for address, item in self.tables.items() if address not in self.code_tables]
         found += [(address, name) for address, (name, _) in pointers.RECORD_TABLES.items()]
         return sorted(found)
 

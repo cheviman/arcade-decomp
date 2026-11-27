@@ -140,9 +140,17 @@ ELEMENTS = {}                  # structure -> element type: an array of one valu
 UNALIGNED = set()              # of those, the ones the program keeps at addresses that are not a multiple of
                                # their width ("elements ... unaligned"): read through a type of alignment 1
 RECORD_TABLES = {}             # program ROM address -> (name, ROM structure): a table of records, name[i].field
+RECORD_POINTERS = False        # a pointer the C keeps to a record of one of those tables, the table's address
+                               # plus whole records, reads &name[i] (the table itself) rather than rom_pointer()
+RECORD_OFFSETS = False         # with RECORD_POINTERS: a number of records worked out in fewer bits ((uint8_t)(x *
+                               # 2u) * 4u in records of 8: x & 0x7F), and a record a number of bytes into a table
+                               # that is not whole records (record_at(name, bytes)), read through the table
+                               # rather than rom_pointer()
 SCOPED_ARRAYS = {}             # (struct, family, offset) -> (bits, count): a family's field that is an array
 FIELD_ARRAYS = {}              # (struct, offset) -> (bits, count): a field that is an array of 'count' elements
                                # of 'bits' (None: it goes on past the record's end), read STRUCT(p)->field[i]
+MEMBERS = {}                   # struct -> {offset: (name, structure, count)}: a structure inside another
+                               # (symbols.txt "member"), read outer->name.field or outer->name[k].field
 
 
 BASES = {}                     # name -> address of the program's data, for "STRUCT@NAME" (decompile.py)
@@ -409,6 +417,23 @@ def scaled_count(node, size, zeros=None):
     if factor > size and factor % size == 0:
         return ir.op("mul", (base, ir.Const(factor // size, base.bits)), base.bits)
     return None
+
+
+def outer_scaled_count(node, size):
+    """The number of whole records of 'size' bytes in a constant factor times an offset worked out in fewer
+    bits, where the two factors make the record: (uint8_t)(x * 2u) * 4u in records of 8 is x & 0x7F
+    (narrow_count with the size over the outer factor). None otherwise."""
+    factor, base = 1, node
+    while isinstance(base, ir.Op) and (base.name == "shl" and isinstance(base.args[1], ir.Const)
+                                       or base.name == "mul" and any(isinstance(arg, ir.Const) for arg in base.args)):
+        if base.name == "shl":
+            factor, base = factor << base.args[1].value, base.args[0]
+        else:
+            constant, other = (base.args[1], base.args[0]) if isinstance(base.args[1], ir.Const) else base.args
+            factor, base = factor * constant.value, other
+    if factor <= 1 or factor >= size or size % factor:
+        return None
+    return narrow_count(base, size // factor)
 
 
 def records_kind(kind):
@@ -834,6 +859,15 @@ def arrays_of(struct, family):
                 yield start, bits, count
 
 
+def array_holding(struct, offset):
+    """(field offset, element bits) of the field of 'struct' that is an array of a known count whose elements
+    hold 'offset', or None: Layouts.lookup finds an array by its first element only."""
+    for start, bits, count in arrays_of(struct, None):
+        if count and start <= offset < start + bits // 8 * count:
+            return start, bits
+    return None
+
+
 def in_field_array(struct, offset, base, base_offset, family):
     """access()'s answer for a field at 'offset' of 'struct': past the start of a field that is an array
     (FIELD_ARRAYS, the family's SCOPED_ARRAYS), that array's element (a pointer moved into it reads name[1],
@@ -858,6 +892,62 @@ def array_access(kind, pointer, constant, rest, zeros=None, whole_records=True):
         found = array_element(kind, pointer, constant, rest, zeros, whole_records, before)
         if found is not None:
             return found
+    return None
+
+
+def member_array_element(kind, pointer, constant, rest, zeros, whole_records, before):
+    """array_element() for an array field of a structure that is a member of kind[0] (MEMBERS): the outer
+    pointer and its structure are kept, and the member's path is named by emit.py from the returned offset."""
+    offset = kind[1] + constant
+    members = MEMBERS.get(kind[0])
+    if not members:
+        return None
+    family = family_of(kind)
+    for member_start, (member_name, inner, member_count) in members.items():
+        inner_size = STRUCTS.get(inner)
+        if not inner_size:
+            continue
+        member_count = 1 if member_count is None else int(member_count)
+        if not member_start <= offset < member_start + inner_size * member_count:
+            continue
+        member_number = (offset - member_start) // inner_size
+        inner_offset = (offset - member_start) % inner_size
+        if member_number >= member_count:
+            continue
+        for start, bits, count in arrays_of(inner, None):
+            width = bits // 8
+            array_start = member_start + member_number * inner_size + start
+            within = offset - array_start
+            limit = count * width if count is not None else (inner_size - start if member_count > 1 else None)
+            if before:
+                if whole_records or within != -width or not rest:
+                    continue
+            elif within < 0 or within % width or (limit is not None and within >= limit):
+                continue
+            element_terms = []
+            for term in rest:
+                # a term that counts member elements is a constant member choice, not an array index
+                if scaled_count(term, inner_size, zeros) is not None:
+                    break
+                by_element = scaled_count(term, width, zeros)
+                if by_element is None:
+                    break
+                element_terms.append(by_element)
+            else:
+                if before:
+                    if len(element_terms) != 1:
+                        continue
+                    counted = ir.op("add", (element_terms[0], ir.Const(0xFFFFFFFF, 32)), 32)
+                    number = ir.Const(0, 32) if isinstance(pointer, ir.Const) else None
+                    return kind[0], array_start, pointer, kind[1], family, number, counted
+                element = ir.Const(within // width, 32)
+                if element_terms:
+                    summed = element_terms[0]
+                    for term in element_terms[1:]:
+                        summed = ir.op("add", (summed, term), 32)
+                    element = summed if not within else ir.op("add", (summed, element), 32)
+                number = ir.Const(0, 32) if isinstance(pointer, ir.Const) else None
+                return kind[0], array_start, pointer, kind[1], family, number, element
     return None
 
 
@@ -908,7 +998,7 @@ def array_element(kind, pointer, constant, rest, zeros, whole_records, before):
             else:
                 number = ir.Const(record & 0xFFFFFFFF, 32) if record or isinstance(pointer, ir.Const) else None
             return kind[0], start, pointer, kind[1], family_of(kind), number, element
-    return None
+    return member_array_element(kind, pointer, constant, rest, zeros, whole_records, before)
 
 
 def counted_from(element, behind):
@@ -1033,7 +1123,7 @@ def indexed_access(address, state, in_fields=True, zeros=None):
                     here, pointer_here, constant_here = (placed[0], 0), moved(term, at - placed[1] - found[1]), placed[1]
                 else:
                     here, pointer_here, constant_here = found, term, constant
-                if any(True for _ in arrays_of(here[0], family_of(here))):
+                if any(True for _ in arrays_of(here[0], family_of(here))) or MEMBERS.get(here[0]):
                     hit = array_access(here, pointer_here, constant_here, rest, zeros, whole_records=False)
                     if hit is not None:
                         return hit
@@ -1506,6 +1596,20 @@ class Layouts:
         self.nested = {}    # struct -> {offset: (name, structure, count)}: structures inside it, its members
         for (struct, offset), member in (getattr(names, "members", None) or {}).items():
             self.nested.setdefault(struct, {})[offset] = member
+        rebased = {}
+        def count_access(struct, offset, bits, number):
+            for start, (name, inner, count) in self.nested.get(struct, {}).items():
+                size = STRUCTS.get(inner, 0)
+                if size and start <= offset and offset + bits // 8 <= start + size * count:
+                    count_access(inner, (offset - start) % size, bits, number)
+                    return
+            rebased.setdefault(struct, {}).setdefault(offset, {}).setdefault(bits, 0)
+            rebased[struct][offset][bits] += number
+        for struct, offsets in counts.items():
+            for offset, widths in offsets.items():
+                for bits, number in widths.items():
+                    count_access(struct, offset, bits, number)
+        counts = rebased
         if names is not None:
             for (struct, offset, bits), (name, kind) in names.overlays.items():
                 if struct != "global":
@@ -1562,6 +1666,18 @@ class Layouts:
                     and not (offset - start) % size:
                 return name + (f"[{(offset - start) // size}]" if count > 1 else "")
         return None
+
+    def member_target(self, struct, offset):
+        """(path, structure, offset) of the innermost member structure holding 'offset'; ('', struct,
+        offset) when there is no member there."""
+        for start, (name, inner, count) in self.nested.get(struct, {}).items():
+            size = STRUCTS.get(inner, 0)
+            if size and start <= offset < start + size * count:
+                element = (offset - start) // size
+                prefix = name + (f"[{element}]" if count > 1 else "")
+                path, inner2, offset2 = self.member_target(inner, (offset - start) % size)
+                return (prefix + "." + path if path else prefix, inner2, offset2)
+        return "", struct, offset
 
     def drop_unread(self, texts):
         """Forgets the fields with a made-up name (unk_30) that the code of none of the C 'texts' reads: it
