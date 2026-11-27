@@ -389,7 +389,7 @@ def main():
             found = count([path])
             if found["rom_reads"] or found["rom_names"]:
                 print(f"{found['rom_reads']:9d} {found['rom_names']:9d}  {path.relative_to(source).as_posix()}")
-    if "--save" in arguments and source == ROOT / "src":
+    if "--save" in arguments and "--src" not in arguments:
         BASELINE.write_text("# KIND COUNT: tools/noise_report.py --save writes it\n" +
                             "".join(f"{kind} {value}\n" for kind, value in counts.items()), encoding="ascii")
         print(f"saved in {BASELINE.relative_to(ROOT)}")
