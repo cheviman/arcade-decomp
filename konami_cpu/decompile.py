@@ -6,11 +6,11 @@ Description: decompiles a Konami CPU program (the 053248's, banked) into readabl
              function
 Version:     0.1.0
 Created:     06-11-2026
-Modified:    11-11-2026
+Modified:    27-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/decompile.py [rom folder or .zip] [--check] [--checks] [--trace] [--out DIR] [--symbols FILE]
-                                 [--variables FILE]
+                                 [--variables FILE] [--interfaces FILE]
        (the core's decompile.py runs this when the game's profile says DECOMPILER = "konami_cpu.decompile")
   --check     build every function's IR and report what does not lift or whose stack the C cannot follow, without
               writing anything
@@ -20,6 +20,8 @@ Usage: python tools/decompile.py [rom folder or .zip] [--check] [--checks] [--tr
   --out       where to write the C (src/ by default)
   --symbols   the names to use instead of symbols.txt
   --variables also list every function's local variables and the instructions that write them
+  --interfaces write what each function takes and hands back, and the calls that read what one hands back
+              themselves, by name (two versions of the program compare), instead of the C
 
 The program goes through the decompiler the V60, 68000 and Z80 programs go through (decompiler/), with the Konami
 CPU's profile (konami_cpu/function.KONAMI): konami_cpu/function.py splits it into functions from the static
@@ -334,6 +336,26 @@ def declared_results(program, open_set):
     return found
 
 
+def declared_unread(program):
+    """symbols.txt's unread lines: {entry: {register number}}, the registers a function reads before setting them only
+    on paths the game never takes (request_absent_player_palettes of the 2 players version hands palette_request U,
+    which only its kind 1 reads, with kind 2): no parameter, they start at 0, as decompile.py's"""
+    entries = {name: entry for entry, name in program.names.items()}
+    found = {}
+    for function_name, register in disassemble.load_names(SYMBOLS, REGISTERS).unread:
+        entry = entries.get(function_name)
+        if entry is None:
+            raise SystemExit(f"{SYMBOLS.name}: an unread register of {function_name}, which is no function")
+        found.setdefault(entry, set()).add(register)
+    return found
+
+
+def zero_unread(flow):
+    """The unread registers (signatures.UNREAD) start at 0 in their functions: the data flow takes them for no input"""
+    for entry, registers in signatures.UNREAD.items():
+        flow.zeroed[entry] = flow.zeroed.get(entry, set()) | {("r", register) for register in registers}
+
+
 def caller_exits_always_said(built, exiting):
     """A function that may return past its caller (stack.link_caller_exits: PULLS D,PC) sets LEFT_CALLER on that way
     out; on its others it clears it, so that whether it did is a result it always hands back, not a value it passes
@@ -376,6 +398,8 @@ def analyse(program, built):
     flow = dataflow.Program(built, program.analysis, interrupt_handlers(program), signatures.CONTEXT)
     signatures.OPEN = open_entries(program, built)
     flow.declared = declared_results(program, signatures.OPEN)
+    signatures.UNREAD = declared_unread(program)
+    zero_unread(flow)
     flow.solve()
     # (with CARRIED, the registers that can carry something are never taken for put back: a PUSHS Y ... PULLS Y around
     # code that hands on what Y carries is a save and a restore of that global, which the C keeps as code)
@@ -452,6 +476,7 @@ def carry(program, built, flow, found):
     flow.context = frozenset(("r", virtual[key], part) for key, parts in found_carried.carried_groups().items()
                              if key in virtual and virtual[key] in used for part in parts)
     flow.declared = declared_results(program, signatures.OPEN)
+    zero_unread(flow)
     flow.solve()
     flow.shrink_outputs()
     flow.conditions_recovered = recovered
@@ -666,7 +691,37 @@ def keep_alive(alive, function):
                 alive.extend(ir.walk(expression))
 
 
-def write_c(program, out_dir, variables_path=None, trace=False):
+def write_interfaces(path, program, flow, found):
+    """--interfaces: what each function takes and hands back ('interface NAME params=... results=...', from its
+    signature) and the calls that read a value a function hands back themselves ('read CALLER PLACE CALLEE VALUE',
+    flow.direct_reads: where a value handed back starts being needed), by name, so that two versions of the program
+    compare"""
+    def name(entry):
+        return program.names.get(entry, f"{entry:06X}")
+
+    def value_name(value):
+        if value[0] != "r":
+            return str(value[1])
+        return cpu.current.register_names.get(value[1]) or cpu.current.variable_names.get(value[1]) or f"r{value[1]}"
+
+    lines = []
+    for entry in sorted(found, key=name):
+        signature = found[entry]
+        params = ",".join(sorted(value_name(value) for value in signature.params)) or "-"
+        results = ",".join(sorted(value_name(value) for value in signature.results)) or "-"
+        lines.append(f"interface {name(entry)} params={params} results={results}")
+    reads = set()
+    for caller, call, target, variable in flow.direct_reads():
+        if variable[0] == "r" and variable[1] in signatures.CONTEXT:
+            continue
+        origin = getattr(call, "origin", None)
+        reads.add((name(caller), "?" if origin is None else f"{origin:06X}", name(target), value_name(variable)))
+    lines += [f"read {caller} {origin} {target} {value}" for caller, origin, target, value in sorted(reads)]
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"interfaces: {len(found)} functions, {len(reads)} reads of values handed back, in {path}")
+
+
+def write_c(program, out_dir, variables_path=None, trace=False, interfaces_path=None):
     built, failures, unfollowed = settle(program)
     if failures:
         raise SystemExit(f"{len(failures)} functions do not lift, the first: {failures[0][0]:06X} {failures[0][1]}")
@@ -679,6 +734,9 @@ def write_c(program, out_dir, variables_path=None, trace=False):
         flow, found, carrying = carry(program, built, flow, found)
         print(f"carried:    {len(carrying)} registers' values kept as globals: "
               + ", ".join(cpu.current.variable_names[number] for number in carrying))
+    if interfaces_path is not None:
+        write_interfaces(interfaces_path, program, flow, found)
+        return 0
     names = dict(program.names)
     for entry, function_name in names.items():
         if not IDENTIFIER.match(function_name) or function_name in TAKEN:
@@ -982,8 +1040,8 @@ def main(arguments):
     arguments = list(arguments)
     decompiler_emit.CHECKED_JUMPS = "--checks" in arguments
     out_dir = game_profile.SOURCE
-    variables_path = None
-    for option in ("--out", "--symbols", "--variables"):
+    variables_path = interfaces_path = None
+    for option in ("--out", "--symbols", "--variables", "--interfaces"):
         if option in arguments:
             position = arguments.index(option)
             value = Path(arguments[position + 1])
@@ -992,8 +1050,10 @@ def main(arguments):
                 out_dir = value
             elif option == "--symbols":
                 SYMBOLS = value
-            else:
+            elif option == "--variables":
                 variables_path = value
+            else:
+                interfaces_path = value
     checking = "--check" in arguments
     tracing = "--trace" in arguments
     arguments = [argument for argument in arguments if argument not in ("--check", "--checks", "--trace")]
@@ -1005,7 +1065,7 @@ def main(arguments):
     print(f"analysis:   {len(program.entries)} functions, {time.time() - started:.0f} s")
     if checking:
         return check(program)
-    return write_c(program, out_dir, variables_path, tracing)
+    return write_c(program, out_dir, variables_path, tracing, interfaces_path)
 
 
 if __name__ == "__main__":

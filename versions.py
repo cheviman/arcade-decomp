@@ -483,12 +483,24 @@ def rewrite_symbols(cpu, lines, places, gone, entries=None, structs=(), data=())
                    if len(words) > 2 and cpu.TOKEN.fullmatch(words[0]) and words[1] in cpu.DATA_KINDS
                    and int(words[0], 16) not in places}
 
+    paired = sorted(places)
+
+    def moved_like_the_one_before(site):
+        # (the paired instruction just before the site moved by as much: the site is in code the version kept as it
+        # was, wherever its function's entry went; find_nearest_player's is a LBRA of the fixed program's jump table)
+        before = bisect_left(paired, site) - 1
+        if before < 0:
+            return False
+        neighbour = paired[before]
+        return cpu.area_of(neighbour) == cpu.area_of(site) and places[site] - site == places[neighbour] - neighbour
+
     def near_its_start(function, where):
         if function not in entries or entries[function] not in places:
             return True
         start = entries[function]
         return all(cpu.area_of(int(part, 16)) == cpu.area_of(start) and cpu.area_of(places[int(part, 16)]) == cpu.area_of(places[start])
                    and abs((places[int(part, 16)] - places[start]) - (int(part, 16) - start)) <= LOCAL_SLACK
+                   or moved_like_the_one_before(int(part, 16))
                    for part in where)
 
     def drop(line):

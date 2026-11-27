@@ -223,6 +223,7 @@ class Analysis:
         self.entry_fields = {}      # {place of a table entry's code address: the place it holds}
         self.from_flow = set()      # block starts the walk reaches by a branch, a jump, a call or a vector
         self.from_table = set()     # and by a table's entry
+        self.backward_targets = set()   # the places entries read before a table's address (a negative index) hold
         self.unresolved = {}        # {place: what} of the jumps and calls the analysis cannot follow
         self.entry_states = {}      # what the registers and the bank can hold where a block starts
         self.work = deque()
@@ -265,9 +266,9 @@ class Analysis:
             instruction = self.decode(bank, cpu)
             if instruction.flow == dis.FLOW_INVALID:
                 return False
-            if instruction.mnemonic == "PULLS":
+            if instruction.mnemonic == "pulls":
                 return True
-            if instruction.mnemonic == "PUSHS" or instruction.mnemonic == "LEAS":
+            if instruction.mnemonic in ("pushs", "leas"):
                 return False
             if any(operand.mode == "indexed" and operand.reg == "S" for operand in instruction.operands):
                 return True
@@ -401,6 +402,8 @@ class Analysis:
                         break
                     low, high = self.table_spans.get(table, (table, table))
                     self.table_spans[table] = (min(low, record_place), max(high, record_place + length))
+                    if index < 0:
+                        self.backward_targets.add(target)
                 entries.append((value, entry_bank))
                 target = place_of(entry_bank, value)
                 if target is not None and value not in UNUSED_ENTRIES:
@@ -844,6 +847,18 @@ class Analysis:
                             bad.add(second)
                         elif place in by_flow and start not in by_flow:
                             bad.add(first)
+            # an entry read backwards at a place the code just before it runs into, which no call and no line of
+            # symbols.txt makes an entry: the middle of a routine (the 2 players version's stage 7 boss's states took
+            # 079423, a label of move_objects after its "SEX", and the knight's steps 07BD0A, after "LEAX #$00C0,X";
+            # the base has an instruction's middle at both)
+            called = {place_of(bank_of(start), instruction.target) for start, instruction in self.instructions.items()
+                      if instruction.flow == dis.FLOW_CALL and instruction.target is not None}
+            ends = {start + instruction.length: start for start, instruction in self.instructions.items()}
+            for target in self.backward_targets:
+                before = ends.get(target)
+                if target in by_flow and target not in called and target not in self.symbols and before in by_flow \
+                        and self.instructions[before].flow in (dis.FLOW_NORMAL, dis.FLOW_BRANCH):
+                    bad.add(target)
             if inside <= self.data_starts and cut <= self.code_starts and bad <= self.bad_entries \
                     and covered <= self.code_behind:
                 self.finish()

@@ -3,7 +3,7 @@ Name:        dataflow.py
 Description: what each function reads, writes and hands back in registers and flags, across the program
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    01-11-2026
+Modified:    27-11-2026
 Author:      Sebastian Toyos
 
 Variables are the parts of the V60 registers (("r", n, part): part 0 is bits 0-7, part 1 bits 8-15,
@@ -1080,6 +1080,21 @@ class Program:
                     if summary.passes.get(key) != reads:
                         summary.passes[key] = reads
                         changed = True
+
+    def direct_reads(self):
+        """[(caller, call, target, variable)]: an output of a callee that its caller reads itself after the call (with
+        nothing live where the caller ends), where the outputs least_outputs keeps start; the rest are handed back up
+        from there. For a report (konami_cpu/decompile.py --interfaces): which call makes a function hand a value
+        back"""
+        found = []
+        for caller in self.functions:
+            for call, live in self.liveness(caller, record_calls=True, exit_live=frozenset())[1]:
+                if call.slot is not None:
+                    continue
+                for target in self.call_targets(call):
+                    if target in self.summaries:
+                        found += [(caller, call, target, variable) for variable in live & self.summaries[target].writes]
+        return found
 
     def live_after_calls(self, entry):
         return self.liveness(entry, record_calls=True)[1]
