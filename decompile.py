@@ -628,9 +628,8 @@ def call_results(function, found, flow):
     return results
 
 
-def write_index(out_dir, program, built, flow, names, texts, entries):
-    """index.txt: for every function, where its C is, its size, who calls it and what it calls, the
-    named things its C mentions, and whether a scenario of tests/controls ran it (build/scenarios)."""
+def call_graph(built, flow):
+    """(callers, callees) of every function in built: the calls and tail calls of its IR the flow resolves."""
     callers = {entry: set() for entry in built}
     callees = {entry: set() for entry in built}
     for entry, function in built.items():
@@ -648,6 +647,13 @@ def write_index(out_dir, program, built, flow, names, texts, entries):
                 if target in built:
                     callees[entry].add(target)
                     callers[target].add(entry)
+    return callers, callees
+
+
+def write_index(out_dir, program, built, flow, names, texts, entries):
+    """index.txt: for every function, where its C is, its size, who calls it and what it calls, the
+    named things its C mentions, and whether a scenario of tests/controls ran it (build/scenarios)."""
+    callers, callees = call_graph(built, flow)
     executed = set()
     traces = sorted((ROOT / "build" / "scenarios").glob("*/executed.txt"))
     if traces:
@@ -1697,8 +1703,11 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
             if rom_fields:
                 proj_block = [
                     "/* the families of the objects' fields that hold an address in the program ROM (memory.ROM_FIELDS), and the one",
-                    "   of each function of game_functions[]: the family its name starts with (an object's handler says which",
-                    "   family's fields the object holds) */",
+                    "   of each function of game_functions[]: the family its name starts with, or, when that one holds no ROM",
+                    "   field, the one whose ROM fields the functions it calls use on its object (scenery_update's object is",
+                    "   road_row's: road_row_start reads its record; flashing_scenery_update, which calls only road_row_draw",
+                    "   and road_row_crash_check, has none); a family the function also reaches holds its fields at the same",
+                    "   offsets (step_palette's palette_list under the letters' and panels') */",
                     "enum object_family",
                     "{",
                     "\tOBJECT_FAMILY_NONE,",
@@ -1709,11 +1718,98 @@ def write_c(program, out_dir, trace=False, variables_path=None, split_webs=False
                 proj_block.append("")
                 proj_block.append("static const uint8_t function_families[FUNCTION_COUNT] =")
                 proj_block.append("{")
+                _, callees = call_graph(built, flow)
+                store_re = re.compile(
+                    r"^current_object->(\w+)(?:\.(\w+))?(\[[^\]]*\])?\s*"
+                    r"(?:\+\+|--|(?:[-+*/%&|^]|<<|>>)?=(?!=))"
+                )
+
+                def unsynced_store(text, family):
+                    lines = text.splitlines()
+                    for i, line in enumerate(lines):
+                        m = store_re.match(line.strip())
+                        if not m:
+                            continue
+                        g1, g2, g3 = m.groups()
+                        if g2:
+                            # (a family's member: its offset by its name in the family's view)
+                            starts = emitter.layouts.scoped["object"].get(g1, {})
+                            found = next(((off, bits) for off, (name, bits, _signed) in starts.items()
+                                          if name == g2), None)
+                            if found is None:
+                                continue
+                            offset, bits = found
+                        else:
+                            # (one of struct object's own members)
+                            starts = emitter.layouts.names["object"]
+                            offset = next((off for off, name in starts.items() if name == g1), None)
+                            if offset is None:
+                                continue
+                            bits = emitter.layouts.fields["object"].get(offset, 32)
+                        if g3:
+                            next_off = min((o for o in starts if o > offset), default=None)
+                            end = next_off - 1 if next_off is not None else 0xFF
+                        else:
+                            end = offset + bits // 8 - 1
+                        stored = g1
+                        if g2:
+                            stored += "." + g2
+                        if g3:
+                            stored += g3
+                        for f_family, f_member, f_offset, _ctype, _bias in rom_fields:
+                            if f_family != family:
+                                continue
+                            f_end = f_offset + 3
+                            if offset <= f_end and end >= f_offset:
+                                if i + 1 < len(lines):
+                                    next_line = lines[i + 1].strip()
+                                else:
+                                    next_line = ""
+                                if next_line != "object_sync(current_object);":
+                                    return (stored, f_member, f_offset)
+                    return None
+
                 for address in table:
                     if address in names:
-                        family = emitter.family_of(address, "object")
-                        if family in rom_families:
-                            proj_block.append(f"\t[FUNCTION_{names[address]}] = OBJECT_FAMILY_{family},")
+                        # the families whose ROM fields the function and the functions it calls run on
+                        visited, stack, reached = {address}, [address], set()
+                        while stack:
+                            current = stack.pop()
+                            reached |= {
+                                found for found in re.findall(
+                                    r"host_of\(current_object\)->(\w+)\.", texts.get(current, "")
+                                ) if found in rom_families
+                            }
+                            for target in callees.get(current, ()):
+                                if target not in visited:
+                                    visited.add(target)
+                                    stack.append(target)
+                        own = emitter.family_of(address, "object")
+                        if own in rom_families:
+                            family = own
+                        elif len(reached) == 1:
+                            family = next(iter(reached))
+                        elif not reached:
+                            continue
+                        else:
+                            raise SystemExit(f"ROM_FIELDS: {names[address]} runs on the fields of "
+                                             f"{', '.join(sorted(reached))}: no family of its own says which")
+                        # a family it also reaches has to keep its fields where the chosen family's are
+                        for other in sorted(reached - {family}):
+                            for _family, member, offset, _ctype, bias in (f for f in rom_fields if f[0] == other):
+                                if not any(f[0] == family and f[2] == offset and f[4] == bias for f in rom_fields):
+                                    raise SystemExit(f"ROM_FIELDS: {names[address]} runs on {other}.{member} (offset "
+                                                     f"{offset:X}), which {family}'s fields do not hold at that offset")
+                        for g in visited:
+                            result = unsynced_store(texts.get(g, ""), family)
+                            if result:
+                                stored, member, offset = result
+                                raise SystemExit(
+                                    f"ROM_FIELDS: {names[address]} is projected as {family}, and "
+                                    f"{names.get(g, hex(g))} stores {stored} over {family}.{member} "
+                                    f"(offset {offset:X}) with no object_sync after it"
+                                )
+                        proj_block.append(f"\t[FUNCTION_{names[address]}] = OBJECT_FAMILY_{family},")
                 proj_block.append("};")
                 proj_block.append("")
                 proj_block.append("/* the address the original holds for a pointer into the program's data, 'bias' bytes into the record it")
