@@ -1,7 +1,7 @@
 """
 Name:        sound_data_text.py
 Description: a sound program's data pieces (a Z80 program, little endian) as text by name, and back byte for byte
-Version:     0.2.0
+Version:     0.3.0
 Created:     26-11-2026
 Modified:    27-11-2026
 Author:      Sebastian Toyos
@@ -20,4 +20,5 @@ record_lines = Z80.record_lines
 read_lines = Z80.read_lines
 write = Z80.write
 read = Z80.read
+layout = Z80.layout
 compare = Z80.compare

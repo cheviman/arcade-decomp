@@ -1,7 +1,7 @@
 r"""
 Name:        data_text.py
 Description: a program's data pieces as text by name, and back byte for byte
-Version:     0.3.0
+Version:     0.4.0
 Created:     27-11-2026
 Modified:    27-11-2026
 Author:      Sebastian Toyos
@@ -22,6 +22,11 @@ tools/data_assets.py, with its colours and characters).
 A kind whose lines say what its bytes give rather than the bytes (a packed map's cells) has a packer: read's
 packers, {KIND: pack(data, lines, where)}, the bytes of a section whose [NAME] line's comment is that KIND from the
 bytes its lines give and its lines (for a hint a line holds).
+
+A family whose pieces another tool writes and gives back (a sound program's music, as MIDI files) is elsewhere:
+write's elsewhere, {FAMILY: where}, gives its pieces their layout lines and no FAMILY.txt (an old one is deleted);
+read's elsewhere, the families it leaves to those tools, reads no FAMILY.txt for them and leaves their pieces out;
+layout() gives every piece's place, length and family, theirs too.
 """
 import re
 from bisect import bisect_right
@@ -308,13 +313,18 @@ class Format:
                 at += 1
         return bytes(out)
 
-    def write(self, out, sections):
-        """The folder 'out': a FAMILY.txt a family and layout.txt, from [(family, name, kind, place, length, lines)]"""
+    def write(self, out, sections, elsewhere=None):
+        """The folder 'out': a FAMILY.txt a family and layout.txt, from [(family, name, kind, place, length, lines)];
+        a family of 'elsewhere' ({family: where}) only in layout.txt"""
         out = Path(out)
         out.mkdir(parents=True, exist_ok=True)
+        elsewhere = elsewhere or {}
         families = {}
         layout = []
         for family, name, kind, place, length, lines in sections:
+            if family in elsewhere:
+                layout.append((place, name, length, family))
+                continue
             if family not in families:
                 families[family] = [
                     f"# {self.program}'s {family}: each piece's [NAME]  # KIND, then its lines "
@@ -325,15 +335,18 @@ class Format:
             layout.append((place, name, length, family))
         for family, lines in families.items():
             (out / f"{family}.txt").write_text("\n".join(lines) + "\n", encoding="ascii")
+        for family in elsewhere:
+            if (out / f"{family}.txt").exists():
+                (out / f"{family}.txt").unlink()
         layout_lines = [f"# NAME PLACE LENGTH FAMILY: each piece, where {self.program} has it "
                         "(PLACE hex, LENGTH decimal)"]
+        layout_lines += [f"# the family {family}: {where}" for family, where in elsewhere.items()]
         layout_lines += [f"{name} {place:0{self.place_digits}X} {length} {family}"
                          for place, name, length, family in sorted(layout)]
         (out / "layout.txt").write_text("\n".join(layout_lines) + "\n", encoding="ascii")
 
-    def read(self, out, functions, packers=None):
-        """{name: (place, bytes)} of the pieces the folder 'out' gives ('functions': {address: name}, for the refs;
-        'packers': {kind: pack(data, lines, where)}, the bytes of the sections of a kind whose lines are not them)"""
+    def layout(self, out):
+        """{name: (place, length, family)} of every piece of the folder 'out's layout.txt"""
         out = Path(out)
         layout_path = out / "layout.txt"
         if not layout_path.exists():
@@ -348,10 +361,19 @@ class Format:
             if parts[0] in layout:
                 raise SystemExit(f"{layout_path}, line {number}: {parts[0]} again")
             layout[parts[0]] = (int(parts[1], 16), int(parts[2]), parts[3])
+        return layout
+
+    def read(self, out, functions, packers=None, elsewhere=()):
+        """{name: (place, bytes)} of the pieces the folder 'out' gives ('functions': {address: name}, for the refs;
+        'packers': {kind: pack(data, lines, where)}, the bytes of the sections of a kind whose lines are not them;
+        the pieces of the families 'elsewhere' left out)"""
+        out = Path(out)
+        layout = self.layout(out)
         names = Names({place: (place + length, name) for name, (place, length, _) in layout.items()}, functions)
         families = {}
         for name, (_, _, family) in layout.items():
-            families.setdefault(family, set()).add(name)
+            if family not in elsewhere:
+                families.setdefault(family, set()).add(name)
         sections, kinds = {}, {}
         for family in families:
             path = out / f"{family}.txt"
@@ -372,7 +394,7 @@ class Format:
                 elif line.startswith("  ") and current is not None:
                     sections[family][current].append(line.strip())
         for name, (_, _, family) in layout.items():
-            if name not in sections.get(family, {}):
+            if family not in elsewhere and name not in sections.get(family, {}):
                 raise SystemExit(f"{family}.txt: no section for {name}")
         for family, sections_by_name in sections.items():
             for name in sections_by_name:
@@ -380,6 +402,8 @@ class Format:
                     raise SystemExit(f"{family}.txt: section {name} has no layout line")
         pieces = {}
         for name, (place, length, family) in layout.items():
+            if family in elsewhere:
+                continue
             where = f"{family}.txt [{name}]"
             data = self.read_lines(sections[family][name], names, where)
             pack = (packers or {}).get(kinds[family, name])
