@@ -95,6 +95,9 @@ Nothing here is a game's: no ROM, no names, no data.
   others' files hold has no file of its own, two files that share bytes must agree on them, and the bytes no
   sample plays are WAVs or lines of their own (Sunset Riders' `tools/sound_assets.py`; The Simpsons' copy is
   to move here). `konami` is a namespace package too.
+- `konami/graphics.py`: the K052109's tiles (MAME's charlayout) and the K053244/K053245's sprite cells (its
+  spritelayout: four 8x8 blocks at 0, 32, 64 and 96), from the ROMs' bytes to pens and back, and cells laid out on a
+  sheet and back (Sunset Riders' `tools/graphics_assets.py`; TMNT's and The Simpsons' tiles are to move here).
 - `sound_data_text.py`: a sound program's data pieces as text by name, and back byte for byte: `layout.txt` (where
   each piece is) and a file a family, a section a piece, its lines `u8`/`u16` values and `ref NAME[+0xN]`
   addresses, a record's fields as labels; the game's tools say the pieces, their names and their lines, and
