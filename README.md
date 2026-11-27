@@ -95,6 +95,11 @@ Nothing here is a game's: no ROM, no names, no data.
   others' files hold has no file of its own, two files that share bytes must agree on them, and the bytes no
   sample plays are WAVs or lines of their own (Sunset Riders' `tools/sound_assets.py`; The Simpsons' copy is
   to move here). `konami` is a namespace package too.
+- `sound_data_text.py`: a sound program's data pieces as text by name, and back byte for byte: `layout.txt` (where
+  each piece is) and a file a family, a section a piece, its lines `u8`/`u16` values and `ref NAME[+0xN]`
+  addresses, a record's fields as labels; the game's tools say the pieces, their names and their lines, and
+  `compare` says what does not come back (Sunset Riders' `tools/sound_data_assets.py`; TMNT's and The Simpsons'
+  sound data are to move here).
 - `check_scenarios.py`: every control script of the game's `tests/controls/` run on the reference and on the
   game (or the translation scaffold), compared frame by frame (state, and with `--video` and `--sound` the
   pictures and the sound), and the static analysis checked against all the code the reference ran.
