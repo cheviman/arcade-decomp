@@ -1,7 +1,7 @@
-"""
+r"""
 Name:        data_text.py
 Description: a program's data pieces as text by name, and back byte for byte
-Version:     0.1.0
+Version:     0.2.0
 Created:     27-11-2026
 Modified:    27-11-2026
 Author:      Sebastian Toyos
@@ -11,9 +11,13 @@ family, its pieces as sections: [NAME]  # KIND, then their lines indented two sp
 (a word that is not a type, not ref nor a value) and items, and what follows # is a comment. The types set the type
 of the values after them on that line: u8, s8, u16, s16 and u32, a value 0x hex after an unsigned type and a
 decimal integer after a signed one, both must fit their type, and VALUE*COUNT is a run of COUNT of it (the fill).
-ref NAME[+0xN] is the address of a piece or a function, in the format's byte order. What a file says wrong stops with SystemExit and a message that says the
-file, the section and the line. sound_data_text.py is the Z80's format over this (little endian, 16-bit refs, 4
-hex digits); the 68000's is Format("big", 4, 6, ...) (Sunset Riders' tools/data_assets.py).
+ref NAME[+0xN] is the address of a piece or a function, in the format's byte order. A format with a colour (COLOURS,
+the board's colour words) has rgb, a type whose values are colours, 0xRRGGBB, a word each (each part's 5 bits
+widened to 8, and back to the nearest); one with characters ({byte: character}) has text "...", a byte a
+character and \xNN for any byte (a # or a " in a text is \x23 or \x22). What a file says wrong stops with
+SystemExit and a message that says the file, the section and the line. sound_data_text.py is the Z80's format over
+this (little endian, 16-bit refs, 4 hex digits); the 68000's is Format("big", 4, 6, ...) (Sunset Riders'
+tools/data_assets.py, with its colours and characters).
 """
 import re
 from bisect import bisect_right
@@ -22,6 +26,12 @@ from pathlib import Path
 TYPES = {"u8": (1, False), "s8": (1, True), "u16": (2, False), "s16": (2, True), "u32": (4, False)}  # bytes, signed
 # a value: 0x hex or a decimal integer, and *COUNT for a run of it
 VALUE = re.compile(r"(0[xX][0-9A-Fa-f]+|-?\d+)(?:\*(\d+))?")
+# a line's tokens: a text in quotes (its characters, and \xNN for a byte the characters have none for), or a run of
+# anything else but blanks
+TOKEN = re.compile(r'"(?:[^"\\]|\\x[0-9A-Fa-f]{2})*"|[^\s"]+')
+ESCAPE = re.compile(r"\\x([0-9A-Fa-f]{2})|(.)", re.S)
+# the boards' colour words: the bit each of red, green and blue starts at, 5 bits each, the top bit clear
+COLOURS = {"xBGR_555": (0, 5, 10)}
 
 
 class Names:
@@ -68,7 +78,7 @@ class Names:
 class Format:
     """The format: order "little" or "big", ref_bytes 2 or 4, place_digits, program, module"""
 
-    def __init__(self, order, ref_bytes, place_digits, program, module):
+    def __init__(self, order, ref_bytes, place_digits, program, module, colour=None, characters=None):
         if order not in ("little", "big"):
             raise SystemExit(f"Format: no order {order}")
         if ref_bytes not in (2, 4):
@@ -78,6 +88,15 @@ class Format:
         self.place_digits = place_digits
         self.program = program
         self.module = module
+        if colour is not None and colour not in COLOURS:
+            raise SystemExit(f"Format: no colour {colour}")
+        self.colour = colour            # the colour words' format (COLOURS), for rgb values
+        # {byte: character} of the texts (text "..."), one character a byte; the bytes it has none for are \xNN
+        self.characters = dict(characters or {})
+        self.bytes_of = {character: byte for byte, character in self.characters.items()}
+        if len(self.bytes_of) != len(self.characters) or any(len(character) != 1 or character in '"\\#'
+                                                             for character in self.bytes_of):
+            raise SystemExit('Format: the characters must be one each, different, and none of " \\ #')
 
     def byte_lines(self, data):
         """u8 lines, 16 bytes a line"""
@@ -147,6 +166,58 @@ class Format:
         size, signed = TYPES[kind]
         return str(value) if signed else f"0x{value:0{2 * size}X}"
 
+    def colour_text(self, word):
+        """A colour word as an rgb value, 0xRRGGBB (each part's 5 bits widened to 8), or None if it is no colour"""
+        if self.colour is None or word >> 15:
+            return None
+        value = 0
+        for shift in COLOURS[self.colour]:
+            five = word >> shift & 0x1F
+            value = value << 8 | five << 3 | five >> 2
+        return f"0x{value:06X}"
+
+    def colour_word(self, value):
+        """An rgb value's colour word: each 8-bit part to the nearest of 5 bits"""
+        word = 0
+        for number, shift in enumerate(COLOURS[self.colour]):
+            eight = value >> 8 * (2 - number) & 0xFF
+            word |= (eight * 31 + 127) // 255 << shift
+        return word
+
+    def colour_lines(self, data, each=8):
+        """rgb lines, 'each' colours a line; a word that is no colour as a u16 in its place"""
+        lines = []
+        for at in range(0, len(data) - 1, 2 * each):
+            items, kind = [], None
+            for word_at in range(at, min(at + 2 * each, len(data) - 1), 2):
+                word = int.from_bytes(data[word_at:word_at + 2], self.order)
+                text = self.colour_text(word)
+                wanted = "rgb" if text is not None else "u16"
+                if wanted != kind:
+                    items.append(wanted)
+                    kind = wanted
+                items.append(text if text is not None else f"0x{word:04X}")
+            lines.append(" ".join(items))
+        if len(data) % 2:
+            lines.append(f"u8 0x{data[-1]:02X}")
+        return lines
+
+    def text_item(self, data):
+        """Bytes as a text item, "..." in the characters, \\xNN for a byte they have none for"""
+        return '"' + "".join(self.characters.get(byte, f"\\x{byte:02X}") for byte in data) + '"'
+
+    def text_bytes(self, token, where):
+        """A text item's bytes"""
+        out = bytearray()
+        for found in ESCAPE.finditer(token[1:-1]):
+            if found.group(1) is not None:
+                out.append(int(found.group(1), 16))
+            elif found.group(2) in self.bytes_of:
+                out.append(self.bytes_of[found.group(2)])
+            else:
+                raise SystemExit(f"{where}: no byte for {found.group(2)!r} in a text (\\xNN gives any)")
+        return bytes(out)
+
     def record_lines(self, data, fields, names=None):
         """A line a field ([(offset, name, type)]: u8, s8, u16, s16, u32 or ref), the bytes no field covers as u8
         lines in their place; a ref field holds a ref when 'names' names its value, else its value"""
@@ -180,10 +251,11 @@ class Format:
         out = bytearray()
         for number, line in enumerate(lines, 1):
             here = f"{where}, line {number}"
-            tokens = line.split("#", 1)[0].strip().split()
+            tokens = TOKEN.findall(line.split("#", 1)[0])
             if not tokens:
                 continue
-            if not (tokens[0] in TYPES or tokens[0] == "ref" or VALUE.fullmatch(tokens[0])):
+            if not (tokens[0] in TYPES or tokens[0] in ("ref", "rgb", "text") or tokens[0].startswith('"')
+                    or VALUE.fullmatch(tokens[0])):
                 tokens = tokens[1:]
             kind = None
             at = 0
@@ -192,6 +264,17 @@ class Format:
                 found = VALUE.fullmatch(token)
                 if token in TYPES:
                     kind = token
+                elif token == "rgb":
+                    if self.colour is None:
+                        raise SystemExit(f"{here}: rgb in a format with no colours")
+                    kind = token
+                elif token == "text":
+                    at += 1
+                    if at >= len(tokens) or not tokens[at].startswith('"'):
+                        raise SystemExit(f'{here}: text with no "..." after it')
+                    out += self.text_bytes(tokens[at], here)
+                elif token.startswith('"'):
+                    raise SystemExit(f"{here}: a text with no 'text' before it")
                 elif token == "ref":
                     at += 1
                     if at >= len(tokens):
@@ -200,6 +283,13 @@ class Format:
                 elif found:
                     if kind is None:
                         raise SystemExit(f"{here}: value {token} with no type")
+                    if kind == "rgb":
+                        if not found.group(1).lower().startswith("0x") or int(found.group(1), 16) > 0xFFFFFF:
+                            raise SystemExit(f"{here}: {token}: an rgb value is 0xRRGGBB")
+                        out += self.colour_word(int(found.group(1), 16)).to_bytes(2, self.order) \
+                            * int(found.group(2) or 1)
+                        at += 1
+                        continue
                     size, signed = TYPES[kind]
                     if signed == found.group(1).lower().startswith("0x"):
                         raise SystemExit(f"{here}: {token}: a {kind} value is "
