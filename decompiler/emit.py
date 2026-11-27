@@ -4,7 +4,7 @@ Description: writes the decompiled functions as C: one C function per V60 functi
              variables, results through pointers
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    01-11-2026
+Modified:    26-11-2026
 Author:      Sebastian Toyos
 
 Every function becomes "void name(parameters)", or returns the one value it hands back. Its parameters
@@ -1369,8 +1369,10 @@ class FunctionWriter:
                 return named
             return f"{memory.ROM_MACRO}{bits}({self.printer.any(field[2]).text})", False, False
         if field is not None and field[0] == "global":
-            # through a pointer to a variable: as the variable
-            own = self.own_variable(field[1], bits)
+            # through a pointer to a variable: as the variable (the family's own name for it at a constant address,
+            # or the bytes an index on from it), else the variable's element
+            value = memory.constant_address(field[1])
+            own = self.own_variable(value, bits) if value is not None else self.own_element(field[1], bits)
             return own if own is not None else self.emitter.memory.access(field[1], bits, self.exact, indexed=True)
         if field is not None:
             text, signed = self.field_access(field, bits)
@@ -1416,6 +1418,17 @@ class FunctionWriter:
                 name = f"{item.name}[0]" if item.indexed else item.name
                 return cprint.part(bits, name, address - start, item.bits), False, True
         return None
+
+    def own_element(self, address, bits):
+        """(C, False, True) for work RAM an index on from a variable the function's family names its own way
+        ("scoped global") and that is no array: RAM8(results_places_ADDRESS + index), the 2 players version's
+        bonus_1_results reading its byte by the character; None otherwise."""
+        items = self.emitter.memory.scoped.get(self.global_family) if self.global_family else None
+        parts = memory.based(address) if items else None
+        item = items.get(parts[0]) if parts is not None else None
+        if item is None or item.indexed:
+            return None
+        return f"{memory.RAM_MACRO}{bits}({item.name}_ADDRESS + {self.exact(parts[1])})", False, True
 
     def family_splits(self, statement):
         """True for a store through an object of a family whose own field at that place is narrower than

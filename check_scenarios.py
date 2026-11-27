@@ -4,7 +4,7 @@ Description: runs every control script on the reference and on the translated ga
              frame, and checks that the static analysis alone finds all the code the reference ran
 Version:     0.1.0
 Created:     11-10-2026
-Modified:    25-11-2026
+Modified:    26-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-only] [--translated] [--video]
@@ -30,8 +30,9 @@ Usage: python tools/check_scenarios.py [NAME ...] [--reference-only] [--native-o
   --out DIR       where the runs go (build/scenarios by default)
   --set SET       another version of the game (a set the game's ROM module knows, rom/SET.zip; the game's profile
                   takes it): its scripts are tests/controls/SET, its runs go to build/scenarios_SET by default, the
-                  reference runs its ROM (--rom) with its sound timing, and the static analysis runs on its program
-                  with its symbols (build/versions/SET/symbols.txt, tools/match_version.py)
+                  reference runs its ROM (--rom) with its sound timing, the game its assets (--assets, the profile's
+                  ASSETS), and the static analysis runs on its program with its symbols
+                  (build/versions/SET/symbols.txt, tools/match_version.py)
 
 For every script: the reference (build/bin/s32ref, or the profile's REFERENCE) writes
 build/scenarios/NAME/{executed,called,hashes}.txt, the game (build/bin/GAME_game_headless, from
@@ -109,6 +110,9 @@ def run_native(script, out, game, video, sound=False):
     extra = ["--video-hashes", str(out / "game_video_hashes.txt")] if video else []
     if sound:
         extra += ["--sound-hashes", str(out / "game_sound_hashes.txt")]
+    if VERSION:
+        # (the version's assets: the game takes its data and which program it is from them)
+        extra += ["--assets", str(game_profile.ASSETS)]
     # a run that writes nothing must not leave an earlier run's hashes to be compared
     for stale in (hashes, "game_video_hashes.txt", "game_sound_hashes.txt"):
         (out / stale).unlink(missing_ok=True)

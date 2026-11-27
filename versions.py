@@ -6,7 +6,7 @@ Description: carries a game's symbols over to another version of the same progra
              board): the base's places matched to the version's, instruction by instruction, for each of its CPUs
 Version:     0.1.0
 Created:     25-11-2026
-Modified:    25-11-2026
+Modified:    26-11-2026
 Author:      Sebastian Toyos
 
 Usage: python tools/match_version.py VERSION_ROM [--base BASE_ROM] [--out DIR]   (the game's shim)
@@ -711,6 +711,10 @@ def carry_program(cpu, set_name, base_image, version_image, name, out):
     # code reached by what the version's analysis does not follow without it, and found there by the match)
     given = {tuple(line.split()) for line in carried if line.split() and not line.startswith("#")}
     own_out = [line for line in own_lines if line.startswith("#") or tuple(line.split()) not in given]
+    # (and an own comment of a function in place of the carried one: what the version's code does)
+    own_comments = {line.split()[1] for line in own_out if line.split()[:1] == ["comment"] and len(line.split()) > 1}
+    carried = [line for line in carried
+               if not (line.split()[:1] == ["comment"] and len(line.split()) > 1 and line.split()[1] in own_comments)]
     (out / name).write_text("\n".join(header + carried + own_out) + "\n", encoding="utf-8")
 
     # the version's functions no base function's name went to: its own code, to be named

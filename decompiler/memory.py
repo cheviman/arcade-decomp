@@ -5,7 +5,7 @@ Description: the game's variables, tables and hardware registers by name: work R
              named addresses
 Version:     0.1.0
 Created:     12-10-2026
-Modified:    01-11-2026
+Modified:    26-11-2026
 Author:      Sebastian Toyos
 
 Work RAM (0x200000-0x20FFFF) stays the board's byte array, so the state compares byte for byte with the
@@ -494,7 +494,8 @@ class Memory:
         if base == VARIABLES:
             macro = (ram_macro if lvalue else ROM_MACRO) + str(bits)
             return f"{macro}(GAME_VARIABLES + {index_text(rest)})", False, lvalue
-        if index is not None and item.bits == bits:
+        if index is not None and item.bits == bits and item.indexed:
+            # (an index on from a variable that is no array is the bytes after it, below: its element would not be C)
             return self.indexed_text(items, item, index_text(index)), item.signed, lvalue
         if LOADED_TABLES and not lvalue:
             # a loaded table read at another width than its elements': by its name and the offset in bytes
