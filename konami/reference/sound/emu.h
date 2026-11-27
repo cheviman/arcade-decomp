@@ -1,10 +1,10 @@
 /**
  *    Name:        emu.h
  *    Description: minimal stand-in for MAME's emu.h, enough to build MAME's Z80 core and disassembler, the
- *                 K007232 and the uPD7759 alone
+ *                 K007232, the uPD7759, the T6W28 and the DACs alone
  *    Version:     0.1.0
  *    Created:     29-10-2026
- *    Modified:    29-10-2026
+ *    Modified:    27-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
@@ -13,7 +13,8 @@
  *    header they use is included before that. With MAME's meaning: devices with a clock, a CPU that runs
  *    for a number of cycles, memory as functions the host sets (the Z80's), a device's ROM region found by
  *    the device's tag among the ones the host gives (set_region), a sound stream the host pulls samples
- *    from, writes that MAME synchronizes to the present (scheduler().synchronize) done at once (the host
+ *    from (with no inputs: nothing is routed into a chip here, so a DAC gives its rails' level), writes that
+ *    MAME synchronizes to the present (scheduler().synchronize) done at once (the host
  *    brings the chips up to the present first), and no-ops for saving state, logging and the debugger.
  *    Built on system32/reference/sound/emu.h, the Z80's.
  */
@@ -450,6 +451,9 @@ public:
 		value = std::clamp(value, -range, range - 1);
 		put_int(output, index, value, range);
 	}
+	void fill(int output, sample_t value) { std::fill(m_outputs[output].begin(), m_outputs[output].end(), value); }
+	int input_count() const { return 0; }
+	sample_t get(int input, int index) const { (void)input; (void)index; return 0.0f; }
 	void update() { if (m_before_change) m_before_change(); }
 	void set_sample_rate(u32 rate) { m_rate = rate; }
 	u32 sample_rate() const { return m_rate; }
@@ -476,6 +480,9 @@ public:
 		sound_stream_update(m_stream);
 	}
 	sound_stream &stream() { return m_stream; }
+
+	// which of the device's inputs something is routed to: none here
+	u64 get_sound_requested_inputs_mask() const { return 0; }
 
 protected:
 	sound_stream *stream_alloc(int inputs, int outputs, u32 rate)
